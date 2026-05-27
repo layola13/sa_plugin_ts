@@ -1,0 +1,5 @@
+// TypeScript to SA-ASM Lowerer Plugin Interface
+// This file declares the functions exported by the .so plugin.
+
+@extern sa_plugin_ts_lower(source: ptr, source_len: u64, out_sa: ptr, out_sa_len: ptr) -> i32!
+@extern sa_plugin_ts_free_buffer(buf: ptr) -> i32
