@@ -1,0 +1,30 @@
+{
+  "schema": "sa.plugin/1",
+  "name": "sa_plugin_ts",
+  "version": "0.1.0",
+  "source": {
+    "type": "local",
+    "path": "."
+  },
+  "abi": {
+    "plugin": 1,
+    "saasm": ">=0.4.0",
+    "symbols": "sa_plugin_ts.sai"
+  },
+  "artifacts": {
+    "linux-x86_64": {
+      "path": "zig-out/lib/libsa_plugin_ts.so"
+    }
+  },
+  "interfaces": {
+    "sai": { "path": "sa_plugin_ts.sai" }
+  },
+  "skills": ["ts.lower"],
+  "permissions": {
+    "fs": [],
+    "net": [],
+    "env": [],
+    "process": { "spawn": false, "exec": [] }
+  },
+  "dependencies": {}
+}
