@@ -10,4 +10,4 @@ A: The plugin injects SA ownership operators (\\^, !). The resulting SA code is 
 A: Only if they are written in this "Strict TS" subset and compiled via this plugin. Traditional JS packages relying on Node.js/V8 runtime features are incompatible.
 
 ## Q: What about the DOM?
-A: DOM access is handled via the SAX (Symbolic Affine XML) airlock, ensuring that UI updates are also verified and secure.
+A: DOM access is handled via the SAX (safe asm XML, 安全汇编 XML) airlock, ensuring that UI updates are also verified and secure.

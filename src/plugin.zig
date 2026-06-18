@@ -182,6 +182,10 @@ fn runTsCommandAbi(
     out_code: *u8,
 ) callconv(.c) u32 {
     out_code.* = 0;
+    if (argv_len < 2 or !std.mem.eql(u8, std.mem.span(argv[1]), "ts")) {
+        return @intFromEnum(plugin_api.AbiStatus.unknown_command);
+    }
+
     const args = plugin_helpers.cArgvToSlice(argv, argv_len, ctx.allocator) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     defer ctx.allocator.free(args);
 
