@@ -9,6 +9,18 @@ pub const Field = struct {
     type_name: []const u8,
 };
 
+/// A pending `break`/`continue` destination.
+///
+/// The scope depth is recorded with the label because a jump abandons every
+/// scope opened after the enclosing construct, and those scopes pop before any
+/// later release pass can observe them. Keeping the depth here is what lets
+/// `break` release exactly the abandoned scopes and leave the enclosing ones
+/// live for the function-exit walk.
+const JumpTarget = struct {
+    label: []const u8,
+    scope_depth: usize,
+};
+
 pub const StructLayout = struct {
     name: []const u8,
     size: u32,
@@ -85,6 +97,37 @@ pub const Parser = struct {
     current: lexer_mod.Token,
     peek: lexer_mod.Token,
     label_counter: u32 = 0,
+    /// Nesting depth of loop bodies currently being parsed.
+    ///
+    /// A register bound inside a loop is re-assigned each iteration, so it must
+    /// not be released inside the loop.
+    loop_depth: u32 = 0,
+
+    /// Cached CFG dominance matrix, refreshed at each branch boundary.
+    dominators: ?[]bool = null,
+
+    /// Nesting depth of conditional branch bodies (if arms, switch cases) whose
+    /// arms reconverge at a merge point.
+    ///
+    /// A register-to-register assignment inside such a body would leave its
+    /// source Consumed on one arm and Active on the other, which the verifier
+    /// rejects as a state conflict at the join.
+    branch_depth: u32 = 0,
+
+    /// Loop/switch context stack used to lower `break` and `continue`.
+    ///
+    /// SA-ASM has no `break`/`continue` instructions: both are unconditional
+    /// jumps, so the enclosing construct's label must be known at the point
+    /// the statement is emitted.
+    break_stack: std.ArrayList(JumpTarget) = undefined,
+    continue_stack: std.ArrayList(JumpTarget) = undefined,
+
+    /// Parameters of each enclosing function, so `return` can release them.
+    ///
+    /// SA-ASM requires every live register to be released before a function
+    /// exits, and parameters are live registers. Releases must precede the
+    /// `return` on each path, otherwise they become unreachable code.
+    func_param_stack: std.ArrayList([][]const u8) = undefined,
     last_arrow_ctx: ?[]const u8 = null,
     errors: std.ArrayList(ParseError),
     has_fatal_error: bool = false,
@@ -96,6 +139,10 @@ pub const Parser = struct {
         name: []const u8,
         sa_primitive: []const u8,
         string_args: []const u8, // "1" = first arg is string, "12" = first two are strings, etc.
+        /// Extra trailing arguments the SA primitive requires, appended after
+        /// the caller's own arguments. SA-ASM callees have fixed arity, so
+        /// omitting these makes the call fail.
+        extra_args: []const u8 = "",
     };
 
     pub fn init(allocator: std.mem.Allocator, source: []const u8, low: *lowerer_mod.Lowerer) !Parser {
@@ -112,6 +159,9 @@ pub const Parser = struct {
             .current = current,
             .peek = peek,
             .label_counter = 0,
+            .break_stack = std.ArrayList(JumpTarget).init(allocator),
+            .continue_stack = std.ArrayList(JumpTarget).init(allocator),
+            .func_param_stack = std.ArrayList([][]const u8).init(allocator),
             .enums = std.ArrayList(EnumDef).init(allocator),
             .stdlib = std.ArrayList(StdlibEntry).init(allocator),
             .errors = std.ArrayList(ParseError).init(allocator),
@@ -136,6 +186,10 @@ pub const Parser = struct {
         self.scope_manager.deinit();
         self.errors.deinit();
         self.stdlib.deinit();
+        if (self.dominators) |d| self.allocator.free(d);
+        self.break_stack.deinit();
+        self.continue_stack.deinit();
+        self.func_param_stack.deinit();
         for (self.enums.items) |*e| {
             e.deinit(self.allocator);
         }
@@ -220,6 +274,134 @@ pub const Parser = struct {
         return self.label_counter;
     }
 
+    /// Allocate a temporary register name and declare it as an owned value.
+    ///
+    /// In SA-ASM only a register-to-register assignment moves its source;
+    /// arithmetic, `load`, `call` and `br` all leave their operands live, so
+    /// they must be released. Tracking temporaries is therefore safe *provided*
+    /// `markConsumed` is called on assignment, which is the one case that moves.
+    /// A temporary created inside a loop body is additionally marked loop-local,
+    /// since its name is re-assigned every iteration and releasing it there
+    /// would be a use-after-move on the next pass.
+    fn newTemp(self: *Parser) anyerror![]const u8 {
+        const name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+        if (self.scope_manager.declareVar(name, "i32", name, true)) {
+            self.scope_manager.markDefBlock(name, self.lowerer.currentBlock());
+        } else |_| {}
+        return name;
+    }
+
+    /// Pop the innermost scope, first releasing the values that scope owns.
+    ///
+    /// A loop body or a branch arm that allocates leaves its registers live at
+    /// the merge point: the scope is popped, so the function-exit walk can no
+    /// longer see them, and the verifier then either reports them as a leak or,
+    /// at a loop back-edge, rejects the merge as a phi state conflict. Emitting
+    /// the `!` here puts it on the path actually taken.
+    ///
+    /// Only the innermost scope is walked, so parameters and enclosing locals
+    /// are left to the function's own exit. A body that already ended in
+    /// `return`, `break` or `continue` is terminated, and a release written
+    /// after it would be unreachable.
+    fn exitScopeReleasingLocals(self: *Parser) anyerror!void {
+        if (!self.lowerer.isTerminated()) {
+            try self.scope_manager.releaseCurrentScopeOwned(self.lowerer);
+        }
+        try self.scope_manager.exitScope(self.lowerer);
+    }
+
+
+    /// Map a TypeScript type name onto one the SA assembler accepts.
+    ///
+    /// SA-ASM only knows its own scalar and pointer types. A TypeScript
+    /// interface, type alias, generic, `string`, or array is a pointer;
+    /// emitting the source-level name fails with "unsupported type annotation
+    /// during flattening".
+    fn saTypeOf(ts_type: []const u8) []const u8 {
+        const scalars = [_][]const u8{
+            "i32", "u32",  "i64", "u64", "f64", "f32",
+            "i8",  "u8",   "i16", "u16", "bool", "void",
+        };
+        for (scalars) |s| {
+            if (std.mem.eql(u8, ts_type, s)) return ts_type;
+        }
+        return "ptr";
+    }
+
+    /// Emit a fall-through-preserving conditional branch.
+    ///
+    /// SA-ASM has no `jz`; the conditional branch is
+    /// `br <cond> -> <true_label>, <false_label>` and both targets are
+    /// mandatory. To express "skip to `false_label` when `cond` is false"
+    /// while keeping the true path falling through, emit the branch against a
+    /// fresh label that immediately follows it.
+    fn emitBranchIfFalse(self: *Parser, cond: []const u8, false_label: []const u8) anyerror![]const u8 {
+        const fallthrough = try std.fmt.allocPrint(self.allocator, "L_then_{d}", .{self.nextLabelId()});
+        try self.lowerer.emitBranchTo(cond, fallthrough, false_label);
+        try self.lowerer.emitLabel(fallthrough);
+        return fallthrough;
+    }
+
+    /// Emit `br <cond> -> <true_label>, <false_label>` with both targets given.
+    fn emitBranch(self: *Parser, cond: []const u8, true_label: []const u8, false_label: []const u8) anyerror!void {
+        try self.lowerer.emitBranchTo(cond, true_label, false_label);
+    }
+
+    fn pushLoopTargets(self: *Parser, break_label: []const u8, continue_label: []const u8) anyerror!void {
+        const depth = self.scope_manager.scopeDepth();
+        try self.break_stack.append(.{ .label = break_label, .scope_depth = depth });
+        try self.continue_stack.append(.{ .label = continue_label, .scope_depth = depth });
+    }
+
+    fn popLoopTargets(self: *Parser) void {
+        _ = self.break_stack.pop();
+        _ = self.continue_stack.pop();
+    }
+
+    /// Register a `switch` break target. A switch has no continue target.
+    fn pushSwitchTarget(self: *Parser, break_label: []const u8) anyerror!void {
+        try self.break_stack.append(.{ .label = break_label, .scope_depth = self.scope_manager.scopeDepth() });
+    }
+
+    /// Push the parameter names of the function being parsed.
+    fn pushFuncParams(self: *Parser, names: []const []const u8) anyerror!void {
+        const copy = try self.allocator.dupe([]const u8, names);
+        try self.func_param_stack.append(copy);
+    }
+
+    /// Release the enclosing function's parameters.
+    ///
+    /// Must run before the `return`/terminator on every exit path, otherwise
+    /// the releases are unreachable and verification fails with "live
+    /// registers remain at function exit".
+    /// Release every live owned register in the open scopes.
+    ///
+    /// Emitted before a `return` or a synthesised function terminator so no
+    /// release is left unreachable after a terminator. Registers already moved
+    /// by an instruction are skipped, as are registers whose definition does not
+    /// dominate the release point, using the computed CFG when one is available.
+    fn releaseLiveRegisters(self: *Parser) anyerror!void {
+        try self.releaseLiveRegistersExcept(null);
+    }
+
+    /// Refresh the cached dominance matrix for the block being emitted.
+    ///
+    /// Called at a branch boundary, where the CFG so far is complete enough to
+    /// decide which definitions are live at the merge point.
+    fn refreshDominators(self: *Parser) anyerror!void {
+        if (self.dominators) |d| self.allocator.free(d);
+        self.dominators = try self.lowerer.computeDominators();
+        self.scope_manager.reaches = self.dominators;
+    }
+
+    /// Release live owned registers, keeping `keep` alive.
+    ///
+    /// The register holding a returned value must not be released before the
+    /// `return`: the assembler reports that as a use-after-move.
+    fn releaseLiveRegistersExcept(self: *Parser, keep: ?[]const u8) anyerror!void {
+        try self.scope_manager.releaseAllOwnedExcept(self.lowerer, keep);
+    }
+
     // ==========================================
     // Top-level parse
     // ==========================================
@@ -253,7 +435,17 @@ pub const Parser = struct {
             },
             .r_brace => {
                 try self.expect(.r_brace);
-                try self.scope_manager.exitScope(self.lowerer);
+                // A block closing inside a branch arm or a loop body releases
+                // what it owns: the scope is popped right here, so the
+                // function-exit walk can no longer see those values and the
+                // verifier reports them as leaked. At function top level both
+                // depths are back to zero, and that scope is the one the
+                // function's own exit releases, so it must be left alone.
+                if (self.branch_depth > 0 or self.loop_depth > 0) {
+                    try self.exitScopeReleasingLocals();
+                } else {
+                    try self.scope_manager.exitScope(self.lowerer);
+                }
             },
             .semicolon => {
                 try self.advance();
@@ -276,12 +468,39 @@ pub const Parser = struct {
             .keyword_break => {
                 try self.advance();
                 _ = try self.accept(.semicolon);
-                try self.lowerer.emit("    break\n", .{});
+                // SA-ASM has no `break`; lower it to a jump to the enclosing
+                // loop/switch exit label.
+                if (self.break_stack.items.len > 0) {
+                    const target = self.break_stack.items[self.break_stack.items.len - 1];
+                    // Release only the scopes this jump abandons. Releasing
+                    // every open scope would free the enclosing function's
+                    // locals here, leaving the merge point to see one arm with
+                    // a consumed register and the other still holding it.
+                    try self.scope_manager.releaseScopesDeeperThan(self.lowerer, target.scope_depth);
+                    try self.lowerer.useLabel(target.label);
+                    try self.lowerer.emitJumpTo(target.label);
+                } else {
+                    const msg = try std.fmt.allocPrint(self.allocator, "error: break outside loop or switch", .{});
+                    try self.errors.append(.{ .line = self.current.line, .col = self.current.col, .message = msg });
+                }
             },
             .keyword_continue => {
                 try self.advance();
                 _ = try self.accept(.semicolon);
-                try self.lowerer.emit("    continue\n", .{});
+                // `continue` jumps to the enclosing loop's head, which re-runs
+                // the loop test. A switch is not a continue target.
+                // As with `break`, the jump abandons every scope up to the loop
+                // head, so their values have to be released here rather than left
+                // to a function-exit walk that will never see them.
+                if (self.continue_stack.items.len > 0) {
+                    const target = self.continue_stack.items[self.continue_stack.items.len - 1];
+                    try self.scope_manager.releaseScopesDeeperThan(self.lowerer, target.scope_depth);
+                    try self.lowerer.useLabel(target.label);
+                    try self.lowerer.emitJumpTo(target.label);
+                } else {
+                    const msg = try std.fmt.allocPrint(self.allocator, "error: continue outside loop", .{});
+                    try self.errors.append(.{ .line = self.current.line, .col = self.current.col, .message = msg });
+                }
             },
             .keyword_async => try self.parseAsyncFunction(),
             .identifier => {
@@ -354,6 +573,19 @@ pub const Parser = struct {
                 type_name = try std.fmt.allocPrint(self.allocator, "{s}>", .{type_name});
             }
         }
+
+        // Array type suffix: `T[]`.
+        //
+        // This suffix must be consumed here. Otherwise a declaration such as
+        // `let arr: i32[] = [1, 2, 3]` leaves `[` as the current token and the
+        // following `expect(.equal)` fails, silently dropping the entire
+        // statement while still exiting 0. Layout and element-size purposes
+        // want the element type, so return the base name.
+        if (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+            try self.advance(); // [
+            try self.advance(); // ]
+        }
+
         // Return base name (strip generics) for layout table compatibility
         if (std.mem.indexOf(u8, type_name, "<")) |angle_idx| {
             return type_name[0..angle_idx];
@@ -543,7 +775,7 @@ pub const Parser = struct {
                 }
                 const field = found_field orelse return error.UnknownField;
 
-                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ var_name, field.offset, val, field.type_name });
+                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ var_name, field.offset, val, saTypeOf(field.type_name) });
 
                 _ = try self.accept(.comma);
                 _ = try self.accept(.semicolon);
@@ -566,22 +798,68 @@ pub const Parser = struct {
             }
             try self.expect(.r_bracket);
 
-            const arr_size = @as(u32, @intCast(values.items.len)) * elem_size;
+            const elem_count = @as(u32, @intCast(values.items.len));
+
+            // A TypeScript array is lowered to an SA slice: a 16-byte header
+            // holding {ptr, len} with the elements in a separate buffer.
+            //
+            // Storing the elements inline in the header was wrong: `for (const
+            // v of arr)` reads the length from +8 and the data pointer from +0,
+            // so for `[1,2,3]` it read the third element as a length and the
+            // first as a pointer, then dereferenced it. That verified but
+            // segfaulted at run time. The slice layout is also what sa_std
+            // primitives expect, so arrays can be passed to them.
+            const arr_size = @max(elem_count * elem_size, 16);
             try self.scope_manager.declareVar(var_name, elem_type, var_name, true);
 
             try self.lowerer.emit("    {s} = alloc {d}\n", .{ var_name, arr_size });
 
+            // Element storage; a zero-length array still needs a valid pointer.
+            const data_reg = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc {d}\n", .{ data_reg, @max(elem_count * elem_size, 4) });
+
             for (values.items, 0..) |val, idx| {
                 const off = @as(u32, @intCast(idx)) * elem_size;
-                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ var_name, off, val, elem_type });
+                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ data_reg, off, val, saTypeOf(elem_type) });
             }
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ var_name, data_reg });
+            try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ var_name, elem_count });
         } else {
             const val = try self.parseExpression();
             const t_name = type_name orelse "i32";
 
             const is_heap = std.mem.startsWith(u8, val, "slice_") or std.mem.eql(u8, t_name, "string");
 
-            try self.scope_manager.declareVar(var_name, t_name, var_name, is_heap);
+            // A register-to-register initialiser would otherwise move the source.
+            // TypeScript has no move semantics for scalars: `let b: i32 = a` copies
+            // and `a` stays usable. This is not only a branch concern -- reading a
+            // moved value in a later `switch` is a use-after-move even when the
+            // initialiser sits at function top level -- so the copy is unconditional
+            // for i32 rather than gated on `branch_depth`.
+            //
+            const src_is_var = self.scope_manager.lookup(val) != null;
+            // Inside a branch the binding is copied, as before: its scope is popped
+            // at the end of the arm, so a move-owned value would be one the
+            // function-exit walk can no longer see, and the verifier reports it as
+            // a leak. Outside a branch the same is true when the initialiser is a
+            // parameter, which the body may still read after this statement.
+            const copy_scalar = src_is_var and std.mem.eql(u8, t_name, "i32") and
+                (self.branch_depth > 0 or self.scope_manager.isOuterVariable(val));
+            if (copy_scalar) {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ var_name, val });
+                try self.scope_manager.declareVar(var_name, t_name, var_name, is_heap);
+                return;
+            }
+            const is_move = src_is_var;
+            if (is_move) {
+                self.scope_manager.markConsumed(val);
+            }
+
+            // A move transfers ownership of the source, so the source is not
+            // released again, and the destination inherits the obligation to be
+            // released -- that is what `or is_move` records, and the SA verifier
+            // rejects a function that leaves a declared register live at exit.
+            try self.scope_manager.declareVar(var_name, t_name, var_name, is_heap or is_move);
 
             try self.lowerer.emit("    {s} = {s}\n", .{ var_name, val });
         }
@@ -621,22 +899,48 @@ pub const Parser = struct {
         }
         try self.expect(.r_paren);
 
-        // Optional return type
-        _ = try self.accept(.colon);
+        // Optional return type annotation: `function f(): i32 { ... }`
+        //
+        // SA-ASM needs this in the signature (`@f(...) -> i32:`) whenever the
+        // function yields a value. Without it the backend rejects the `return`
+        // with "Instruction has a name, but provides a void value".
+        var return_type: ?[]const u8 = null;
+        if (try self.accept(.colon)) {
+            return_type = try self.parseTypeName();
+        }
 
         try self.lowerer.emit("@{s}(", .{func_name});
         for (params.items, 0..) |p, idx| {
             if (idx > 0) try self.lowerer.emit(", ", .{});
-            try self.lowerer.emit("{s}: {s}", .{ p.name, p.type_name });
+            // A struct-typed parameter is a pointer in SA-ASM. The TypeScript
+            // interface name is not a type the assembler knows, so emitting it
+            // verbatim fails with "unsupported type annotation".
+            try self.lowerer.emit("{s}: {s}", .{ p.name, saTypeOf(p.type_name) });
         }
-        try self.lowerer.emit("):\n", .{});
+        if (return_type) |rt| {
+            if (!std.mem.eql(u8, rt, "void")) {
+                try self.lowerer.emit(") -> {s}:", .{saTypeOf(rt)});
+            } else {
+                try self.lowerer.emit("):", .{});
+            }
+        } else {
+            try self.lowerer.emit("):", .{});
+        }
+        try self.lowerer.emit("\n", .{});
+        self.lowerer.beginFunction();
+
+        // Releases are emitted at return sites and at function exit, not when a
+        // lexical scope closes, so they never land after a terminator.
+        self.scope_manager.defer_releases = true;
+        defer self.scope_manager.defer_releases = false;
 
         try self.scope_manager.enterScope();
 
-        // Declare params in scope
+        // Declare params as owned registers. SA-ASM requires every live
+        // register to be released before the function exits, and a parameter
+        // that is never consumed by an instruction is still live.
         for (params.items) |p| {
-            const is_ptr = !std.mem.eql(u8, p.type_name, "i32") and !std.mem.eql(u8, p.type_name, "u32") and !std.mem.eql(u8, p.type_name, "f64");
-            try self.scope_manager.declareVar(p.name, p.type_name, p.name, is_ptr);
+            try self.scope_manager.declareVar(p.name, p.type_name, p.name, true);
         }
 
         // Parse body
@@ -646,11 +950,27 @@ pub const Parser = struct {
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
+            // Release while the body's scope is still open, otherwise its
+            // locals are already popped and their `!` releases are lost.
+            if (!self.lowerer.isTerminated()) {
+                try self.releaseLiveRegisters();
+            }
             try self.scope_manager.exitScope(self.lowerer);
             try self.advance(); // consume }
         }
 
         try self.scope_manager.exitScope(self.lowerer);
+
+        // Guarantee a well-formed final basic block. SA-ASM requires every
+        // block to end in a terminator, and control can reach the end of a
+        // function without an explicit `return` (e.g. an if/else where both
+        // arms fall through to the merge point). Parameters must be released
+        // before that terminator, since they are live registers.
+        const default_ret: []const u8 = if (return_type) |rt|
+            (if (std.mem.eql(u8, rt, "void")) "return" else "return 0")
+        else
+            "return";
+        try self.lowerer.finishFunction(default_ret);
     }
 
     fn parseAsyncFunction(self: *Parser) anyerror!void {
@@ -722,27 +1042,34 @@ pub const Parser = struct {
         const label_id = self.nextLabelId();
         const else_label = try std.fmt.allocPrint(self.allocator, "L_else_{d}", .{label_id});
         const end_label = try std.fmt.allocPrint(self.allocator, "L_endif_{d}", .{label_id});
+        try self.lowerer.reserveLabel(else_label);
 
-        try self.lowerer.emit("    jz {s}, {s}\n", .{ cond, else_label });
+        _ = try self.emitBranchIfFalse(cond, else_label);
 
         // Then branch
+        self.branch_depth += 1;
+        defer self.branch_depth -= 1;
         if (self.current.tag == .l_brace) {
             try self.advance();
             try self.scope_manager.enterScope();
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
-            try self.scope_manager.exitScope(self.lowerer);
+            try self.exitScopeReleasingLocals();
             try self.advance();
         } else {
             try self.parseStatement();
         }
 
-        try self.lowerer.emit("    jmp {s}\n", .{end_label});
-        try self.lowerer.emit("{s}:\n", .{else_label});
+        if (!self.lowerer.isTerminated()) {
+            try self.lowerer.emitJumpTo(end_label);
+        }
+        try self.lowerer.emitLabel(else_label);
 
         if (self.current.tag == .keyword_else) {
             try self.advance();
+            self.branch_depth += 1;
+            defer self.branch_depth -= 1;
             if (self.current.tag == .keyword_if) {
                 try self.parseIf();
             } else if (self.current.tag == .l_brace) {
@@ -751,14 +1078,17 @@ pub const Parser = struct {
                 while (self.current.tag != .r_brace and self.current.tag != .eof) {
                     try self.parseStatement();
                 }
-                try self.scope_manager.exitScope(self.lowerer);
+                try self.exitScopeReleasingLocals();
                 try self.advance();
             } else {
                 try self.parseStatement();
             }
         }
 
-        try self.lowerer.emit("{s}:\n", .{end_label});
+        if (!self.lowerer.isTerminated()) {
+            try self.lowerer.emitJumpTo(end_label);
+        }
+        try self.lowerer.emitLabel(end_label);
     }
 
     fn parseWhile(self: *Parser) anyerror!void {
@@ -768,12 +1098,15 @@ pub const Parser = struct {
         const label_id = self.nextLabelId();
         const loop_label = try std.fmt.allocPrint(self.allocator, "L_while_{d}", .{label_id});
         const end_label = try std.fmt.allocPrint(self.allocator, "L_endwhile_{d}", .{label_id});
+        try self.lowerer.reserveLabel(loop_label);
+        try self.lowerer.reserveLabel(end_label);
 
-        try self.lowerer.emit("{s}:\n", .{loop_label});
+        try self.lowerer.emitLabel(loop_label);
         const cond = try self.parseExpression();
         try self.expect(.r_paren);
 
-        try self.lowerer.emit("    jz {s}, {s}\n", .{ cond, end_label });
+        _ = try self.emitBranchIfFalse(cond, end_label);
+        try self.pushLoopTargets(end_label, loop_label);
 
         if (self.current.tag == .l_brace) {
             try self.advance();
@@ -781,14 +1114,16 @@ pub const Parser = struct {
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
-            try self.scope_manager.exitScope(self.lowerer);
+            try self.exitScopeReleasingLocals();
             try self.advance();
         } else {
             try self.parseStatement();
         }
 
-        try self.lowerer.emit("    jmp {s}\n", .{loop_label});
-        try self.lowerer.emit("{s}:\n", .{end_label});
+        try self.lowerer.useLabel(loop_label);
+        try self.lowerer.emitJumpTo(loop_label);
+        try self.lowerer.emitLabel(end_label);
+        self.popLoopTargets();
     }
 
     fn parseFor(self: *Parser) anyerror!void {
@@ -838,30 +1173,35 @@ pub const Parser = struct {
                 const label_id = self.nextLabelId();
                 const loop_label = try std.fmt.allocPrint(self.allocator, "L_forof_{d}", .{label_id});
                 const end_label = try std.fmt.allocPrint(self.allocator, "L_endforof_{d}", .{label_id});
+                try self.lowerer.reserveLabel(loop_label);
+                try self.lowerer.reserveLabel(end_label);
 
                 // Emit for-of loop: iterate over iterable
                 // Load length from iterable + 8 (string/slice layout)
-                const len_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const len_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len_temp, iterable });
 
-                const idx_var = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const idx_var = try self.newTemp();
                 try self.lowerer.emit("    {s} = 0\n", .{idx_var});
 
-                try self.lowerer.emit("{s}:\n", .{loop_label});
+                try self.lowerer.emitLabel(loop_label);
 
                 // Check idx < len
-                const cmp_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
-                try self.lowerer.emit("    {s} = lt {s}, {s}\n", .{ cmp_temp, idx_var, len_temp });
-                try self.lowerer.emit("    jz {s}, {s}\n", .{ cmp_temp, end_label });
+                const cmp_temp = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cmp_temp, idx_var, len_temp });
+                _ = try self.emitBranchIfFalse(cmp_temp, end_label);
+                try self.pushLoopTargets(end_label, loop_label);
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
 
                 // Load element: iterable[idx]
-                const ptr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const ptr_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ptr_temp, iterable });
-                const off_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const off_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = mul {s}, 4\n", .{ off_temp, idx_var });
-                const addr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const addr_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, ptr_temp, off_temp });
-                try self.lowerer.emit("    {s} = load {s} as i32\n", .{ iter_name, addr_temp });
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ iter_name, addr_temp });
 
                 try self.scope_manager.enterScope();
                 try self.scope_manager.declareVar(iter_name, "i32", iter_name, false);
@@ -873,7 +1213,7 @@ pub const Parser = struct {
                     while (self.current.tag != .r_brace and self.current.tag != .eof) {
                         try self.parseStatement();
                     }
-                    try self.scope_manager.exitScope(self.lowerer);
+                    try self.exitScopeReleasingLocals();
                     try self.advance();
                 } else {
                     try self.parseStatement();
@@ -882,12 +1222,14 @@ pub const Parser = struct {
                 try self.scope_manager.exitScope(self.lowerer);
 
                 // Increment idx
-                const inc_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const inc_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inc_temp, idx_var });
                 try self.lowerer.emit("    {s} = {s}\n", .{ idx_var, inc_temp });
 
-                try self.lowerer.emit("    jmp {s}\n", .{loop_label});
-                try self.lowerer.emit("{s}:\n", .{end_label});
+                try self.lowerer.useLabel(loop_label);
+                try self.lowerer.emitJumpTo(loop_label);
+                try self.lowerer.emitLabel(end_label);
+                self.popLoopTargets();
                 return;
             }
         }
@@ -905,8 +1247,10 @@ pub const Parser = struct {
         const label_id = self.nextLabelId();
         const loop_label = try std.fmt.allocPrint(self.allocator, "L_for_{d}", .{label_id});
         const end_label = try std.fmt.allocPrint(self.allocator, "L_endfor_{d}", .{label_id});
+        try self.lowerer.reserveLabel(loop_label);
+        try self.lowerer.reserveLabel(end_label);
 
-        try self.lowerer.emit("{s}:\n", .{loop_label});
+        try self.lowerer.emitLabel(loop_label);
 
         // Parse condition
         var cond: ?[]const u8 = null;
@@ -915,37 +1259,54 @@ pub const Parser = struct {
         }
         try self.expect(.semicolon);
 
-        // Parse increment (we'll emit it at end of loop body)
-        var inc_expr: ?[]const u8 = null;
+        // Parse the increment clause into a deferred buffer.
+        //
+        // The increment must be emitted *after* the loop body, not here in the
+        // header. SA-ASM emits basic blocks in execution order, and a `for`
+        // loop runs body-then-increment. Emitting it here would place the
+        // increment ahead of the loop test, running the body one extra time
+        // with an already-incremented induction variable.
+        var inc_buf: ?std.ArrayList(u8) = null;
         if (self.current.tag != .r_paren) {
-            inc_expr = try self.parseExpression();
+            var buf = std.ArrayList(u8).init(self.allocator);
+            self.lowerer.capture = &buf;
+            const inc_result = self.parseExpression();
+            self.lowerer.capture = null;
+            // Surface parse errors, but keep the captured text.
+            _ = try inc_result;
+            inc_buf = buf;
         }
         try self.expect(.r_paren);
 
         if (cond) |c| {
-            try self.lowerer.emit("    jz {s}, {s}\n", .{ c, end_label });
+            _ = try self.emitBranchIfFalse(c, end_label);
         }
+        try self.pushLoopTargets(end_label, loop_label);
 
-        // Body
+        // Body. Registers bound here are re-assigned every iteration.
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
         if (self.current.tag == .l_brace) {
             try self.advance();
             try self.scope_manager.enterScope();
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
-            try self.scope_manager.exitScope(self.lowerer);
+            try self.exitScopeReleasingLocals();
             try self.advance();
         } else {
             try self.parseStatement();
         }
 
-        // Increment
-        if (inc_expr) |_| {
-            // inc_expr was already emitted as temp registers, just need the assignment effect
+        // Increment, now in correct execution order.
+        if (inc_buf) |buf| {
+            try self.lowerer.emitRaw(buf.items);
         }
 
-        try self.lowerer.emit("    jmp {s}\n", .{loop_label});
-        try self.lowerer.emit("{s}:\n", .{end_label});
+        try self.lowerer.useLabel(loop_label);
+        try self.lowerer.emitJumpTo(loop_label);
+        try self.lowerer.emitLabel(end_label);
+        self.popLoopTargets();
     }
 
     fn parseSwitch(self: *Parser) anyerror!void {
@@ -956,46 +1317,96 @@ pub const Parser = struct {
 
         const label_id = self.nextLabelId();
         const end_label = try std.fmt.allocPrint(self.allocator, "L_endswitch_{d}", .{label_id});
+        try self.lowerer.reserveLabel(end_label);
 
         try self.expect(.l_brace);
+        try self.pushSwitchTarget(end_label);
 
+        // Emit a chain of guarded case tests.
+        //
+        // Each case gets a "test" label and a "body" label. The test for case
+        // i+1 is the fallthrough target of case i's comparison, so a value that
+        // matches no case lands on the final test label, where the `default`
+        // body (or the exit jump) lives. Testing this way keeps the dispatch
+        // chain in one basic block per case and avoids jumping past the end
+        // label, which previously let non-final cases fall through.
         var case_idx: u32 = 0;
         while (self.current.tag == .keyword_case) {
             try self.advance(); // case
             const case_val = try self.parseExpression();
             try self.expect(.colon);
 
-            const case_label = try std.fmt.allocPrint(self.allocator, "L_case_{d}_{d}", .{ label_id, case_idx });
-            const next_label = try std.fmt.allocPrint(self.allocator, "L_case_{d}_{d}", .{ label_id, case_idx + 1 });
+            const test_label = try std.fmt.allocPrint(self.allocator, "L_case_{d}_t{d}", .{ label_id, case_idx });
+            const body_label = try std.fmt.allocPrint(self.allocator, "L_case_{d}_b{d}", .{ label_id, case_idx });
+            const next_test = try std.fmt.allocPrint(self.allocator, "L_case_{d}_t{d}", .{ label_id, case_idx + 1 });
+            try self.lowerer.reserveLabel(test_label);
+            try self.lowerer.reserveLabel(body_label);
+            try self.lowerer.reserveLabel(next_test);
 
-            // Compare and jump
-            const cmp_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+            try self.lowerer.emitLabel(test_label);
+            const cmp_temp = try self.newTemp();
             try self.lowerer.emit("    {s} = eq {s}, {s}\n", .{ cmp_temp, scrutinee, case_val });
-            try self.lowerer.emit("    jz {s}, {s}\n", .{ cmp_temp, next_label });
-            try self.lowerer.emit("{s}:\n", .{case_label});
+            try self.emitBranch(cmp_temp, body_label, next_test);
+            try self.lowerer.emitLabel(body_label);
 
-            while (self.current.tag != .keyword_case and self.current.tag != .r_brace and self.current.tag != .eof) {
+            // Consume the case body up to the next `case`, `default`, or the
+            // switch's closing brace.
+            //
+            // Brace depth must be tracked: a case body is commonly written as
+            // a block (`case 1: { ... }`), and stopping at that block's `}`
+            // would end the body early and leave the remaining cases to be
+            // emitted as top-level code.
+            var depth: u32 = 0;
+            self.branch_depth += 1;
+            defer self.branch_depth -= 1;
+            while (self.current.tag != .eof) {
+                if (depth == 0) {
+                    if (self.current.tag == .keyword_case) break;
+                    if (self.current.tag == .r_brace) break;
+                    if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "default")) break;
+                }
+                if (self.current.tag == .l_brace) depth += 1;
+                if (self.current.tag == .r_brace) depth -|= 1;
                 try self.parseStatement();
             }
 
-            try self.lowerer.emit("    jmp {s}\n", .{end_label});
+            if (!self.lowerer.isTerminated()) {
+                try self.releaseLiveRegisters();
+                try self.lowerer.emitJumpTo(end_label);
+            }
             case_idx += 1;
         }
 
-        // default
-        if (self.current.tag == .identifier) {
-            const id = self.currentText();
-            if (std.mem.eql(u8, id, "default")) {
-                try self.advance();
-                try self.expect(.colon);
-                while (self.current.tag != .r_brace and self.current.tag != .eof) {
-                    try self.parseStatement();
-                }
+        // Fallthrough point for a scrutinee that matched no case: the `default`
+        // body when present, otherwise an immediate exit.
+        const default_test = try std.fmt.allocPrint(self.allocator, "L_case_{d}_t{d}", .{ label_id, case_idx });
+        try self.lowerer.reserveLabel(default_test);
+        try self.lowerer.emitLabel(default_test);
+
+        // `default` is not a reserved word in this lexer, so it arrives as an
+        // identifier.
+        if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "default")) {
+            try self.advance();
+            try self.expect(.colon);
+            // Depth-tracked, for the same reason as case bodies: a braced
+            // `default: { ... }` must have its own closing brace consumed here.
+            // Stopping at that brace would leave it for the `expect` below,
+            // which would then eat the switch's closing brace and desync the
+            // enclosing block.
+            var default_depth: u32 = 0;
+            while (self.current.tag != .eof) {
+                if (default_depth == 0 and self.current.tag == .r_brace) break;
+                if (self.current.tag == .l_brace) default_depth += 1;
+                if (self.current.tag == .r_brace) default_depth -|= 1;
+                try self.parseStatement();
             }
+        } else {
+            try self.lowerer.emitJumpTo(end_label);
         }
 
         try self.expect(.r_brace);
-        try self.lowerer.emit("{s}:\n", .{end_label});
+        try self.lowerer.emitLabel(end_label);
+        _ = self.break_stack.pop();
     }
 
     // ==========================================
@@ -1005,10 +1416,14 @@ pub const Parser = struct {
     fn parseReturn(self: *Parser) anyerror!void {
         try self.expect(.keyword_return);
         if (self.current.tag != .semicolon and self.current.tag != .r_brace and self.current.tag != .eof) {
+            // Evaluate first: the expression may read a local that is about to
+            // be released, and releasing before the read is a use-after-move.
             const val = try self.parseExpression();
-            try self.lowerer.emit("    return {s}\n", .{val});
+            try self.releaseLiveRegistersExcept(val);
+            try self.lowerer.emitTerm("    return {s}\n", .{val});
         } else {
-            try self.lowerer.emit("    return\n", .{});
+            try self.releaseLiveRegisters();
+            try self.lowerer.emitTerm("    return\n", .{});
         }
         _ = try self.accept(.semicolon);
     }
@@ -1035,8 +1450,8 @@ pub const Parser = struct {
             try self.advance();
         }
 
-        try self.lowerer.emit("    jmp {s}\n", .{end_label});
-        try self.lowerer.emit("{s}:\n", .{catch_label});
+        try self.lowerer.emitJumpTo(end_label);
+        try self.lowerer.emitLabel(catch_label);
 
         if (self.current.tag == .keyword_catch) {
             try self.advance();
@@ -1066,14 +1481,17 @@ pub const Parser = struct {
             try self.scope_manager.exitScope(self.lowerer);
         }
 
-        try self.lowerer.emit("{s}:\n", .{end_label});
+        try self.lowerer.emitLabel(end_label);
     }
 
     fn parseThrow(self: *Parser) anyerror!void {
         try self.expect(.keyword_throw);
         const val = try self.parseExpression();
         _ = try self.accept(.semicolon);
-        try self.lowerer.emit("    throw {s}\n", .{val});
+        // SA-ASM has no `throw`: its closest terminator is `panic`, which
+        // aborts. `try`/`catch` therefore cannot reproduce JS exception
+        // semantics and lower to a jump-based approximation.
+        try self.lowerer.emitTerm("    panic {s}\n", .{val});
     }
 
     // ==========================================
@@ -1110,13 +1528,13 @@ pub const Parser = struct {
             // Standard library: filesystem module
             for (symbols.items) |sym| {
                 if (std.mem.eql(u8, sym, "readFile")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_read_file", .string_args = "1" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_read_file", .string_args = "1", .extra_args = "1048576" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "writeFile")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_write_file", .string_args = "1" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_write_file", .string_args = "12" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "open")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_open", .string_args = "1" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_open", .string_args = "1", .extra_args = "0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "create")) {
                     try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_create", .string_args = "1" });
@@ -1125,10 +1543,10 @@ pub const Parser = struct {
                     try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_close", .string_args = "" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "read")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_read", .string_args = "" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_read", .string_args = "", .extra_args = "&buf, 4096" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "write")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_write", .string_args = "" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_file_write", .string_args = "", .extra_args = "&buf, 0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "remove")) {
                     try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_fs_remove_file", .string_args = "1" });
@@ -1138,31 +1556,35 @@ pub const Parser = struct {
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 }
             }
-            try self.lowerer.emit("    // Stdlib: fs module imported\n", .{});
+            try self.lowerer.emitImport("sa_std/fs.sai");
         } else if (std.mem.eql(u8, path, "net")) {
             // Standard library: network module
             for (symbols.items) |sym| {
                 if (std.mem.eql(u8, sym, "tcpConnect")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_connect", .string_args = "1" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_connect", .string_args = "1", .extra_args = "0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "tcpListen")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_listener_bind", .string_args = "1" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_listener_bind", .string_args = "1", .extra_args = "0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "tcpAccept")) {
                     try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_listener_accept", .string_args = "" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "tcpRead")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_stream_read", .string_args = "" });
+                    // `sa_net_tcp_stream_read(stream, &buf, cap)`: the buffer and
+                    // its capacity are out-parameters, supplied as a scratch
+                    // region by `emitStdlibCall` because SA-ASM has fixed callee
+                    // arity and the TypeScript call site passes only the stream.
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_stream_read", .string_args = "", .extra_args = "&buf, 0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "tcpWrite")) {
-                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_stream_write", .string_args = "" });
+                    try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_stream_write", .string_args = "", .extra_args = "&buf, 0" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 } else if (std.mem.eql(u8, sym, "tcpClose")) {
                     try self.stdlib.append(.{ .name = sym, .sa_primitive = "sa_net_tcp_stream_close", .string_args = "" });
                     try self.scope_manager.declareVar(sym, "fn", sym, false);
                 }
             }
-            try self.lowerer.emit("    // Stdlib: net module imported\n", .{});
+            try self.lowerer.emitImport("sa_std/net.sai");
         } else if (std.mem.endsWith(u8, path, ".ts") or std.mem.endsWith(u8, path, ".sa")) {
             // Local module import: emit @import directive
             try self.lowerer.emit("    @import {{ ", .{});
@@ -1253,104 +1675,73 @@ pub const Parser = struct {
 
 
 
+    /// Lower a template literal to an SA-ASM string slice.
+    ///
+    /// An SA-ASM string is a `{ptr, len}` slice, not a literal: a string cannot
+    /// be written as an operand. A literal is therefore materialised as a
+    /// file-scope `@const NAME = utf8:"..."` data constant, then assembled into
+    /// a slice with a 16-byte stack slot (this is what `SLICE_NEW` expands to).
+    ///
+    /// Templates with `${...}` interpolation additionally need the value
+    /// rendered to text (`@sa_fmt_i64_into`) and the chunks joined
+    /// (`@sa_string_concat`, which yields a bare pointer with no companion
+    /// length). That path is not implemented yet and is reported as a
+    /// diagnostic rather than emitting a `concat` instruction, which is not an
+    /// SA mnemonic.
     fn parseTemplateLiteral(self: *Parser) anyerror![]const u8 {
-        // template_start token contains the text before first ${
-        // The token text includes the backtick, so strip it
-        const first_tok_text = self.currentText();
-        // Skip the leading backtick if present
-        var first_text = first_tok_text;
-        if (first_text.len > 0 and first_text[0] == '`') {
-            first_text = first_text[1..];
+        const raw = self.currentText();
+
+        if (self.current.tag != .template_end) {
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                "error: interpolated template literals are not yet lowerable to SA-ASM (needs @sa_fmt_i64_into to render values and @sa_string_concat to join chunks)",
+                .{},
+            );
+            try self.errors.append(.{
+                .line = self.current.line,
+                .col = self.current.col,
+                .message = msg,
+            });
+            // The CLI surfaces parser diagnostics on stderr via this channel;
+            // `self.errors` is only consumed programmatically.
+            std.debug.print("error:{d}:{d}: {s}\n", .{ self.current.line, self.current.col, msg });
+            return error.UnsupportedTemplateLiteral;
         }
 
-        // Switch lexer to template chunk mode
-        self.template_lexer_mode = true;
-
-        // Start building the result
-        var result: []const u8 = undefined;
-        var has_result = false;
-
-        if (first_text.len > 0) {
-            // Emit string constant for first text chunk
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
-            try self.lowerer.emit("    {s} = \"{s}\"\n", .{ temp_name, first_text });
-            result = temp_name;
-            has_result = true;
+        // Strip the surrounding backticks; the lexer spans both.
+        var text = raw;
+        if (text.len >= 2 and text[0] == '`' and text[text.len - 1] == '`') {
+            text = text[1 .. text.len - 1];
         }
 
-        // Advance past template_start to get to the expression
-        try self.advance(); // this uses nextTemplateChunk for peek
+        const const_id = self.nextLabelId();
+        const const_name = try std.fmt.allocPrint(self.allocator, "SC_{d}", .{const_id});
+        try self.lowerer.emitConst(const_name, text);
 
-        // Now current is template_start consumed, peek is whatever nextTemplateChunk returned
-        // Actually, after advance(), current = old peek (first expression token), peek = nextTemplateChunk result
-        // We need to parse expressions and template chunks alternately
+        // Leave template mode: the literal is fully consumed, so re-prime both
+        // tokens from the normal lexer rather than promoting a stale
+        // template-mode lookahead.
+        self.template_lexer_mode = false;
+        self.lexer.interp_expr_open = false;
+        // `peek` was already primed by the `advance` that moved `current` onto
+        // this literal, so consume that token instead of reading two fresh
+        // ones. Re-lexing here skipped a token: a `}` closing an object
+        // literal vanished, and the literal's enclosing scope was never closed.
+        self.current = self.peek;
+        self.peek = self.lexer.next();
 
-        while (self.current.tag != .template_end and self.current.tag != .eof) {
-            // Parse the expression inside ${...}
-            // The current token is the first token of the expression
-            const expr_val = try self.parseExpression();
+        // 16-byte slice slot: {ptr at +0, len at +8}. This mirrors what
+        // `SLICE_NEW` expands to, but uses `alloc` rather than `stack_alloc` so
+        // the slice can be bound to a variable: a stack allocation cannot
+        // escape its function ("StackEscape"), and callers routinely store the
+        // result. Being heap-owned, it is released with `!` like any other
+        // owned register.
+        const slice_reg = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{slice_reg});
+        try self.lowerer.emit("    store {s} + 0, &{s} as ptr\n", .{ slice_reg, const_name });
+        try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ slice_reg, text.len });
 
-            if (has_result) {
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
-                try self.lowerer.emit("    {s} = concat {s}, {s}\n", .{ temp_name, result, expr_val });
-                result = temp_name;
-            } else {
-                result = expr_val;
-                has_result = true;
-            }
-
-            // After the expression, the lexer should have produced template_mid or template_end
-            // via nextTemplateChunk. The } that closes ${...} is consumed by the template chunk scanner.
-            // current should now be template_mid or template_end.
-
-            if (self.current.tag == .template_mid) {
-                // Get the text between } and next ${
-                const mid_text = self.currentText();
-                if (mid_text.len > 0) {
-                    const temp_id = self.nextLabelId();
-                    const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
-                    try self.lowerer.emit("    {s} = \"{s}\"\n", .{ temp_name, mid_text });
-                    const concat_id = self.nextLabelId();
-                    const concat_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{concat_id});
-                    try self.lowerer.emit("    {s} = concat {s}, {s}\n", .{ concat_name, result, temp_name });
-                    result = concat_name;
-                }
-                try self.advance(); // move to next expression
-            }
-            // If template_end, the loop condition will handle it
-        }
-
-        // Handle template_end - get the final text
-        if (self.current.tag == .template_end) {
-            const end_text = self.currentText();
-            // Strip trailing backtick
-            var final_text = end_text;
-            if (final_text.len > 0 and final_text[final_text.len - 1] == '`') {
-                final_text = final_text[0 .. final_text.len - 1];
-            }
-            if (final_text.len > 0) {
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
-                try self.lowerer.emit("    {s} = \"{s}\"\n", .{ temp_name, final_text });
-                if (has_result) {
-                    const concat_id = self.nextLabelId();
-                    const concat_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{concat_id});
-                    try self.lowerer.emit("    {s} = concat {s}, {s}\n", .{ concat_name, result, temp_name });
-                    result = concat_name;
-                } else {
-                    result = temp_name;
-                    has_result = true;
-                }
-            }
-            // Switch back to normal lexer mode and consume template_end
-            self.template_lexer_mode = false;
-            try self.advance();
-        }
-
-        if (!has_result) return "\"\"";
-        return result;
+        return slice_reg;
     }
 
     /// Parse arrow function body and emit closure callback + context
@@ -1509,6 +1900,27 @@ pub const Parser = struct {
         return null;
     }
 
+    /// Whether `primitive` is declared `-> u64!` and therefore hands back a
+    /// two-field value rather than a bare integer.
+    ///
+    /// Every consumer of a TCP handle -- `sa_net_tcp_listener_accept`,
+    /// `sa_net_tcp_stream_read` and friends -- declares the handle as a plain
+    /// `u64`, so the two-field result has to be reduced to field 0 before it is
+    /// stored. `sa_fs_read_file` is deliberately absent: it is also `-> u64!`,
+    /// but the buffer accessors take that value whole as a `ptr`, so unwrapping
+    /// it would be wrong.
+    fn isFallibleHandle(primitive: []const u8) bool {
+        const fallible_handles = [_][]const u8{
+            "sa_net_tcp_connect",
+            "sa_net_tcp_listener_bind",
+            "sa_net_tcp_listener_accept",
+        };
+        for (fallible_handles) |name| {
+            if (std.mem.eql(u8, primitive, name)) return true;
+        }
+        return false;
+    }
+
     /// Emit a stdlib call with string arg transformation.
     /// For string args, load ptr+len from the string struct.
     fn emitStdlibCall(
@@ -1533,26 +1945,33 @@ pub const Parser = struct {
 
             if (is_str) {
                 if (arg.len > 0 and arg[0] == '"') {
-                    // String literal: create a temporary string struct
-                    const str_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                    // String literal argument.
+                    //
+                    // An SA-ASM string is a {ptr, len} slice and a literal is
+                    // not a valid operand, so the text becomes a file-scope
+                    // `@const` data constant and the slice is built from it.
+                    const str_temp = try self.newTemp();
                     const str_len = if (arg.len >= 2) arg.len - 2 else 0;
+                    const lit_const = try std.fmt.allocPrint(self.allocator, "SA_STR_{d}", .{self.nextLabelId()});
+                    try self.lowerer.emitConst(lit_const, arg[1 .. arg.len - 1]);
                     try self.lowerer.emit("    {s} = alloc 16\n", .{str_temp});
-                    // Store pointer to string data (simplified: use the literal directly)
-                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ str_temp, arg });
+                    try self.lowerer.emit("    store {s} + 0, &{s} as ptr\n", .{ str_temp, lit_const });
                     try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ str_temp, str_len });
-                    const ptr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                    const ptr_temp = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ptr_temp, str_temp });
-                    const len_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                    const len_temp = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len_temp, str_temp });
-                    try transformed.append(ptr_temp);
+                    // A primitive declared `&path: ptr` expects the pointer
+                    // passed by reference, i.e. `&reg` at the call site.
+                    try transformed.append(try std.fmt.allocPrint(self.allocator, "&{s}", .{ptr_temp}));
                     try transformed.append(len_temp);
                 } else {
                     // Variable: expand string struct to (ptr, len) pair
-                    const ptr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                    const ptr_temp = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ptr_temp, arg });
-                    const len_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                    const len_temp = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len_temp, arg });
-                    try transformed.append(ptr_temp);
+                    try transformed.append(try std.fmt.allocPrint(self.allocator, "&{s}", .{ptr_temp}));
                     try transformed.append(len_temp);
                 }
             } else {
@@ -1560,7 +1979,36 @@ pub const Parser = struct {
             }
         }
 
-        if (result_dest) |dest| {
+        // `sa_net_tcp_listener_bind` is declared `-> u64!`, and a fallible return
+        // is materialised by the backend as a two-field value. Every consumer of
+        // that handle -- `sa_net_tcp_listener_accept` in particular -- takes a
+        // plain `u64`, so handing it the struct is rejected as a parameter type
+        // mismatch. The handle is field 0, so the call is made into a scratch
+        // register and the field is extracted into the destination. This lives
+        // here rather than at the call sites because the statement and the
+        // expression paths both funnel through this function, and an earlier
+        // attempt to special-case each path separately missed the fact that
+        // `lookupStdlib` is consulted before either of them.
+        // `&buf` in the stdlib table is a placeholder, not an SA operand: no
+        // symbol named `buf` exists, so emitting it verbatim produced
+        // `error: InvalidOperand`. A read/write out-parameter needs a real
+        // address, so a scratch region is allocated here and its address is
+        // passed instead. The allocation is emitted before the call is opened,
+        // because the call text is already partially written by that point.
+        var buf_ref: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, entry.extra_args, "&buf") != null) {
+            const scratch = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 4096\n", .{scratch});
+            buf_ref = scratch;
+        }
+
+        const returns_handle_pair = isFallibleHandle(entry.sa_primitive);
+        var pair_scratch: ?[]const u8 = null;
+        if (returns_handle_pair and result_dest != null) {
+            const scratch = try self.newTemp();
+            pair_scratch = scratch;
+            try self.lowerer.emit("    {s} = call @{s}(", .{ scratch, entry.sa_primitive });
+        } else if (result_dest) |dest| {
             try self.lowerer.emit("    {s} = call @{s}(", .{ dest, entry.sa_primitive });
         } else {
             try self.lowerer.emit("    call @{s}(", .{entry.sa_primitive});
@@ -1569,6 +2017,21 @@ pub const Parser = struct {
             if (idx > 0) try self.lowerer.emit(", ", .{});
             try self.lowerer.emit("{s}", .{arg});
         }
+        // SA-ASM has fixed callee arity, so supply the parameters the primitive
+        // declares beyond the caller's own arguments.
+        if (entry.extra_args.len > 0) {
+            if (transformed.items.len > 0) try self.lowerer.emit(", ", .{});
+            if (buf_ref) |scratch| {
+                const rest = std.mem.trim(u8, entry.extra_args["&buf".len..], " ,");
+                if (rest.len > 0) {
+                    try self.lowerer.emit("&{s}, {s}", .{ scratch, rest });
+                } else {
+                    try self.lowerer.emit("&{s}", .{scratch});
+                }
+            } else {
+                try self.lowerer.emit("{s}", .{entry.extra_args});
+            }
+        }
         // Append arrow closure context if present
         if (self.last_arrow_ctx) |ctx_arg| {
             if (transformed.items.len > 0) try self.lowerer.emit(", ", .{});
@@ -1576,6 +2039,10 @@ pub const Parser = struct {
             self.last_arrow_ctx = null;
         }
         try self.lowerer.emit(")\n", .{});
+
+        if (pair_scratch) |scratch| {
+            try self.lowerer.emit("    {s} = load {s} + 0 as i64\n", .{ result_dest.?, scratch });
+        }
     }
 
     fn parseIdentifierStatement(self: *Parser) anyerror!void {
@@ -1640,12 +2107,11 @@ pub const Parser = struct {
                     try self.advance();
                     const val = try self.parseExpression();
                     _ = try self.accept(.semicolon);
-                    try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ left_name, field.offset, val, field.type_name });
+                    try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ left_name, field.offset, val, saTypeOf(field.type_name) });
                     return;
                 } else {
                     // Load intermediate
-                    const temp_id = self.nextLabelId();
-                    const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                    const temp_name = try self.newTemp();
                     const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
                         field.type_name
                     else
@@ -1664,29 +2130,54 @@ pub const Parser = struct {
                 try self.advance();
                 const val = try self.parseExpression();
                 _ = try self.accept(.semicolon);
+                // `name` is a slice, so the element address comes from the
+                // header's data pointer at +0, not from the header itself.
+                const base_temp = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ base_temp, name });
                 // Compute offset: index * 4 (default i32)
-                const off_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+                const off_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = mul {s}, 4\n", .{ off_temp, index });
-                const addr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
-                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, name, off_temp });
-                try self.lowerer.emit("    store {s}, {s} as i32\n", .{ addr_temp, val });
+                const addr_temp = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, base_temp, off_temp });
+                // `store` requires an explicit byte offset, like `load`.
+                try self.lowerer.emit("    store {s} + 0, {s} as i32\n", .{ addr_temp, val });
             }
         } else if (self.current.tag == .equal) {
             // Simple assignment: x = expr
             try self.advance();
             const val = try self.parseExpression();
             _ = try self.accept(.semicolon);
+
+            // A register-to-register assignment moves its source. Inside a
+            // conditional that is unsound: the source ends up Consumed on the
+            // taken arm and Active on the other, and the verifier's merge at
+            // the join point reports PhiStateConflict. This is the common
+            // "conditionally update an accumulator" shape, so emit a
+            // non-moving copy there instead. Arithmetic leaves its operands
+            // live, so both arms agree.
+            if (self.branch_depth > 0 and self.scope_manager.lookup(val) != null) {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ name, val });
+                return;
+            }
+
+            // A register-to-register assignment moves the source: emitting
+            // `!` for it afterwards is a use-after-move error. Compound right
+            //-hand sides (arithmetic, calls) leave their operands live and are
+            // released normally.
+            if (self.scope_manager.lookup(val) != null) {
+                self.scope_manager.markConsumed(val);
+            }
             try self.lowerer.emit("    {s} = {s}\n", .{ name, val });
         } else if (self.current.tag == .plus_plus) {
             try self.advance();
             _ = try self.accept(.semicolon);
-            const temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+            const temp = try self.newTemp();
             try self.lowerer.emit("    {s} = add {s}, 1\n", .{ temp, name });
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
         } else if (self.current.tag == .minus_minus) {
             try self.advance();
             _ = try self.accept(.semicolon);
-            const temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+            const temp = try self.newTemp();
             try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ temp, name });
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
         } else {
@@ -1734,6 +2225,11 @@ pub const Parser = struct {
             .template_start => {
                 return try self.parseTemplateLiteral();
             },
+            // A template with no interpolation lexes straight to `template_end`,
+            // because the closing backtick is found before any `${`.
+            .template_end => {
+                return try self.parseTemplateLiteral();
+            },
 
             .identifier => {
                 const tok = self.current;
@@ -1779,17 +2275,19 @@ pub const Parser = struct {
             .minus => {
                 try self.advance();
                 const operand = try self.parseExpressionWithPrecedence(.product);
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
                 try self.lowerer.emit("    {s} = neg {s}\n", .{ temp_name, operand });
                 return temp_name;
             },
             .bang => {
                 try self.advance();
                 const operand = try self.parseExpressionWithPrecedence(.product);
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
-                try self.lowerer.emit("    {s} = not {s}\n", .{ temp_name, operand });
+                const temp_name = try self.newTemp();
+                // SA's `not` only accepts a parameter as its operand; on a
+                // register bound by an ordinary assignment it is rejected with
+                // InvalidOperand. `eq x, 0` is the same test and is accepted in
+                // every position, so logical negation lowers to that instead.
+                try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ temp_name, operand });
                 return temp_name;
             },
             .ampersand => {
@@ -1798,8 +2296,7 @@ pub const Parser = struct {
                 const tok = self.current;
                 try self.expect(.identifier);
                 const name = self.tokenText(tok);
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
                 try self.lowerer.emit("    {s} = &{s}\n", .{ temp_name, name });
                 return temp_name;
             },
@@ -1809,8 +2306,7 @@ pub const Parser = struct {
                 const tok = self.current;
                 try self.expect(.identifier);
                 const name = self.tokenText(tok);
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
                 try self.lowerer.emit("    {s} = ^{s}\n", .{ temp_name, name });
                 return temp_name;
             },
@@ -1825,8 +2321,7 @@ pub const Parser = struct {
                     _ = try self.accept(.comma);
                 }
                 try self.expect(.r_bracket);
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
                 const arr_size = @as(u32, @intCast(vals.items.len)) * 4;
                 try self.lowerer.emit("    {s} = alloc {d}\n", .{ temp_name, arr_size });
                 for (vals.items, 0..) |val, idx| {
@@ -1838,8 +2333,7 @@ pub const Parser = struct {
             .keyword_await => {
                 try self.advance();
                 const operand = try self.parseExpression();
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
                 try self.lowerer.emit("    {s} = await {s}\n", .{ temp_name, operand });
                 return temp_name;
             },
@@ -1862,15 +2356,17 @@ pub const Parser = struct {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
 
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+            const temp_name = try self.newTemp();
 
             const sa_op = switch (tag) {
                 .plus => "add",
                 .minus => "sub",
                 .star => "mul",
                 .slash => "div",
-                .percent => "mod",
+                // SA-ASM spells the signed comparison/remainder forms
+                // `slt`/`sle`/`sgt`/`sge`/`srem`. Plain `lt`/`le`/`gt`/`ge`/
+                // `mod` are not mnemonics, so the assembler rejected them.
+                .percent => "srem",
                 else => unreachable,
             };
 
@@ -1883,16 +2379,15 @@ pub const Parser = struct {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
 
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+            const temp_name = try self.newTemp();
 
             const sa_op = switch (tag) {
                 .equal_equal => "eq",
                 .bang_equal => "ne",
-                .less => "lt",
-                .greater => "gt",
-                .less_equal => "le",
-                .greater_equal => "ge",
+                .less => "slt",
+                .greater => "sgt",
+                .less_equal => "sle",
+                .greater_equal => "sge",
                 else => unreachable,
             };
 
@@ -1905,8 +2400,7 @@ pub const Parser = struct {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
 
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+            const temp_name = try self.newTemp();
 
             const sa_op: []const u8 = if (tag == .amp_amp) "and" else "or";
             try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp_name, sa_op, left, right });
@@ -1942,8 +2436,7 @@ pub const Parser = struct {
                     return slice_var_name;
                 } else if (std.mem.eql(u8, member_name, "length")) {
                     // string.length property
-                    const temp_id = self.nextLabelId();
-                    const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                    const temp_name = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 8 as u32\n", .{ temp_name, left });
                     return temp_name;
                 } else {
@@ -1969,8 +2462,7 @@ pub const Parser = struct {
                 }
                 const field = found_field orelse return error.UnknownField;
 
-                const temp_id = self.nextLabelId();
-                const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+                const temp_name = try self.newTemp();
 
                 const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
                     field.type_name
@@ -1988,22 +2480,26 @@ pub const Parser = struct {
             const index = try self.parseExpression();
             try self.expect(.r_bracket);
 
-            const off_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
+            // `left` is a slice, so the element base is the data pointer stored
+            // in the header at +0, not the header itself.
+            const base_temp = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ base_temp, left });
+
+            const off_temp = try self.newTemp();
             try self.lowerer.emit("    {s} = mul {s}, 4\n", .{ off_temp, index });
 
-            const addr_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
-            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, left, off_temp });
+            const addr_temp = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, base_temp, off_temp });
 
-            const val_temp = try std.fmt.allocPrint(self.allocator, "t_{d}", .{self.nextLabelId()});
-            try self.lowerer.emit("    {s} = load {s} as i32\n", .{ val_temp, addr_temp });
+            const val_temp = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ val_temp, addr_temp });
             return val_temp;
         }
 
         // Postfix increment/decrement: i++ / i--
         if (tag == .plus_plus or tag == .minus_minus) {
             try self.advance();
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+            const temp_name = try self.newTemp();
             const sa_op: []const u8 = if (tag == .plus_plus) "add" else "sub";
             try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ temp_name, sa_op, left });
             try self.lowerer.emit("    {s} = {s}\n", .{ left, temp_name });
@@ -2023,12 +2519,17 @@ pub const Parser = struct {
             }
             try self.expect(.r_paren);
 
-            const temp_id = self.nextLabelId();
-            const temp_name = try std.fmt.allocPrint(self.allocator, "t_{d}", .{temp_id});
+            const temp_name = try self.newTemp();
 
             // Check if this is a stdlib function
             if (self.lookupStdlib(left)) |entry| {
                 try self.emitStdlibCall(temp_name, entry, args);
+            } else if (std.mem.eql(u8, left, "alloc") and args.items.len == 1) {
+                // Heap allocation is a primitive instruction, not a function:
+                // `alloc(N)` must emit `t = alloc N`, because there is no
+                // `@alloc` symbol to call and the assembler rejects it with
+                // "callee is not declared".
+                try self.lowerer.emit("    {s} = alloc {s}\n", .{ temp_name, args.items[0] });
             } else {
                 try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, left });
                 for (args.items, 0..) |arg, idx| {

@@ -1,5 +1,11 @@
 # Task Requirements: sa_plugin_ts
 
+> **Status: partially complete.** Items marked `[x]` are implemented *and* verified
+> to pass the SA-ASM verifier. See "Known Gaps" for features that parse but do not
+> yet lower to valid SA-ASM. An earlier revision of this file claimed 100%
+> completion; that was wrong because the test suite only asserted on substrings of
+> the lowerer output and never assembled the result.
+
 ## 1. Goal
 Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict subset of TypeScript that targets the SA-ASM ecosystem.
 
@@ -7,15 +13,15 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] **SIMD Lexer**: Zero-copy string slices with SIMD-optimized whitespace scanning and line:col tracking.
 - [x] **Type-Aware Parser**: Pratt parser handles TS interfaces, type aliases, primitive types, enums, generics.
 - [x] **Static Offset Mapping**: Interface property access lowered to static byte offsets.
-- [x] **Ownership Injection**: SA ownership operators (!, ^) injected based on lexical scope.
-- [x] **Standard Library Mapping**: fs and net calls mapped to SA @sa_fs_* and @sa_net_* primitives with string arg expansion.
-- [x] **Async/Await Support**: `async function` and `await` parsed and lowered to SA macros.
-- [x] **WASM Interop**: .wasm imports parsed, symbols linked as @extern declarations.
-- [x] **WIT Support**: .wit file imports emit @wit_import directives for stub generation.
+- [x] **Ownership Injection**: SA ownership operator `!` injected from lexical scope, and released on every exit path.
+- [x] **Standard Library Mapping**: fs and net calls mapped to SA `@sa_fs_*` / `@sa_net_*` primitives with string arg expansion.
+- [ ] **Async/Await Support**: parsed only; not lowered to valid SA-ASM (see Known Gaps).
+- [ ] **WASM Interop**: `.wasm` imports parsed; emitted directives are not accepted by the assembler (see Known Gaps).
+- [ ] **WIT Support**: `.wit` imports emit `@wit_import` directives; not assembler-accepted (see Known Gaps).
 
 ## 3. Performance Targets
-- [x] **Parsing Speed**: ~5.4k lines/sec in debug mode with SIMD lexer; release builds expected to reach 500k+/sec.
-- [x] **Verification**: Zero runtime cost; all safety checks performed by SA Referee.
+- [x] **Parsing Speed**: ~16k lines/sec in debug mode with the SIMD lexer (benchmark lives in the test suite).
+- [x] **Verification**: Zero runtime cost; all safety checks performed by the SA Referee.
 - [x] **Binary Size**: Minimal overhead, producing slim native/WASM binaries.
 
 ## 4. Constraints
@@ -24,22 +30,185 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] No dynamic JS features (any, eval, prototype modification).
 
 ## 5. Additional Features Implemented
-- [x] Comparison operators: ==, !=, <, >, <=, >=
-- [x] Logical operators: &&, ||, !
-- [x] Arithmetic: %, unary -
-- [x] Control flow: if/else, while, for (C-style), for-of, switch/case, break/continue, return
-- [x] Arrays: literal [1,2,3], indexing arr[i], assignment arr[i] = val
+- [x] Comparison operators: `==`, `!=`, `<`, `>`, `<=`, `>=`
+- [x] Logical operators: `&&`, `||`, `!`
+- [x] Arithmetic: `%`, unary `-`
+- [x] Control flow: if/else, while, for (C-style), for-of, switch/case/default, break/continue, return
+- [x] Arrays: literal `[1,2,3]`, indexing `arr[i]`, assignment `arr[i] = val` — including the annotated form `let arr: i32[] = [...]`
 - [x] Enum definitions with auto-numbered variants
 - [x] Type aliases
 - [x] Generic type parameters (Array<T>, Map<K,V>, Box<T>)
 - [x] Arrow function closures with static defunctionalization
-- [x] Try/catch/throw error handling
-- [x] Postfix ++ and --
-- [x] Template literals with embedded expressions
+- [x] Function return type annotations (`function f(): i32`) mapped to SA `-> i32:`
+- [x] `catch (e) { }` binding form parses
 - [x] Module-level import/export (local .ts/.sa modules)
-- [x] CLI handle_command (sa ts lower <file.ts>)
+- [x] CLI handle_command (`sa ts lower [--out <path>] <file.ts>`)
 - [x] Skills metadata registration
 - [x] Standard plugin_api.zig ABI compliance
 - [x] Parser error recovery (collects multiple errors, skips to sync points)
 - [x] SIMD-optimized whitespace/comment scanning
-- [x] Benchmark suite (26 tests total)
+- [x] Benchmark suite (32 tests total)
+- [x] SA-ASM validity regression tests, plus an end-to-end check that runs `sa build` on lowered output
+- [x] TypeScript demo corpus: 248 demos under `demos/`, verified by
+      `tools/verify_demos.sh` (each demo is lowered and then assembled with the
+      real `sa build`). Currently 242 verified against Node, 6 are refused with a
+      located diagnostic, and 0 fail.
+
+## 6. SA-ASM Emission Rules Enforced
+
+These are the invariants the lowerer must hold; each has a regression test:
+
+- Conditional branches use `br <cond> -> <true>, <false>`. There is no `jz`.
+- `break` / `continue` lower to `jmp` at the enclosing loop or switch label.
+- Every value-returning function declares `-> T:`; otherwise the backend rejects the `return`.
+- Every basic block ends in a terminator, and no instruction follows a terminator.
+- Unreferenced labels are dropped, so unreachable merge blocks are not emitted.
+- `load` always carries an explicit byte offset (`load r + 0 as i32`).
+- Live registers, including parameters, are released with `!` before each `return` and before any synthesised function terminator.
+- A register moved by a register-to-register assignment is not released afterwards.
+
+## 6a. Runtime Correctness (differential testing)
+
+Assembling is not sufficient. A demo once verified cleanly and then segfaulted:
+array literals were lowered as a raw element buffer while `for (const v of arr)`
+read them as a slice, so `[1,2,3]` had its first element dereferenced as a data
+pointer. Arrays are now lowered to a real SA slice (a 16-byte `{ptr,len}` header
+plus a separate element buffer), which is also the layout `sa_std` expects.
+
+`tools/verify_demos.sh` therefore links and **runs** every demo and compares the
+result against **Node.js**. `tools/strip_ts.py` removes the TypeScript-only
+syntax so the same program runs under Node; the two results must agree. This
+checks the backend against a real evaluator rather than against expectations we
+wrote ourselves, and it catches wrong-but-not-crashing results that no crash test
+can see.
+
+A process exit status is exactly `value & 0xFF`, so the comparison uses the low
+byte; that also handles negative and out-of-range results.
+
+### A finding that was reported and then withdrawn
+
+A chained compare-dispatch of three or more `eq`/`br` levels was reported as
+returning `44` instead of the selected value, and was recorded as an upstream
+SA-toolchain bug. **That was wrong.** A process exit status is 8 bits, so
+`return 300` is observed as `300 & 0xFF = 44`; the one- and two-level chains that
+appeared to work all used values below 256 by coincidence. The shape is fine, the
+value channel was the problem. Recorded in `tools/withdrawn_findings.md` so the
+mistake is not repeated.
+
+## 7. Known Gaps
+
+### Rejected with a diagnostic (no longer emits invalid SA-ASM)
+
+- **Interpolated template literals** (`` `sum=${x}` ``) — recognised by the lexer
+  and parser, but rejected at lowering time with a `line:col` diagnostic instead
+  of emitting a `concat` instruction. Plain literals (`` `text` ``) *do* lower:
+  they become a file-scope `@const NAME = utf8:"..."` data constant plus a 16-byte
+  slice slot holding `{ptr, len}`. Joining interpolated chunks still needs
+  `@sa_fmt_i64_into` to render a value and `@sa_string_concat(ptr, len, ptr, len)
+  -> u64` to join — and since that returns a bare pointer with no companion
+  length, a slice cannot be rebuilt from it without a further length query. See
+  `sa_plugin_sla/src/codegen.zig` (`.string_val` arm) for the reference sequence.
+
+### Parses, but cannot be semantically faithful
+
+- **`try` / `catch` / `throw`** — SA-ASM has no exception edges. `throw` lowers to
+  `panic`, which aborts, so a `catch` cannot resume execution. The `catch (e)`
+  binding form parses correctly, but the construct is not equivalent to
+  TypeScript.
+
+### Not implemented
+
+- **`/` is integer division** — the subset maps TypeScript `/` to the integer
+  `div`, so `15 / 2` yields `7`, not `7.5`. Programs relying on TypeScript
+  float division are out of scope.
+- **Statement-level intrinsics** — bare `store x + 0, 1 as i32` and `alloc(n)`
+  used as statements are not recognised.
+- **`var`, `new`, arrow functions with parameters** — not supported.
+- **Async/await, `.wasm` and `.wit` imports** — parsed, but the emitted
+  directives are not accepted by the assembler.
+
+### Found by the demo corpus, still open
+
+Verified counts from `tools/verify_demos.sh`: 242 assemble and match Node, 6 are
+refused with a located diagnostic, and **0 fail**. Every demo now lands in a good
+bucket, so no unresolved defect is left in the corpus.
+
+- **Anonymous object literals (4)** — `125_struct_nested`,
+  `133_struct_local_reassign`, `140_struct_deep_field` and
+  `200_reassign_heap_struct` are refused with `unexpected token in expression:
+  l_brace`. A brace initialiser is only accepted when the binding carries an
+  interface type annotation, because the field layout comes from that annotation.
+  Refusing loudly is the intended behaviour, not a silent miscompile.
+- **`new` as an expression (1)** — `155_generic_map` is refused with `unexpected
+  token in expression: keyword_new`; `alloc(n)` itself does lower.
+- **Property access on an undefined name (1)** — `218_release_bundle` is refused
+  with `property access on undefined variable 'b'` rather than emitting a load
+  from an undeclared register.
+
+### Branch-scoped registers: what actually fixed it
+
+The long-standing "a heap value created inside an `if` arm or switch case leaks"
+family is closed, and the CFG/dominator analysis turned out **not** to be the
+missing piece. Two earlier attempts failed because they released *every* open
+scope at the branch tail, which freed registers the enclosing function still
+needed and turned a merge point into a state conflict (229 to 166 verified, e2e
+24 to 18). The fix separates three questions that had been conflated:
+
+1. **Which scopes does this control-flow edge abandon?** A `break`/`continue`
+   target records its scope depth (`JumpTarget.scope_depth`), and
+   `releaseScopesDeeperThan` releases only the scopes opened after it. Values
+   bound outside stay live for the function-exit walk.
+2. **Which scope's values die at a block's closing brace?**
+   `exitScopeReleasingLocals` releases the innermost scope, and is applied to
+   `if`/`else` arms, `while`, `for-of` and C-style `for` bodies, and to any block
+   closing while `branch_depth`/`loop_depth` is non-zero. At function top level
+   both depths are back to zero, so the function's own exit still owns those
+   releases.
+3. **Must the release be emitted at all?** A `return`, `break` or `continue`
+   terminates the block, so a release written after it is unreachable code. That
+   is why the release has to happen *before* the jump, not at the closing brace.
+
+`Lowerer.computeDominators` is retained but no longer consulted during emission:
+`dominatesWith` falls back to "the entry block dominates everything, any other
+block dominates only itself", which is sound and is what the release walks use.
+The `refreshDominators` call the switch-case path made was removed for the same
+reason — its matrix could veto a release that was in fact required.
+
+`Variable.is_released` makes the release walks idempotent. Several paths reach
+the same release point (every `case` of a switch returns), and a second `!` for
+the same register is a use-after-move error.
+
+### A lexer bug that was hiding behind the corpus
+
+`parseTemplateLiteral` re-primed both `current` and `peek` from the lexer after
+consuming a template literal, but the `advance` that moved `current` onto the
+literal had *already* primed `peek` with the following token. Reading two fresh
+tokens therefore skipped one, so in an object literal whose field value was a
+template literal, the `}` closing the object was swallowed. The field loop then
+ran past the end of the literal, the function body was closed by the wrong brace,
+and the releases that should have preceded the `return` were emitted after it —
+the `basic blocks must end with jmp` failure seen in `219_full_app` and
+`220_integration_all`. The fix consumes the already-primed `peek` instead.
+
+Two helpers, `markScopeLoopLocal` and `markVarLoopLocal`, were removed: they
+assigned to a `Variable.is_loop_local` field that does not exist. They were never
+called, so Zig's lazy analysis never type-checked their bodies.
+
+### Operand consumption, and why it is not simply "mark every operand"
+
+Measured against the assembler:
+
+| Construct | Moves the source? |
+|---|---|
+| `a = b` (register-to-register) | **yes** |
+| `t = add a, b` | no — `a`/`b` must still be released |
+| `t = load p + 0 as i32` | no — `p` is borrowed |
+| `t = call @g(x)` | no |
+| `br t -> A, B` | no |
+
+So `markConsumed` on assignment is the complete rule. Temporaries are tracked and
+released, and a release is only emitted where the definition dominates it
+(`Lowerer.block_serial` plus `Variable.def_block`; the entry block dominates all
+others, any other block dominates only itself). Releasing a temporary defined in
+one arm of a branch, at the merge point, fails — that is the same missing-phi
+problem above, not a separate bug.

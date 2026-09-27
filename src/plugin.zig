@@ -557,7 +557,10 @@ test "sa_plugin_ts compiles if/else and while with control flow" {
     const result = low.output.items;
 
     try std.testing.expect(std.mem.indexOf(u8, result, "gt x, 0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "jz") != null);
+    // SA-ASM has no `jz`; the conditional branch is `br cond -> L_true, L_false`.
+    try std.testing.expect(std.mem.indexOf(u8, result, "br t_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, " -> ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "jz") == null);
     try std.testing.expect(std.mem.indexOf(u8, result, "jmp") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "L_else_") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "L_endif_") != null);
@@ -618,12 +621,14 @@ test "sa_plugin_ts compiles array literals and indexing" {
 
     const result = low.output.items;
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "arr = alloc 12") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "store arr + 0, 1 as i32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "store arr + 4, 2 as i32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "store arr + 8, 3 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "arr = alloc 16") != null);
+    // Elements live in a separate buffer; the header holds {ptr, len}.
+    try std.testing.expect(std.mem.indexOf(u8, result, " + 0, 1 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, " + 4, 2 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, " + 8, 3 as i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "mul 1, 4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "load") != null);
+    // Reading an element must go through the header's data pointer.
+    try std.testing.expect(std.mem.indexOf(u8, result, "load arr + 0 as ptr") != null);
 }
 
 test "sa_plugin_ts compiles return statements" {
@@ -742,7 +747,8 @@ test "sa_plugin_ts compiles unary negation and logical not" {
     const result = low.output.items;
 
     try std.testing.expect(std.mem.indexOf(u8, result, "neg a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "not b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "eq b, 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "not ") == null);
 }
 
 test "sa_plugin_ts compiles modulo operator" {
@@ -767,7 +773,8 @@ test "sa_plugin_ts compiles modulo operator" {
 
     const result = low.output.items;
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "mod a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "srem a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "mod a, b") == null);
 }
 
 test "sa_plugin_ts maps fs.readFile to sa_fs_read_file with string expansion" {
@@ -793,14 +800,18 @@ test "sa_plugin_ts maps fs.readFile to sa_fs_read_file with string expansion" {
 
     try p.parse();
 
-    const result = low.output.items;
+    // Read via toOwnedSlice: file-scope declarations live in the header buffer.
+    const result = try low.toOwnedSlice();
+    defer arena_allocator.free(result);
 
-    // Verify fs module imported
-    try std.testing.expect(std.mem.indexOf(u8, result, "Stdlib: fs module imported") != null);
+    // Verify the declaring module is imported at file scope.
+    try std.testing.expect(std.mem.indexOf(u8, result, "@import \"sa_std/fs.sai\"") != null);
     // Verify readFile maps to sa_fs_read_file with string arg expansion
     try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_fs_read_file(") != null);
     // Verify writeFile maps to sa_fs_write_file
     try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_fs_write_file(") != null);
+    // A string literal becomes a `@const` data constant, never a bare operand.
+    try std.testing.expect(std.mem.indexOf(u8, result, "utf8:") != null);
     // Verify string struct is expanded to ptr+len pairs
     try std.testing.expect(std.mem.indexOf(u8, result, "load") != null);
 }
@@ -827,9 +838,10 @@ test "sa_plugin_ts maps net.tcpConnect to sa_net_tcp_connect" {
 
     try p.parse();
 
-    const result = low.output.items;
+    const result = try low.toOwnedSlice();
+    defer arena_allocator.free(result);
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "Stdlib: net module imported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "@import \"sa_std/net.sai\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_net_tcp_connect(") != null);
 }
 
@@ -890,7 +902,7 @@ test "benchmark: parsing speed for large input" {
     try std.testing.expect(lines_per_sec > 1_000); // relaxed for debug mode; release builds target 500k/sec
 }
 
-test "sa_plugin_ts compiles template literals with embedded expressions" {
+test "sa_plugin_ts parses template literals with embedded expressions" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -908,12 +920,16 @@ test "sa_plugin_ts compiles template literals with embedded expressions" {
     var p = try parser.Parser.init(arena_allocator, source, &low);
     defer p.deinit();
 
-    try p.parse();
+    // The lexer/parser must recognise the interpolated form without tripping
+    // over the chunk boundaries. Lowering is expected to report a diagnostic:
+    // see "sa_plugin_ts rejects template literals instead of emitting a bogus
+    // concat" for why.
+    p.parse() catch {};
 
     const result = low.output.items;
-    // Should contain concat operations for template literal parts
-    try std.testing.expect(std.mem.indexOf(u8, result, "concat") != null or
-        std.mem.indexOf(u8, result, "Hello") != null);
+    // No unassemblable `concat` may be emitted.
+    try std.testing.expect(std.mem.indexOf(u8, result, "concat") == null);
+    try std.testing.expect(p.errors.items.len > 0);
 }
 
 test "sa_plugin_ts compiles for-of iteration" {
@@ -1074,4 +1090,369 @@ test "sa_plugin_ts error recovery collects multiple errors" {
 
     // Check that the parser collected errors
     try std.testing.expect(p.errors.items.len > 0);
+}
+
+// ==========================================
+// SA-ASM VALIDATION REGRESSION TESTS
+//
+// The rest of this file asserts on substrings of the lowerer output, which
+// cannot catch an instruction the SA assembler does not accept. The bugs these
+// tests guard against all produced well-formed-looking output that failed to
+// assemble: `jz` is not an SA mnemonic, functions carried no return type,
+// `let arr: i32[] = [...]` silently emitted nothing, and `break`/`continue`
+// were emitted as if they were instructions.
+// ==========================================
+
+fn lowerForTest(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+    try p.parse();
+
+    // Use the same path the CLI emits, so file-scope declarations (e.g.
+    // `@const` string data) are included.
+    const out = try low.toOwnedSlice();
+    return try allocator.dupe(u8, out);
+}
+
+fn expectNoLineStartingWith(output: []const u8, forbidden: []const u8) !void {
+    var it = std.mem.splitScalar(u8, output, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len < forbidden.len) continue;
+        if (!std.mem.eql(u8, line[0..forbidden.len], forbidden)) continue;
+        std.debug.print("emitted non-SA-ASM instruction '{s}': {s}\n", .{ forbidden, line });
+        return error.NonSaAsmInstruction;
+    }
+}
+
+test "sa_plugin_ts emits only mnemonics the SA assembler accepts" {
+    const allocator = std.testing.allocator;
+
+    const source =
+        \\interface Point { x: i32; y: i32; }
+        \\enum Color { Red, Green, Blue }
+        \\type ID = i64;
+        \\function classify(c: i32, p: Point): i32 {
+        \\  let r: i32 = 0;
+        \\  if (c == 0) { r = 1; } else { r = 2; }
+        \\  let arr: i32[] = [1, 2, 3];
+        \\  let i: i32 = 0;
+        \\  while (i < 3) { r = r + arr[0]; i = i + 1; }
+        \\  for (let k: i32 = 0; k < 2; k++) { r = r + k; }
+        \\  switch (r) {
+        \\    case 1: { r = 10; break; }
+        \\    default: { r = 20; }
+        \\  }
+        \\  let g: i32 = p.x;
+        \\  return r + g;
+        \\}
+    ;
+
+    const out = try lowerForTest(allocator, source);
+    defer allocator.free(out);
+
+    // `jz`, `break`, `continue`, `throw` and `concat` are not SA-ASM
+    // instructions; the lowerer must emit `br`/`jmp`/`panic`/nothing instead.
+    try expectNoLineStartingWith(out, "jz ");
+    try expectNoLineStartingWith(out, "break");
+    try expectNoLineStartingWith(out, "continue");
+    try expectNoLineStartingWith(out, "throw ");
+    // Signed comparison/remainder forms; plain `lt`/`le`/`gt`/`ge`/`mod` are not
+    // SA mnemonics.
+    try expectNoLineStartingWith(out, "mod ");
+    for ([_][]const u8{ " = lt ", " = le ", " = gt ", " = ge ", " = mod " }) |frag| {
+        try std.testing.expect(std.mem.indexOf(u8, out, frag) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, out, "slt ") != null or
+        std.mem.indexOf(u8, out, "sle ") != null or
+        std.mem.indexOf(u8, out, "sgt ") != null or
+        std.mem.indexOf(u8, out, "sge ") != null);
+
+    // Conditional branches must use the two-target `br cond -> L, L` form.
+    try std.testing.expect(std.mem.indexOf(u8, out, "br ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " -> ") != null);
+
+    // A value-returning function must declare its return type.
+    try std.testing.expect(std.mem.indexOf(u8, out, "@classify(c: i32, p: ptr) -> i32:") != null);
+
+    // `load` requires an explicit byte offset.
+    try std.testing.expect(std.mem.indexOf(u8, out, " as i32\n") == null or
+        std.mem.indexOf(u8, out, "load ") == null or
+        std.mem.indexOf(u8, out, "+ 0 as i32") != null);
+}
+
+test "sa_plugin_ts lowers a typed array declaration instead of dropping it" {
+    const allocator = std.testing.allocator;
+
+    // Regression: `T[]` was never consumed by the type parser, so `expect(equal)`
+    // failed and the whole statement vanished while the CLI still exited 0.
+    const out = try lowerForTest(allocator,
+        \\function main(): i32 {
+        \\  let arr: i32[] = [1, 2, 3];
+        \\  return arr[1];
+        \\}
+    );
+    defer allocator.free(out);
+
+    // A slice header {ptr, len} plus a separate element buffer.
+    try std.testing.expect(std.mem.indexOf(u8, out, "arr = alloc 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "alloc 12") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " + 0, 1 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " + 8, 3 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, " + 0, ") != null);
+}
+
+test "sa_plugin_ts emits the for-loop increment after the loop body" {
+    const allocator = std.testing.allocator;
+
+    // Regression: the increment clause was emitted in the header, ahead of the
+    // loop test, so the body ran one extra time on an already-bumped counter.
+    const out = try lowerForTest(allocator,
+        \\function main(): i32 {
+        \\  let total: i32 = 0;
+        \\  for (let i: i32 = 0; i < 5; i++) { total = total + i; }
+        \\  return total;
+        \\}
+    );
+    defer allocator.free(out);
+
+    const test_at = std.mem.indexOf(u8, out, "lt i, 5").?;
+    const body_at = std.mem.indexOf(u8, out, "add total, i").?;
+    const incr_at = std.mem.indexOf(u8, out, "add i, 1").?;
+    const back_at = std.mem.indexOf(u8, out, "jmp L_for_").?;
+
+    try std.testing.expect(test_at < body_at);
+    try std.testing.expect(body_at < incr_at);
+    try std.testing.expect(incr_at < back_at);
+}
+
+test "sa_plugin_ts lowers a literal template to an SA string slice" {
+    const allocator = std.testing.allocator;
+
+    // An SA-ASM string is a `{ptr, len}` slice and cannot appear as an operand,
+    // so a literal becomes a file-scope `@const` data constant plus a 16-byte
+    // slot holding {ptr, len}.
+    const out = try lowerForTest(allocator,
+        \\function main() {
+        \\  const msg: string = `hello world`;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // The `@const` must be at file scope, ahead of the function.
+    try std.testing.expect(std.mem.indexOf(u8, out, "@const SC_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "utf8:\"hello world") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "alloc 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "as ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "11 as u64") != null);
+    // Never a bogus `concat`.
+    try std.testing.expect(std.mem.indexOf(u8, out, "concat") == null);
+}
+
+test "sa_plugin_ts rejects interpolated templates instead of emitting a bogus concat" {
+    const allocator = std.testing.allocator;
+
+    // Joining chunks needs `@sa_fmt_i64_into` to render a value plus
+    // `@sa_string_concat` to join, which returns a bare pointer with no
+    // companion length. Until that exists the lowerer must diagnose rather
+    // than emit `concat`, which is not an SA mnemonic.
+    const source =
+        \\function main() {
+        \\  let x: i32 = 7;
+        \\  const s: string = `sum=${x}`;
+        \\}
+    ;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+    p.parse() catch {};
+
+    try std.testing.expect(p.errors.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, p.errors.items[0].message, "interpolated template") != null);
+    try std.testing.expect(std.mem.indexOf(u8, low.output.items, "concat") == null);
+}
+
+test "sa_plugin_ts supports the catch binding form" {
+    const allocator = std.testing.allocator;
+
+    // `catch (e) { ... }` is the only standard TypeScript spelling; the parser
+    // previously accepted a bare `catch { ... }` and dropped the real form.
+    const out = try lowerForTest(allocator,
+        \\function risky(x: i32): i32 {
+        \\  try {
+        \\    if (x < 0) { throw 1; }
+        \\  } catch (e) {
+        \\    return 0;
+        \\  }
+        \\  return x;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // SA-ASM has no exception edges, so the catch label is never branched to
+    // and is legitimately dropped. What must hold is that the `catch (e) { }`
+    // binding form parses at all: previously the parser hit `catch` as an
+    // unexpected token, skipped the binding, and discarded the handler body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "return 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "return x") != null);
+}
+
+test "sa_plugin_ts does not swallow the brace after a template literal in an object literal" {
+    const allocator = std.testing.allocator;
+
+    // Regression: `parseTemplateLiteral` used to re-prime `current` AND `peek`
+    // from the lexer, but the `advance` that moved `current` onto the literal
+    // had already primed `peek` with the following token. Re-lexing skipped
+    // one token, so the `}` closing this object literal disappeared. The field
+    // loop then ran past the end of the literal, the function body was closed
+    // by the wrong brace, and the releases that must precede `return` were
+    // emitted after it. The assembler rejected that with
+    // "basic blocks must end with jmp" (demos 219_full_app, 220_integration_all).
+    const out = try lowerForTest(allocator,
+        \\interface Config { retries: i32; tag: string; }
+        \\function main(): i32 {
+        \\  const cfg: Config = { retries: 3, tag: `release` };
+        \\  return cfg.retries;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // The object literal's second field must still be stored, which only
+    // happens if the loop saw the closing `}`.
+    try std.testing.expect(std.mem.indexOf(u8, out, "store cfg + 0, 3 as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "store cfg + 8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "utf8:\"release") != null);
+
+    // The structural symptom: with the skipped `}` the releases are emitted
+    // after the `return`, which is unreachable code and is what the assembler
+    // rejected. Nothing but a label may follow a `return`.
+    var saw_return = false;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        if (t[t.len - 1] == ':') {
+            saw_return = false;
+            continue;
+        }
+        if (saw_return) {
+            std.debug.print("instruction after return: {s}\n", .{t});
+            return error.TestExpectedEqual;
+        }
+        if (std.mem.startsWith(u8, t, "return")) saw_return = true;
+    }
+}
+
+test "sa_plugin_ts releases a switch-arm local at break without touching enclosing locals" {
+    const allocator = std.testing.allocator;
+
+    // Regression (demos 239_struct_in_switch_arm): a heap value declared in a
+    // case body is owned by a scope that the `break` abandons, so it must be
+    // released at the jump. Releasing *every* open scope instead freed the
+    // enclosing function's `keep` as well, which regressed 15 other switch and
+    // loop demos (235 verified -> 222, e2e 24 -> 22).
+    const out = try lowerForTest(allocator,
+        \\interface P { x: i32; }
+        \\function classify(m: i32): i32 {
+        \\  const keep: P = { x: 7 };
+        \\  let t: i32 = 0;
+        \\  switch (m) {
+        \\    case 1: {
+        \\      const p: P = { x: 4 };
+        \\      t = p.x;
+        \\      break;
+        \\    }
+        \\    default: { t = 0; }
+        \\  }
+        \\  return t + keep.x;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // `p` is released at the break, exactly once.
+    const p_release = std.mem.indexOf(u8, out, "!p\n") orelse return error.TestExpectedEqual;
+    // ...and `keep` survives the break: it is still read by the `return`, so a
+    // release of `keep` before that read would be a use-after-move.
+    const keep_read = std.mem.indexOf(u8, out, "load keep + 0") orelse return error.TestExpectedEqual;
+    const keep_release = std.mem.indexOf(u8, out, "!keep\n") orelse return error.TestExpectedEqual;
+    try std.testing.expect(p_release < keep_read);
+    try std.testing.expect(keep_release > keep_read);
+    // `p` must not also be released a second time after the switch merge.
+    try std.testing.expect(std.mem.lastIndexOf(u8, out, "!p\n").? == p_release);
+}
+
+test "sa_plugin_ts keeps a parameter readable after a let copies it" {
+    const allocator = std.testing.allocator;
+
+    // Regression (demo 201_state_machine): `let next: i32 = state` is a copy in
+    // TypeScript, but the lowerer emitted a move, so the later `switch (state)`
+    // read a consumed register. `isOuterVariable` distinguishes a parameter
+    // (declared in its own scope) from a local, and only the former gets
+    // `dest = add src, 0`.
+    const out = try lowerForTest(allocator,
+        \\function step(state: i32): i32 {
+        \\  let next: i32 = state;
+        \\  switch (state) {
+        \\    case 0: { next = 1; break; }
+        \\    default: { next = 0; }
+        \\  }
+        \\  return next;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // The copy is an arithmetic add, not an assignment, so `state` stays live.
+    try std.testing.expect(std.mem.indexOf(u8, out, "next = add state, 0") != null);
+    // The switch scrutinee still reads `state`, which is only valid if the
+    // parameter was never consumed.
+    try std.testing.expect(std.mem.indexOf(u8, out, "eq state,") != null);
+}
+
+test "sa_plugin_ts emits a block-local release before the terminator, never after" {
+    const allocator = std.testing.allocator;
+
+    // Regression: releases written after `return` are unreachable code and the
+    // assembler reports "basic blocks must end with jmp". This asserts the
+    // structural rule directly: the last `!` of a block must precede its
+    // `return`, and no `!` may follow a `return` in the same block.
+    const out = try lowerForTest(allocator,
+        \\interface Cfg { retries: i32; }
+        \\function main(): i32 {
+        \\  const cfg: Cfg = { retries: 3 };
+        \\  return cfg.retries;
+        \\}
+    );
+    defer allocator.free(out);
+
+    // Walk the emitted body: once a `return` is seen, nothing may be emitted
+    // except further labels (a new block).
+    var saw_return = false;
+    var it = std.mem.splitScalar(u8, out, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " \t\r");
+        if (t.len == 0) continue;
+        if (t[t.len - 1] == ':') {
+            saw_return = false;
+            continue;
+        }
+        if (saw_return) {
+            std.debug.print("instruction after return: {s}\n", .{t});
+            return error.TestExpectedEqual;
+        }
+        if (std.mem.startsWith(u8, t, "return")) saw_return = true;
+    }
 }

@@ -1,0 +1,7 @@
+function fact(n: i32): i32 {
+  if (n <= 1) { return 1; }
+  return n * fact(n - 1);
+}
+function main(): i32 {
+  return fact(5);
+}

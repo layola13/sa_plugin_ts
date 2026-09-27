@@ -92,6 +92,11 @@ pub const Lexer = struct {
     col: u32 = 1,
     // Template literal tracking
     template_depth: u32 = 0,
+    /// True while positioned inside a `${ ... }` interpolation, i.e. after a
+    /// `template_start`/`template_mid` chunk was emitted. The next template
+    /// chunk must skip the `}` that closes the interpolation, otherwise that
+    /// brace leaks into the literal text (`sum=${x}` would yield "}").
+    interp_expr_open: bool = false,
 
     pub fn next(self: *Lexer) Token {
         self.skipWhitespaceAndComments();
@@ -209,7 +214,22 @@ pub const Lexer = struct {
                         const len = self.pos - start;
                         self.pos += 2;
                         self.col += 2;
+                        // An interpolation expression begins after this chunk.
+                        self.interp_expr_open = true;
                         return .{ .tag = .template_start, .start = start, .len = @intCast(len), .line = start_line, .col = start_col };
+                    }
+                    if (tc == '`') {
+                        // Template with no interpolation: close it here.
+                        //
+                        // Without this the scan ran to EOF and swallowed the
+                        // rest of the file, so a plain `` `text` `` literal was
+                        // unlexable. The token spans both backticks; the parser
+                        // strips them.
+                        const len = self.pos - start + 1;
+                        self.pos += 1;
+                        self.col += 1;
+                        self.template_depth -|= 1;
+                        return .{ .tag = .template_end, .start = start, .len = @intCast(len), .line = start_line, .col = start_col };
                     }
                     self.pos += 1;
                     if (tc == '\n') {
@@ -365,9 +385,25 @@ pub const Lexer = struct {
         }
     }
 
-    /// Handle closing brace inside template literal: }...` or }...${
+    /// Scan the literal chunk that follows a `${ ... }` interpolation.
+    ///
+    /// The chunk runs until the closing backtick (`template_end`) or the next
+    /// `${` (`template_mid`).
     pub fn nextTemplateChunk(self: *Lexer) Token {
         self.skipWhitespaceAndComments();
+
+        // Consume the `}` that closes the interpolation before scanning, so it
+        // is not mistaken for literal template text. Without this, `sum=${x}`
+        // would produce a trailing "}" chunk.
+        if (self.interp_expr_open) {
+            self.interp_expr_open = false;
+            if (self.pos < self.source.len and self.source[self.pos] == '}') {
+                self.pos += 1;
+                self.col += 1;
+                self.skipWhitespaceAndComments();
+            }
+        }
+
         if (self.pos >= self.source.len) {
             return .{ .tag = .eof, .start = self.pos, .len = 0, .line = self.line, .col = self.col };
         }
@@ -390,6 +426,8 @@ pub const Lexer = struct {
                 const len = self.pos - start;
                 self.pos += 2;
                 self.col += 2;
+                // Another interpolation begins after this chunk.
+                self.interp_expr_open = true;
                 return .{ .tag = .template_mid, .start = start, .len = @intCast(len), .line = start_line, .col = start_col };
             }
             self.pos += 1;

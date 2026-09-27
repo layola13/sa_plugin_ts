@@ -1,0 +1,5 @@
+# Inequality
+
+`!=` comparison.
+
+- `main.ts`: TypeScript source for this slot.

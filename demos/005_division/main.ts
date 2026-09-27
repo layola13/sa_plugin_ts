@@ -1,0 +1,6 @@
+function div(a: i32, b: i32): i32 {
+  return a / b;
+}
+function main(): i32 {
+  return div(84, 2);
+}
