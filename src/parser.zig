@@ -2974,7 +2974,11 @@ pub const Parser = struct {
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
-            try self.scope_manager.exitScope(self.lowerer);
+            // The scope pops here, so the function-exit walk can never see
+            // the body's temps: release them on the fallthrough path now
+            // (same as a branch-arm block close). Skipped automatically when
+            // the body ends in `return`/`break`/`continue`.
+            try self.exitScopeReleasingLocals();
             try self.advance();
         }
 
@@ -3354,6 +3358,13 @@ pub const Parser = struct {
     /// String operands already lower to slice headers and pass through;
     /// integer operands are boxed into a 4-byte slice header on the fly.
     fn mapKeySlice(self: *Parser, key: []const u8) anyerror![]const u8 {
+        // Quoted literals (`"a"`, `'a'`) materialise as real `{ptr,len}`
+        // string slices; only then do byte-compared lookups match. Without
+        // this, a literal fell into the integer box below and emitted
+        // `store bytes + 0, "a" as i32`, which the assembler rejects.
+        if (key.len >= 2 and (key[0] == '"' or key[0] == '\'') and key[key.len - 1] == key[0]) {
+            return try self.materializeStringChunk(key[1 .. key.len - 1]);
+        }
         if (self.scope_manager.lookup(key)) |v| {
             if (std.mem.eql(u8, v.type_name, "string")) return key;
         }
@@ -3378,7 +3389,7 @@ pub const Parser = struct {
             const v = try self.parseExpression();
             try self.expect(.r_paren);
             const ks = try self.mapKeySlice(k);
-            try self.lowerer.emit("    call @sa_btree_map_insert({s}, {s}, {s})\n", .{ left, ks, v });
+            try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ left, ks, v });
             return "0";
         }
         if (std.mem.eql(u8, member_name, "get")) {
@@ -3387,7 +3398,7 @@ pub const Parser = struct {
             try self.expect(.r_paren);
             const ks = try self.mapKeySlice(k);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_get({s}, {s})\n", .{ t, left, ks });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_get(&{s}, &{s})\n", .{ t, left, ks });
             return t;
         }
         if (std.mem.eql(u8, member_name, "has")) {
@@ -3396,7 +3407,7 @@ pub const Parser = struct {
             try self.expect(.r_paren);
             const ks = try self.mapKeySlice(k);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_contains_key({s}, {s})\n", .{ t, left, ks });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_contains_key(&{s}, &{s})\n", .{ t, left, ks });
             return t;
         }
         if (std.mem.eql(u8, member_name, "delete")) {
@@ -3404,42 +3415,48 @@ pub const Parser = struct {
             const k = try self.parseExpression();
             try self.expect(.r_paren);
             const ks = try self.mapKeySlice(k);
+            // `sa_btree_map_remove` returns the removed u64 payload (0 on
+            // miss), but JS `delete` returns a boolean. Probe presence first
+            // so a stored `0` still reports `true`: exact boolean semantics
+            // for one extra lookup.
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_remove({s}, {s})\n", .{ t, left, ks });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_contains_key(&{s}, &{s})\n", .{ t, left, ks });
+            const scratch = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_btree_map_remove(&{s}, &{s})\n", .{ scratch, left, ks });
             return t;
         }
         if (std.mem.eql(u8, member_name, "clear")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
-            try self.lowerer.emit("    call @sa_btree_map_clear({s})\n", .{left});
+            try self.lowerer.emit("    call @sa_btree_map_clear(&{s})\n", .{left});
             return "0";
         }
         if (std.mem.eql(u8, member_name, "size")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_len({s})\n", .{ t, left });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_len(&{s})\n", .{ t, left });
             return t;
         }
         if (std.mem.eql(u8, member_name, "keys")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_keys_set({s})\n", .{ t, left });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_keys_set(&{s})\n", .{ t, left });
             return t;
         }
         if (std.mem.eql(u8, member_name, "values")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_values_vec({s})\n", .{ t, left });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_values_vec(&{s})\n", .{ t, left });
             return t;
         }
         if (std.mem.eql(u8, member_name, "entries")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
             const t = try self.newTemp();
-            try self.lowerer.emit("    {s} = call @sa_btree_map_iter_vec({s})\n", .{ t, left });
+            try self.lowerer.emit("    {s} = call @sa_btree_map_iter_vec(&{s})\n", .{ t, left });
             return t;
         }
         return error.UnknownMethod;
@@ -5896,7 +5913,7 @@ pub const Parser = struct {
                 if (self.isMapVar(left) and std.mem.eql(u8, member_name, "size")) {
                     try self.lowerer.emitImport("sa_std/btree_map.sa");
                     const temp_name = try self.newTemp();
-                    try self.lowerer.emit("    {s} = call @sa_btree_map_len({s})\n", .{ temp_name, left });
+                    try self.lowerer.emit("    {s} = call @sa_btree_map_len(&{s})\n", .{ temp_name, left });
                     return temp_name;
                 }
 

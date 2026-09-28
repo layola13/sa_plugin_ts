@@ -1565,6 +1565,99 @@ test "sa_plugin_ts lowers new Map to sa_btree_map_new" {
     try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_new()") != null);
 }
 
+test "sa_plugin_ts Map string-literal keys lower to slices with &-prefixed btree calls" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  const m: Map<string, i32> = new Map();
+        \\  m.set("a", 1);
+        \\  const v: i32 = m.get("a");
+        \\  return v;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+    // Literals materialise as @const string data, never as an i32 store.
+    try std.testing.expect(std.mem.indexOf(u8, result, "= utf8:\"a\\0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, ", \"a\" as i32") == null);
+    // sa_btree_map_* takes `&map`/`&key`: the call site must carry `&`.
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_insert(&") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_get(&") != null);
+}
+
+test "sa_plugin_ts Map delete returns a boolean presence flag" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  const m: Map<string, i32> = new Map();
+        \\  m.set("a", 1);
+        \\  const d: i32 = m.delete("a");
+        \\  return d;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+    // Presence probe first (a stored 0 still deletes to `true`), removal second.
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_contains_key(&") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_remove(&") != null);
+}
+
+test "sa_plugin_ts try body releases its temps before the end label" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  try { console.log(1); } catch (e) { console.log(2); }
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+    const jmp = std.mem.indexOf(u8, result, "jmp L_endtry_");
+    try std.testing.expect(jmp != null);
+    // The try scope pops at the jump, so its releases must already be out.
+    try std.testing.expect(std.mem.indexOf(u8, result[0..jmp.?], "!t_") != null);
+}
+
 test "sa_plugin_ts lowers new Array(n) to a zeroed slice" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
