@@ -6884,12 +6884,45 @@ pub const Parser = struct {
                         try self.expect(.greater);
                     }
                     try self.expect(.l_paren);
+                    // Dynamic length (`new Array(size)`): bytes = size * elem,
+                    // data = alloc bytes, zeroed via sa_mem_set. Literal
+                    // lengths keep the unrolled path below.
                     if (self.current.tag != .number) {
-                        return self.refuseAt(
-                            "error: new 'Array' length must be an integer literal",
-                            .{},
-                            error.ConstructorsNotSupported,
-                        );
+                        if (self.current.tag == .r_paren) {
+                            try self.expect(.r_paren);
+                            const dest = try self.newTemp();
+                            try self.retagTemp(dest, elem_type);
+                            try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+                            const data_reg = try self.newTemp();
+                            try self.lowerer.emit("    {s} = alloc 4\n", .{data_reg});
+                            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
+                            try self.lowerer.emit("    store {s} + 8, 0 as u64\n", .{dest});
+                            return dest;
+                        }
+                        const n_reg = try self.parseExpression();
+                        if (self.current.tag != .r_paren) {
+                            return self.refuseAt(
+                                "error: new 'Array' takes a single length argument",
+                                .{},
+                                error.ConstructorsNotSupported,
+                            );
+                        }
+                        try self.expect(.r_paren);
+                        var elem_size: u32 = 4;
+                        var elem_align: u32 = 4;
+                        try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
+                        const dest = try self.newTemp();
+                        try self.retagTemp(dest, elem_type);
+                        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+                        const bytes_reg = try self.newTemp();
+                        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ bytes_reg, n_reg, elem_size });
+                        const data_reg = try self.newTemp();
+                        try self.lowerer.emit("    {s} = alloc {s}\n", .{ data_reg, bytes_reg });
+                        try self.lowerer.emitImport("sa_std/core/mem.sa");
+                        try self.lowerer.emit("    call @sa_mem_set(&{s}, 0, {s})\n", .{ data_reg, bytes_reg });
+                        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
+                        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, n_reg });
+                        return dest;
                     }
                     const len_tok = self.current;
                     try self.advance();

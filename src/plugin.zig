@@ -1691,6 +1691,36 @@ test "sa_plugin_ts lowers new Array(n) to a zeroed slice" {
     try std.testing.expect(std.mem.indexOf(u8, result, "+ 8, 3 as u64") != null);
 }
 
+test "sa_plugin_ts lowers new Array(size) with a register length via mem_set" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(n: i32): i32 {
+        \\  const a = new Array(n);
+        \\  return a[0];
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const dyn = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Dynamic bytes + register-sized alloc + mem_set zeroing ...
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "= mul n, 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "call @sa_mem_set(&") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "sa_std/core/mem.sa") != null);
+    // ... and the slice header records the register length.
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "+ 8, n as u64") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
