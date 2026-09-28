@@ -3534,7 +3534,14 @@ pub const Parser = struct {
                 try self.advance();
                 const operand = try self.parseExpressionWithPrecedence(.product);
                 const temp_name = try self.newTemp();
-                try self.lowerer.emit("    {s} = neg {s}\n", .{ temp_name, operand });
+                // Type-directed like the binary ops: float operands need
+                // `fneg`; plain `neg` is rejected with InvalidOperand.
+                if (self.isFloatOperand(operand)) {
+                    try self.lowerer.emit("    {s} = fneg {s}\n", .{ temp_name, operand });
+                    try self.retagTemp(temp_name, "f64");
+                } else {
+                    try self.lowerer.emit("    {s} = neg {s}\n", .{ temp_name, operand });
+                }
                 return temp_name;
             },
             .bang => {
@@ -3672,6 +3679,15 @@ pub const Parser = struct {
             const temp_name = try self.newTemp();
 
             const use_float = self.isFloatOperand(left) or self.isFloatOperand(right);
+            // SA-ASM has no float remainder (`frem` does not exist), so a
+            // float `%` is refused loudly instead of emitting a bogus `srem`.
+            if (tag == .percent and use_float) {
+                return self.refuseAt(
+                    "error: float remainder is not supported: '%' only lowers for integers",
+                    .{},
+                    error.FloatRemainderNotSupported,
+                );
+            }
             const sa_op = switch (tag) {
                 .plus => if (use_float) "fadd" else "add",
                 .minus => if (use_float) "fsub" else "sub",

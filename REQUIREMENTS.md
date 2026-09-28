@@ -55,7 +55,9 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] Type-directed float arithmetic (copied from `sa_plugin_sla`'s
   `planScalarBinaryOp`): `+ - * /` with an `f32`/`f64` side lower to
   `fadd`/`fsub`/`fmul`/`fdiv`, comparisons to `fcmp_*`; integer sides keep the
-  existing forms (`/` on integers stays `div`, `%` stays `srem`)
+  existing forms (`/` on integers stays `div`, `%` stays `srem`). Unary `-` on
+  a float lowers to `fneg`. There is no `frem` in SA-ASM, so `%` with a float
+  side is refused loudly with a located diagnostic instead of emitting `srem`)
 - [x] Double-quoted string literals bound to variables (`const s = "bob"`
   materialises the slice; the raw `"..."` is not an SA operand)
 - [x] `s.length` property (aliased to the builtin string layout's `len`

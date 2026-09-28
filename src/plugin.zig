@@ -1334,6 +1334,60 @@ test "sa_plugin_ts lowers float interpolation through sa_fmt_f64_into" {
     try std.testing.expect(std.mem.indexOf(u8, result, "sext s as i64") == null);
 }
 
+test "sa_plugin_ts lowers float negation to fneg" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let x: f64 = 2.5;
+        \\  let n: f64 = -x;
+        \\  if (n == -2.5) { return 1; }
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "fneg x") != null);
+}
+
+test "sa_plugin_ts refuses float remainder loudly" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let m: f64 = 5.5 % 2.0;
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    // Statement-level recovery collects the diagnostic and continues, so the
+    // refusal surfaces on `p.errors` rather than as a parse() error.
+    try p.parse();
+    try std.testing.expect(p.errors.items.len >= 1);
+    try std.testing.expect(std.mem.indexOf(u8, p.errors.items[0].message, "float remainder") != null);
+}
+
 test "sa_plugin_ts descriptor is valid" {
     try std.testing.expectEqual(@as(u32, 1), descriptor.abi_version);
     try std.testing.expectEqual(@sizeOf(plugin_api.PluginDescriptor), descriptor.descriptor_size);

@@ -13,8 +13,12 @@ The plugin uses a **Linear Lowering Pipeline**. It processes TS source code and 
 - **FFI Airlock**: All I/O calls are wrapped in SA's @ffi_wrapper internally to safely transition to Syscalls.
 
 ### 1.3 WASM Module Linkage
-- **Direct Symbol Mapping**: The parser recognizes .wasm imports as @extern symbols, allowing zero-cost integration of pre-compiled assets.
-- **WIT Integration**: Stubs are automatically generated to bridge TS structures with WASM memory layouts.
+- **Direct Symbol Mapping**: `.wasm` imports declare an arity-matched
+  `@extern` at the first call site (verifier-accepted; linking needs the real
+  module).
+- **WIT Imports Refused**: the assembler accepts no `@wit_import` directive,
+  so `.wit` imports and their calls are refused loudly with a located
+  diagnostic instead of emitting stub code.
 
 ## 2. Memory Management
 The plugin uses an **Arena Allocator** per compilation unit. This allows for O(1) cleanup after the SA code has been emitted, ensuring the compiler itself remains extremely fast.
