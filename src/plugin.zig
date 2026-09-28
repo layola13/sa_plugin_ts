@@ -1721,6 +1721,59 @@ test "sa_plugin_ts lowers new Array(size) with a register length via mem_set" {
     try std.testing.expect(std.mem.indexOf(u8, dyn, "+ 8, n as u64") != null);
 }
 
+test "sa_plugin_ts lowers chained Array(n).fill(1) on a construction temp" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(n: i32): i32 {
+        \\  const a = Array(n).fill(1);
+        \\  return a[0];
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const chained = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Zeroing (construction) and refill (fill) both go through mem_set ...
+    try std.testing.expect(std.mem.indexOf(u8, chained, "call @sa_mem_set(&") != null);
+    // ... and the let binds the filled array (no dropped call).
+    try std.testing.expect(std.mem.indexOf(u8, chained, "load ") != null);
+}
+
+test "sa_plugin_ts accepts _ as an unused arrow parameter" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(n: i32): i32 {
+        \\  const t = (_, index) => index;
+        \\  return t(0, n);
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const usc = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, usc, "closure_callback") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

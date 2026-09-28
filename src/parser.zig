@@ -4211,6 +4211,54 @@ pub const Parser = struct {
     /// copies the old elements, appends `v`, and swaps the header. O(n)
     /// per push, but always correct (the old fixed-buffer code silently
     /// dropped pushes / overflowed `[]`-seeded arrays).
+    /// Shared array-construction emitters (`new Array(n)` and the `Array(n)`
+    /// call form lower identically). Literal lengths unroll zero stores;
+    /// register lengths use `mul` + register-sized `alloc` + `sa_mem_set`.
+    /// `zero=false` skips the fill (the caller overwrites every slot, e.g.
+    /// `Array.from` with a mapper). `dest` must be a fresh temp; retagged
+    /// to the array type here.
+    fn emitArrayAllocLit(self: *Parser, dest: []const u8, elem_type: []const u8, count: u32) anyerror!void {
+        // Tag the header with the full array type (`number[]`), like array
+        // literals: member dispatch (`isArrayVar`) and indexing derive the
+        // element by stripping one level. A bare `i32` tag made chained
+        // calls on construction temps (`Array(n).fill(1)`) miss the Array
+        // path and silently drop the call.
+        const arr_type = try std.fmt.allocPrint(self.allocator, "{s}[]", .{elem_type});
+        try self.retagTemp(dest, arr_type);
+        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+        var elem_size: u32 = 4;
+        var elem_align: u32 = 4;
+        try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
+        const data_reg = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc {d}\n", .{ data_reg, @max(count * elem_size, 4) });
+        var idx: u32 = 0;
+        while (idx < count) : (idx += 1) {
+            const off = idx * elem_size;
+            try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ data_reg, off, saTypeOf(elem_type) });
+        }
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
+        try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ dest, count });
+    }
+
+    fn emitArrayAllocReg(self: *Parser, dest: []const u8, elem_type: []const u8, n_reg: []const u8, zero: bool) anyerror!void {
+        const arr_type = try std.fmt.allocPrint(self.allocator, "{s}[]", .{elem_type});
+        try self.retagTemp(dest, arr_type);
+        var elem_size: u32 = 4;
+        var elem_align: u32 = 4;
+        try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
+        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+        const bytes_reg = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ bytes_reg, n_reg, elem_size });
+        const data_reg = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc {s}\n", .{ data_reg, bytes_reg });
+        if (zero) {
+            try self.lowerer.emitImport("sa_std/core/mem.sa");
+            try self.lowerer.emit("    call @sa_mem_set(&{s}, 0, {s})\n", .{ data_reg, bytes_reg });
+        }
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, n_reg });
+    }
+
     fn lowerArrayPush(self: *Parser, arr: []const u8, val: []const u8) anyerror![]const u8 {
         var elem_type: []const u8 = "i32";
         if (self.scope_manager.lookup(arr)) |av| {
@@ -4318,6 +4366,29 @@ pub const Parser = struct {
             try self.retagTemp(out, elem_type);
             try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ left, last });
             return out;
+        }
+        if (std.mem.eql(u8, member_name, "fill")) {
+            // `arr.fill(v)`: set every slot to `v` via sa_mem_set, return
+            // the array itself (JS returns `this`).
+            try self.expect(.l_paren);
+            const v = try self.parseExpression();
+            try self.expect(.r_paren);
+            var elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
+            const data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, left });
+            const nbytes = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nbytes, len, esz });
+            try self.lowerer.emitImport("sa_std/core/mem.sa");
+            try self.lowerer.emit("    call @sa_mem_set(&{s}, {s}, {s})\n", .{ data, v, nbytes });
+            return left;
         }
         if (std.mem.eql(u8, member_name, "indexOf")) {
             try self.expect(.l_paren);
@@ -5288,6 +5359,10 @@ pub const Parser = struct {
         defer self.arrow_base_depth = saved_arrow_base;
 
         for (params) |p| {
+            // `_` is a throwaway placeholder (e.g. `(_, i) => i`): binding
+            // it would collide across arrows, so it stays undeclared and
+            // call sites pass `0` for its slot.
+            if (std.mem.eql(u8, p.name, "_")) continue;
             try self.scope_manager.declareVar(p.name, p.type_name, p.name, true);
         }
 
@@ -6884,21 +6959,16 @@ pub const Parser = struct {
                         try self.expect(.greater);
                     }
                     try self.expect(.l_paren);
-                    // Dynamic length (`new Array(size)`): bytes = size * elem,
-                    // data = alloc bytes, zeroed via sa_mem_set. Literal
-                    // lengths keep the unrolled path below.
+                    // Empty `new Array()` is a zero-length slice.
+                    if (self.current.tag == .r_paren) {
+                        try self.expect(.r_paren);
+                        const dest = try self.newTemp();
+                        try self.emitArrayAllocLit(dest, elem_type, 0);
+                        return dest;
+                    }
+                    // Dynamic length (`new Array(size)`); literals keep the
+                    // unrolled path inside the shared emitter.
                     if (self.current.tag != .number) {
-                        if (self.current.tag == .r_paren) {
-                            try self.expect(.r_paren);
-                            const dest = try self.newTemp();
-                            try self.retagTemp(dest, elem_type);
-                            try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
-                            const data_reg = try self.newTemp();
-                            try self.lowerer.emit("    {s} = alloc 4\n", .{data_reg});
-                            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
-                            try self.lowerer.emit("    store {s} + 8, 0 as u64\n", .{dest});
-                            return dest;
-                        }
                         const n_reg = try self.parseExpression();
                         if (self.current.tag != .r_paren) {
                             return self.refuseAt(
@@ -6908,20 +6978,8 @@ pub const Parser = struct {
                             );
                         }
                         try self.expect(.r_paren);
-                        var elem_size: u32 = 4;
-                        var elem_align: u32 = 4;
-                        try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
                         const dest = try self.newTemp();
-                        try self.retagTemp(dest, elem_type);
-                        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
-                        const bytes_reg = try self.newTemp();
-                        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ bytes_reg, n_reg, elem_size });
-                        const data_reg = try self.newTemp();
-                        try self.lowerer.emit("    {s} = alloc {s}\n", .{ data_reg, bytes_reg });
-                        try self.lowerer.emitImport("sa_std/core/mem.sa");
-                        try self.lowerer.emit("    call @sa_mem_set(&{s}, 0, {s})\n", .{ data_reg, bytes_reg });
-                        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
-                        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, n_reg });
+                        try self.emitArrayAllocReg(dest, elem_type, n_reg, true);
                         return dest;
                     }
                     const len_tok = self.current;
@@ -6949,22 +7007,9 @@ pub const Parser = struct {
                         );
                     }
                     try self.expect(.r_paren);
-                    var elem_size: u32 = 4;
-                    var elem_align: u32 = 4;
-                    try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
                     const count = @as(u32, @intCast(len_val));
                     const dest = try self.newTemp();
-                    try self.retagTemp(dest, elem_type);
-                    try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
-                    const data_reg = try self.newTemp();
-                    try self.lowerer.emit("    {s} = alloc {d}\n", .{ data_reg, @max(count * elem_size, 4) });
-                    var idx: u32 = 0;
-                    while (idx < count) : (idx += 1) {
-                        const off = idx * elem_size;
-                        try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ data_reg, off, saTypeOf(elem_type) });
-                    }
-                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
-                    try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ dest, count });
+                    try self.emitArrayAllocLit(dest, elem_type, count);
                     return dest;
                 }
                 if (std.mem.eql(u8, type_name, "Error")) {
@@ -7561,6 +7606,34 @@ pub const Parser = struct {
                     // `Number(x)`: the subset's numbers already are integers.
                     try self.lowerer.emit("    {s} = add {s}, 0\n", .{ temp_name, args.items[0] });
                 }
+            } else if (std.mem.eql(u8, left, "Array") and self.scope_manager.lookup(left) == null and self.arrow_aliases.get(left) == null) {
+                // `Array(n)` call form (no `new`): identical to construction.
+                // A user-declared `Array` keeps the normal call path.
+                if (args.items.len == 0) {
+                    try self.emitArrayAllocLit(temp_name, "i32", 0);
+                } else if (args.items.len == 1) {
+                    const a0 = args.items[0];
+                    const lit = std.fmt.parseInt(i64, a0, 10) catch null;
+                    if (lit) |lv| {
+                        if (lv < 0) {
+                            return self.refuseAt(
+                                "error: new 'Array' length must be non-negative",
+                                .{},
+                                error.ConstructorsNotSupported,
+                            );
+                        }
+                        try self.emitArrayAllocLit(temp_name, "i32", @as(u32, @intCast(lv)));
+                    } else {
+                        try self.emitArrayAllocReg(temp_name, "i32", a0, true);
+                    }
+                } else {
+                    return self.refuseAt(
+                        "error: new 'Array' takes a single length argument",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                return temp_name;
             } else if (self.arrow_aliases.get(left)) |alias| {
                 // Value call through an arrow alias: `let r = f(41)` lowers
                 // straight to the callback with the alias context last
