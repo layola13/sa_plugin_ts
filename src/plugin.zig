@@ -1803,6 +1803,34 @@ test "sa_plugin_ts lowers Array.from length-mapper to a fill loop" {
     try std.testing.expect(std.mem.indexOf(u8, frm, "store ") != null);
 }
 
+test "sa_plugin_ts treats return before a statement keyword as bare (ASI)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(a: i32, b: i32): void {
+        \\  if (a === b) return
+        \\  if (a < b) {
+        \\    return
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const asi = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Both returns emitted; the second `if` parsed as a statement.
+    try std.testing.expect(std.mem.indexOf(u8, asi, "return") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

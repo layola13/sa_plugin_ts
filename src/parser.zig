@@ -3415,7 +3415,15 @@ pub const Parser = struct {
 
     fn parseReturn(self: *Parser) anyerror!void {
         try self.expect(.keyword_return);
-        if (self.current.tag != .semicolon and self.current.tag != .r_brace and self.current.tag != .eof) {
+        // ASI: `return` followed by a newline and a statement keyword is a
+        // bare return (`if (a === b) return` + next-line `if`). Those
+        // keywords can never start an expression, so parsing one as the
+        // return value only produces a cascade (`keyword_if` in expression).
+        const bare = self.current.tag == .semicolon or self.current.tag == .r_brace or self.current.tag == .eof or switch (self.current.tag) {
+            .keyword_if, .keyword_for, .keyword_while, .keyword_switch, .keyword_try, .keyword_return, .keyword_let, .keyword_const, .keyword_var, .keyword_break, .keyword_continue, .keyword_throw => true,
+            else => false,
+        };
+        if (!bare) {
             // Evaluate first: the expression may read a local that is about to
             // be released, and releasing before the read is a use-after-move.
             const val = try self.parseExpression();
