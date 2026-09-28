@@ -1033,7 +1033,7 @@ pub const Parser = struct {
                     }
                 }
             } else if (self.scope_manager.lookup(val)) |vv| {
-                if (isFutureType(vv.type_name)) t_name = vv.type_name;
+                t_name = vv.type_name;
             }
 
             const is_heap = std.mem.startsWith(u8, val, "slice_") or std.mem.eql(u8, t_name, "string") or isFutureType(t_name);
@@ -2356,11 +2356,12 @@ pub const Parser = struct {
     /// Render an interpolation operand to a string slice register.
     ///
     /// Strings pass through; integers go through `sext` +
-    /// `@sa_fmt_i64_into` into a scratch buffer that the slice borrows (the
+    /// `@sa_fmt_i64_into`, floats through `@sa_fmt_f64_into` (precision 6,
+    /// the C-like default; mirrors `sa_plugin_sla` float printing via
+    /// `sa_std/fmt.sai`), into a scratch buffer that the slice borrows (the
     /// buffer stays live until scope exit, like any owned temp). String
     /// literals interpolate as their own text. Anything else is refused
-    /// loudly: floats have no digit rendering, and `null`/unknown operands
-    /// must not silently become pointer digits.
+    /// loudly: `null`/unknown operands must not silently become digits.
     fn renderInterpValue(self: *Parser, val: []const u8) anyerror![]const u8 {
         try self.rejectFutureOperand(val);
         if (val.len > 0 and val[0] == '"') {
@@ -2369,17 +2370,16 @@ pub const Parser = struct {
         }
         if (self.scope_manager.lookup(val)) |v| {
             if (std.mem.eql(u8, v.type_name, "string")) return val;
-            if (std.mem.eql(u8, v.type_name, "f64")) {
-                return self.refuseAt(
-                    "error: float interpolation is not supported: '{s}' has no digit rendering",
-                    .{val},
-                    error.FloatInterpolationNotSupported,
-                );
+            if (isFloatTypeName(v.type_name)) {
+                return try self.renderFloatInterpValue(val);
             }
         } else {
+            if (isFloatLiteral(val)) {
+                return try self.renderFloatInterpValue(val);
+            }
             if (!isIntLiteral(val)) {
                 return self.refuseAt(
-                    "error: cannot interpolate '{s}': only integers and strings lower to text",
+                    "error: cannot interpolate '{s}': only integers, floats and strings lower to text",
                     .{val},
                     error.BadInterpolationOperand,
                 );
@@ -2403,6 +2403,66 @@ pub const Parser = struct {
         try self.releaseOwnedIfLive(nlen);
         try self.retagTemp(vslice, "string");
         return vslice;
+    }
+
+    /// Render a float operand via `@sa_fmt_f64_into` (precision 6).
+    /// Shape mirrors the integer path above and `sa_plugin_sla` float
+    /// printing: scratch 64-byte buffer + 8-byte length slot, then pack a
+    /// fresh 16-byte `{ptr, len}` slice retagged as `string`.
+    fn renderFloatInterpValue(self: *Parser, val: []const u8) anyerror![]const u8 {
+        const numbuf = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 64\n", .{numbuf});
+        const numlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 8\n", .{numlen});
+        const rc = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_f64_into({s}, 6, {s}, 64, &{s})\n", .{ rc, val, numbuf, numlen });
+        const nlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as u64\n", .{ nlen, numlen });
+        const vslice = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{vslice});
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ vslice, numbuf });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ vslice, nlen });
+        try self.releaseOwnedIfLive(rc);
+        try self.releaseOwnedIfLive(nlen);
+        try self.retagTemp(vslice, "string");
+        return vslice;
+    }
+
+    /// Whether `name` is a float source-level type (`f64`/`f32`).
+    fn isFloatTypeName(name: []const u8) bool {
+        return std.mem.eql(u8, name, "f64") or std.mem.eql(u8, name, "f32");
+    }
+
+    /// Whether `text` looks like a float literal (`[-]digits.digits`).
+    fn isFloatLiteral(text: []const u8) bool {
+        if (text.len == 0) return false;
+        var i: usize = 0;
+        if (text[0] == '-') {
+            if (text.len == 1) return false;
+            i = 1;
+        }
+        var digits_before: usize = 0;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+            digits_before += 1;
+        }
+        if (i >= text.len or text[i] != '.') return false;
+        i += 1;
+        var digits_after: usize = 0;
+        while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
+            digits_after += 1;
+        }
+        return digits_before > 0 and digits_after > 0 and i == text.len;
+    }
+
+    /// Whether a value register/literal should be treated as float for
+    /// type-directed lowering (copies sa_plugin_sla's
+    /// `isFloatType or` rule): float-typed variable or float literal.
+    fn isFloatOperand(self: *Parser, val: []const u8) bool {
+        if (self.scope_manager.lookup(val)) |v| {
+            if (isFloatTypeName(v.type_name)) return true;
+            return false;
+        }
+        return isFloatLiteral(val);
     }
 
     /// Join two string slices with the body of stdlib's `STR_CONCAT` macro
@@ -3600,6 +3660,9 @@ pub const Parser = struct {
         const tag = self.current.tag;
 
         // Arithmetic: + - * / %
+        // Type-directed like sa_plugin_sla's planScalarBinaryOp: if either
+        // side is float (f32/f64 var or float literal), emit fadd/fsub/fmul
+        // /fdiv; otherwise keep the integer forms. `%` stays integer-only.
         if (tag == .plus or tag == .minus or tag == .star or tag == .slash or tag == .percent) {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
@@ -3608,11 +3671,12 @@ pub const Parser = struct {
 
             const temp_name = try self.newTemp();
 
+            const use_float = self.isFloatOperand(left) or self.isFloatOperand(right);
             const sa_op = switch (tag) {
-                .plus => "add",
-                .minus => "sub",
-                .star => "mul",
-                .slash => "div",
+                .plus => if (use_float) "fadd" else "add",
+                .minus => if (use_float) "fsub" else "sub",
+                .star => if (use_float) "fmul" else "mul",
+                .slash => if (use_float) "fdiv" else "div",
                 // SA-ASM spells the signed comparison/remainder forms
                 // `slt`/`sle`/`sgt`/`sge`/`srem`. Plain `lt`/`le`/`gt`/`ge`/
                 // `mod` are not mnemonics, so the assembler rejected them.
@@ -3621,10 +3685,15 @@ pub const Parser = struct {
             };
 
             try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp_name, sa_op, left, right });
+            if (use_float and tag != .percent) {
+                try self.retagTemp(temp_name, "f64");
+            }
             return temp_name;
         }
 
         // Comparison: == != < > <= >=
+        // Float sides use fcmp_* (SLA planScalarBinaryOp shape), ints keep
+        // eq/ne/slt/sgt/sle/sge.
         if (tag == .equal_equal or tag == .bang_equal or tag == .less or tag == .greater or tag == .less_equal or tag == .greater_equal) {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
@@ -3633,7 +3702,16 @@ pub const Parser = struct {
 
             const temp_name = try self.newTemp();
 
-            const sa_op = switch (tag) {
+            const use_float = self.isFloatOperand(left) or self.isFloatOperand(right);
+            const sa_op = if (use_float) switch (tag) {
+                .equal_equal => "fcmp_eq",
+                .bang_equal => "fcmp_ne",
+                .less => "fcmp_lt",
+                .greater => "fcmp_gt",
+                .less_equal => "fcmp_le",
+                .greater_equal => "fcmp_ge",
+                else => unreachable,
+            } else switch (tag) {
                 .equal_equal => "eq",
                 .bang_equal => "ne",
                 .less => "slt",

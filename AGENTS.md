@@ -123,6 +123,10 @@ String args auto-expanded from TS string structs (ptr+len) into SA pointer+lengt
 - Generic type parameters (Box<T>, Map<K,V>) — base name used for layout lookup
 - Enums with auto-numbered variants
 - Type aliases
+- Float arithmetic is type-directed like `sa_plugin_sla`'s
+  `planScalarBinaryOp`: when either side is `f32`/`f64` (or a float literal),
+  `+ - * /` lower to `fadd`/`fsub`/`fmul`/`fdiv` and comparisons to `fcmp_*`;
+  otherwise the integer forms are kept (`%` stays integer `srem`).
 - Arrow function closures with parameters (static defunctionalization, out-of-line callbacks, per-arrow context registers, `let f = (x) => ...` aliases; direct calls borrow `ctx`, higher-order passing moves `^ctx`)
 - Template literals: a plain literal (`` `text` ``) lowers to an SA string
   slice; interpolated forms (`` `text ${expr}` ``) lower too — integer
@@ -150,12 +154,14 @@ These are deliberate, documented refusals rather than silent bad codegen. See
 `REQUIREMENTS.md` section 7 for the full list and the reference implementation
 for each.
 
-- **Interpolated template literals with non-integer operands** — integers
-  lower via `sext` + `@sa_fmt_i64_into` (`sa_std/fmt.sai`) and strings pass
-  through, joined chunk-by-chunk with `@sa_string_concat` (`sa_std/string.sai`)
-  into a fresh `{ptr, len}` slice. Booleans render as 0/1 (documented). Float
-  or other operand types record a located diagnostic and return
-  `error.UnsupportedTemplateLiteral` instead of emitting bad SA.
+- **Interpolated template literals** — integers lower via `sext` +
+  `@sa_fmt_i64_into`, floats via `@sa_fmt_f64_into` (precision 6,
+  `sa_std/fmt.sai`), strings pass through, joined chunk-by-chunk with
+  `@sa_string_concat` (`sa_std/string.sai`) into a fresh `{ptr, len}` slice.
+  Booleans render as 0/1 (documented). Other operand types record a located
+  diagnostic instead of emitting bad SA. `let` bindings without an annotation
+  inherit the initialiser's type, so `let s = `v=${x}`` stays `string` and
+  `console.log(s)` prints text rather than pointer digits.
 - **String variable binding** — `const s: string = "..."` materializes a real
   slice (plain `s = "..."` is not a valid SA-ASM register assignment).
 - **`s.length` property** — aliases to the string slice's `len` field. The

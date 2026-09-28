@@ -47,10 +47,15 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
   out-of-line callbacks with per-arrow context registers; `let f = arrow`
   aliases; direct calls borrow `ctx`, higher-order passing moves `^ctx`)
 - [x] Interpolated template literals (`` `sum=${x}` ``): integers render via
-  `sext` + `@sa_fmt_i64_into` (`sa_std/fmt.sai`), strings pass through,
+  `sext` + `@sa_fmt_i64_into` (`sa_std/fmt.sai`), floats via
+  `@sa_fmt_f64_into` with precision 6, strings pass through,
   chunks join with the inlined `STR_CONCAT` body (`@sa_string_concat`,
   `sa_std/string.sai`). Booleans render as `0`/`1` (JEV scope decision);
-  floats and other operands are refused loudly with a located diagnostic
+  other operands are refused loudly with a located diagnostic
+- [x] Type-directed float arithmetic (copied from `sa_plugin_sla`'s
+  `planScalarBinaryOp`): `+ - * /` with an `f32`/`f64` side lower to
+  `fadd`/`fsub`/`fmul`/`fdiv`, comparisons to `fcmp_*`; integer sides keep the
+  existing forms (`/` on integers stays `div`, `%` stays `srem`)
 - [x] Double-quoted string literals bound to variables (`const s = "bob"`
   materialises the slice; the raw `"..."` is not an SA operand)
 - [x] `s.length` property (aliased to the builtin string layout's `len`
@@ -67,11 +72,13 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] SIMD-optimized whitespace/comment scanning
 - [x] Benchmark suite (40 tests total, including a runtime table whose 23 expectations are verified against Node: lower, `sa build`, run, assert exit status)
 - [x] SA-ASM validity regression tests, plus an end-to-end check that runs `sa build` on lowered output
-- [x] TypeScript demo corpus: 261 demos under `demos/`, verified by
+- [x] TypeScript demo corpus: 260 demos under `demos/`, verified by
       `tools/verify_demos.sh` (each demo is lowered and then assembled with the
-      real `sa build`). Currently 258 verified against Node, 1 is refused with a
+      real `sa build`). Currently 259 verified against Node, 1 is refused with a
       located diagnostic (`155_generic_map`, a `new` expression), and 0 fail.
       `demos/251_kitchen_sink` exercises the whole verified subset in one program.
+      `demos/262_float_arith` covers the type-directed float ops (`fdiv`/`fadd`/
+      `fmul`/`fsub`/`fcmp_eq`).
       `demos/252_arrow_param_expr`–`255_arrow_block_body` cover arrow functions
       with parameters (expression/two-param/capture/block bodies).
       `demos/256_interp_basic`–`258_string_bind_length` cover interpolated
@@ -132,11 +139,10 @@ mistake is not repeated.
 
 ### Rejected with a diagnostic (no longer emits invalid SA-ASM)
 
-- **Float interpolation** (`` `v=${f}` `` with an `f64` operand, or a float
-  literal) — recognised, but refused at lowering time with a `line:col`
-  diagnostic: there is no digit rendering for floats. Integer and string
-  operands lower normally (see §5); booleans render as `0`/`1` per the JEV
-  scope decision recorded in §5.
+- **Non-numeric interpolation operands** (e.g. `null`) — recognised, but
+  refused at lowering time with a `line:col` diagnostic. Integer, float and
+  string operands lower normally (see §5); booleans render as `0`/`1` per the
+  JEV scope decision recorded in §5.
 
 ### Parses, but cannot be semantically faithful
 
@@ -147,9 +153,11 @@ mistake is not repeated.
 
 ### Not implemented
 
-- **`/` is integer division** — the subset maps TypeScript `/` to the integer
-  `div`, so `15 / 2` yields `7`, not `7.5`. Programs relying on TypeScript
-  float division are out of scope.
+- **`/` on integers is integer division** — with no float side the subset maps
+  TypeScript `/` to the integer `div`, so `15 / 2` yields `7`, not `7.5`. When
+  either side is `f32`/`f64` (or a float literal) it lowers to `fdiv`, so
+  `7.5 / 2.5` yields `3.0`. Programs relying on TypeScript float division must
+  use float operands.
 - **Statement-level intrinsics** — bare `store x + 0, 1 as i32` and `alloc(n)`
   used as statements lower inline (same instruction as the expression form).
 - **`var`** — lowers exactly like `let` (function-level lowering with lexical
@@ -160,7 +168,7 @@ mistake is not repeated.
 
 ### Found by the demo corpus, still open
 
-Verified counts from `tools/verify_demos.sh`: 258 assemble and match Node, 1 is
+Verified counts from `tools/verify_demos.sh`: 259 assemble and match Node, 1 is
 refused with a located diagnostic, and **0 fail**. Every demo now lands in a good
 bucket, so no unresolved defect is left in the corpus.
 

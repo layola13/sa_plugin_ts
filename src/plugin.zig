@@ -1264,6 +1264,76 @@ test "sa_plugin_ts lowers console.log to sa_print_bytes" {
     try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_print_bytes(") != null);
 }
 
+test "sa_plugin_ts lowers float arithmetic to fadd/fsub/fmul/fdiv" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let a: f64 = 7.5;
+        \\  let b: f64 = 2.5;
+        \\  let c: f64 = a / b;
+        \\  let d: f64 = a + b;
+        \\  let e: f64 = a * b;
+        \\  let f: f64 = a - b;
+        \\  if (c == 3.0) { return 1; }
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "fdiv a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "fadd a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "fmul a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "fsub a, b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "fcmp_eq c, 3.0") != null);
+}
+
+test "sa_plugin_ts lowers float interpolation through sa_fmt_f64_into" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let x: f64 = 3.25;
+        \\  let s = `v=${x}`;
+        \\  console.log(s);
+        \\  console.log(x);
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_fmt_f64_into(x, 6,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "sext s as i64") == null);
+}
+
 test "sa_plugin_ts descriptor is valid" {
     try std.testing.expectEqual(@as(u32, 1), descriptor.abi_version);
     try std.testing.expectEqual(@sizeOf(plugin_api.PluginDescriptor), descriptor.descriptor_size);
