@@ -17,14 +17,57 @@
     }
   },
   "interfaces": {
-    "sai": { "path": "sa_plugin_ts.sai" }
+    "sai": {
+      "path": "sa_plugin_ts.sai"
+    }
   },
-  "skills": ["ts.lower"],
+  "skills": [
+    "ts.lower",
+    "ts.check",
+    "ts.build",
+    "ts.build-exe",
+    "ts.test",
+    "ts.init"
+  ],
   "permissions": {
-    "fs": [],
+    "fs": [
+      {
+        "op": "read",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "write",
+        "path": "$PROJECT/**"
+      },
+      {
+        "op": "create",
+        "path": "$PROJECT/**"
+      }
+    ],
     "net": [],
-    "env": [],
-    "process": { "spawn": false, "exec": [] }
+    "env": [
+      "HOME",
+      "PATH",
+      "SA_*"
+    ],
+    "process": {
+      "spawn": true,
+      "exec": [
+        {
+          "path": "/usr/local/bin/sa",
+          "args": [
+            "*"
+          ]
+        },
+        {
+          "path": "/opt/sa/bin/sa",
+          "args": [
+            "*"
+          ]
+        }
+      ]
+    }
   },
-  "dependencies": {}
+  "dependencies": {},
+  "help": "usage: ts <command> [options]\n       sa ts <command> [options]\n\nCommands:\n  lower      [file.ts] [--out <file>] [-p <package>]\n  check      [file.ts] [-p <package>]\n  build      [file.ts] [--out <file>] [-p <package>]\n  build-exe  [file.ts] [--out <exe>] [-p <package>] [<sa-build-exe-args>...]\n  test       [file.ts] [-p <package>] [<sa-test-args>...]\n  init       [path]\n  skills     [--json]\n  help\n\nOptions:\n  -p, --package <name>   Select a workspace package (accepted; single-file lowering)\n  --out, -o <file>       Write output to file\n  --json                 Emit JSON where supported\n  -h, --help             Show this help message\n"
 }

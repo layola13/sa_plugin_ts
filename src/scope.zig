@@ -2,11 +2,13 @@ const std = @import("std");
 
 /// Whether a definition in `def` dominates a release point in `at`.
 ///
-/// When a computed dominance matrix is supplied it is authoritative. Falling
-/// back to "the entry block dominates everything, any other block dominates
-/// only itself" is the sound approximation used before the analysis existed: a
-/// register defined in one arm of a branch is not live at the merge point, so
-/// treating every block as dominating itself would leak it.
+/// Matrix layout: row `b` holds the dominator set of `b` (block `b` plus
+/// every block above it on the idom chain), so "def dominates at" reads row
+/// `at`, column `def`. When no matrix is supplied, or the snapshot does not
+/// cover the blocks, fall back to "the entry block dominates everything, any
+/// other block dominates only itself": a register defined in one arm of a
+/// branch is not live at the merge point, so treating every block as
+/// dominating itself would leak it.
 inline fn dominatesWith(
     reaches: ?[]const bool,
     def: u32,
@@ -19,7 +21,7 @@ inline fn dominatesWith(
         var w: usize = 1;
         while (w * w < m.len) : (w += 1) {}
         if (w == 0 or w * w != m.len) return def == 0 or def == at;
-        if (@as(usize, def) < w and @as(usize, at) < w) return m[@as(usize, def) * w + @as(usize, at)];
+        if (@as(usize, def) < w and @as(usize, at) < w) return m[@as(usize, at) * w + @as(usize, def)];
         return def == at;
     }
     return def == 0 or def == at;

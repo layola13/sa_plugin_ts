@@ -1,41 +1,5 @@
 const std = @import("std");
 
-/// Intersect the dominator sets of two predecessors while the sets are still
-/// represented by their current dominator tree walk.
-///
-/// The classic iterative immediate-dominator algorithm walks each candidate up
-/// its own idom chain to a common ancestor, which needs no explicit sets.
-fn intersectDominators(
-    allocator: std.mem.Allocator,
-    dom: []const u32,
-    a: u32,
-    b: u32,
-) !u32 {
-    const unsnapped = std.math.maxInt(u32);
-    var finger1 = a;
-    var finger2 = b;
-    while (finger1 != finger2) {
-        while (finger1 != dom[finger1]) {
-            finger1 = dom[finger1];
-            if (finger1 == unsnapped) return unsnapped;
-        }
-        while (finger2 != dom[finger2]) {
-            finger2 = dom[finger2];
-            if (finger2 == unsnapped) return unsnapped;
-        }
-        if (finger1 == unsnapped) return unsnapped;
-        if (finger2 == unsnapped) return unsnapped;
-        // Advance the deeper finger one level toward the root.
-        if (dom[finger1] < dom[finger2]) {
-            finger2 = dom[finger2];
-        } else {
-            finger1 = dom[finger1];
-        }
-    }
-    _ = allocator;
-    return finger1;
-}
-
 pub const Lowerer = struct {
     allocator: std.mem.Allocator,
     output: std.ArrayList(u8),
@@ -80,21 +44,25 @@ pub const Lowerer = struct {
     /// serial 0 is always the entry block, which dominates every other block.
     block_serial: u32 = 0,
 
-    /// Control-flow edges of the block being built.
+    /// Control-flow edges of the function being built, by successor NAME.
     ///
-    /// `edges[from]` is the set of blocks `from` can transfer control to. Every
-    /// block must list *all* of its successors: a `br` lists two, a `jmp` and
-    /// `return` list none, and a block that simply falls through to the next
-    /// label lists the following block. The set is what a dominator analysis
-    /// needs to decide where a register is live, which a release depends on.
-    edges: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u32)) = .{},
+    /// `succ_names[from]` is every label `from` can transfer control to: a
+    /// `br` lists two, a `jmp` lists one, `return` lists none, and a block
+    /// that falls through to the next label lists that label (recorded by
+    /// `emitLabel`, which is the only place the next label's name is known).
+    /// Names are used instead of serials because a forward target's serial
+    /// is unknowable at branch-emit time — resolving it as "next serial"
+    /// misroutes every else/merge target into the fallthrough block.
+    /// Resolution against `written_serials` happens per
+    /// `computeDominators` call, so later calls see more labels and the
+    /// result only grows more complete; nothing here is ever speculative.
+    succ_names: std.ArrayListUnmanaged(std.ArrayListUnmanaged([]const u8)) = .{},
 
-    /// Successors of the block currently being emitted. Each entry is the index
-    /// of a not-yet-written label, which resolves to serial `index + 1`.
-    pending_edges: std.ArrayListUnmanaged(u32) = .{},
-
-    /// Number of labels written so far; the next label gets serial this + 1.
-    labels_written: u32 = 0,
+    /// Serial of each label actually written to the output, for resolving
+    /// `succ_names`. A pending label that is dropped (unreferenced and
+    /// empty) never appears here, and neither does a label still sitting in
+    /// `pending_label`.
+    written_serials: std.StringHashMapUnmanaged(u32) = .{},
 
     pub fn init(allocator: std.mem.Allocator) Lowerer {
         return .{
@@ -110,6 +78,9 @@ pub const Lowerer = struct {
         self.header.deinit();
         self.imports.deinit();
         self.label_refs.deinit(self.allocator);
+        for (self.succ_names.items) |*l| l.deinit(self.allocator);
+        self.succ_names.deinit(self.allocator);
+        self.written_serials.deinit(self.allocator);
     }
 
     /// Declare a file-scope UTF-8 data constant.
@@ -170,8 +141,29 @@ pub const Lowerer = struct {
             // A label that ends a function with nothing after it is dropped by
             // `finishFunction` instead, which checks before flushing.
             try self.output.writer().print("{s}:\n", .{label});
+            // The single choke point where a label becomes a real block: all
+            // CFG resolution reads this map, so a dropped label (never
+            // flushed) can never misroute an edge.
+            try self.written_serials.put(self.allocator, label, self.block_serial);
             self.pending_label = null;
         }
+    }
+
+    /// Ensure `succ_names` has a list for `serial`, initializing new slots
+    /// (`resize` on an unmanaged list leaves them undefined).
+    fn ensureBlock(self: *Lowerer, serial: u32) !void {
+        if (self.succ_names.items.len <= serial) {
+            const old_len = self.succ_names.items.len;
+            try self.succ_names.resize(self.allocator, serial + 1);
+            for (self.succ_names.items[old_len..]) |*l| l.* = .{};
+        }
+    }
+
+    /// Grow `succ_names` for the next serial, initializing the new slot.
+    fn growBlock(self: *Lowerer) !void {
+        const old_len = self.succ_names.items.len;
+        try self.succ_names.resize(self.allocator, self.block_serial + 1);
+        for (self.succ_names.items[old_len..]) |*l| l.* = .{};
     }
 
     /// Emit an ordinary (non-terminating) instruction.
@@ -196,18 +188,18 @@ pub const Lowerer = struct {
     pub fn emitBranchTo(self: *Lowerer, cond: []const u8, true_label: []const u8, false_label: []const u8) !void {
         try self.useLabel(true_label);
         try self.useLabel(false_label);
-        // Both targets are labels that will be emitted in order, so the block
-        // they land in is one past the current serial. Resolve them precisely
-        // against the recorded label serials when the label is written.
         try self.emitTerm("    br {s} -> {s}, {s}\n", .{ cond, true_label, false_label });
-        try self.pending_edges.append(self.allocator, self.labels_written);
+        try self.ensureBlock(self.block_serial);
+        try self.succ_names.items[self.block_serial].append(self.allocator, true_label);
+        try self.succ_names.items[self.block_serial].append(self.allocator, false_label);
     }
 
     /// Emit an unconditional jump and record the CFG edge.
     pub fn emitJumpTo(self: *Lowerer, label: []const u8) !void {
         try self.useLabel(label);
         try self.emitTerm("    jmp {s}\n", .{label});
-        try self.pending_edges.append(self.allocator, self.labels_written);
+        try self.ensureBlock(self.block_serial);
+        try self.succ_names.items[self.block_serial].append(self.allocator, label);
     }
 
     /// Begin a new basic block at `name`.
@@ -225,13 +217,21 @@ pub const Lowerer = struct {
                 try self.flushPending();
                 if (self.block_empty) {
                     try self.output.writer().print("    jmp {s}\n", .{name});
+                    try self.ensureBlock(self.block_serial);
+                    try self.succ_names.items[self.block_serial].append(self.allocator, name);
                 }
             }
         }
-        try self.closeBlock();
+        // The block being closed falls through to `name` unless it already
+        // ends in a terminator. This is the only place the next label's name
+        // is known, so it is the only place the fallthrough edge can be
+        // recorded — by name, like every other edge.
+        if (!self.block_terminated) {
+            try self.ensureBlock(self.block_serial);
+            try self.succ_names.items[self.block_serial].append(self.allocator, name);
+        }
         self.block_serial +%= 1;
-        self.labels_written +%= 1;
-        try self.edges.resize(self.allocator, self.block_serial + 1);
+        try self.growBlock();
         self.pending_label = name;
         self.block_empty = true;
         self.block_terminated = false;
@@ -267,82 +267,120 @@ pub const Lowerer = struct {
         return self.block_serial;
     }
 
-    /// Record that control can flow from the current block to `target`.
-    pub fn addEdge(self: *Lowerer, target: u32) !void {
-        try self.pending_edges.append(self.allocator, target);
-    }
-
-    /// Close the current block, recording its outgoing edges.
-    ///
-    /// A branch to a label that has not been written yet is recorded as an index
-    /// into `branch_targets`. Since `emitLabel` assigns serial `index + 1`,
-    /// those resolve without waiting for the label.
-    fn closeBlock(self: *Lowerer) !void {
-        if (self.edges.items.len <= self.block_serial) {
-            try self.edges.resize(self.allocator, self.block_serial + 1);
-        }
-
-        var succ = std.ArrayListUnmanaged(u32){};
-        for (self.pending_edges.items) |e| {
-            succ.append(self.allocator, @intCast(e + 1)) catch {};
-        }
-        self.pending_edges = .{};
-
-        // A block with no explicit terminator falls through to the next one.
-        if (!self.block_terminated and self.block_serial + 1 < self.edges.items.len) {
-            succ.append(self.allocator, self.block_serial + 1) catch {};
-        }
-        self.edges.items[self.block_serial] = succ;
-    }
-
     /// Immediate dominators for the current function, indexed by block serial.
     ///
     /// Entry is its own dominator. A block unreachable from entry keeps
     /// `maxInt(u32)`, which `dominates` treats as dominating nothing, so a
     /// release is never emitted into dead code. A register may only be released
-    /// where its definition dominates the release point; treating every block as
-    /// dominating itself is what previously leaked values created in a branch arm.
+    /// where its definition dominates the release point.
+    ///
+    /// Name resolution happens here, per call: a forward target skipped as
+    /// "not yet written" today resolves once its label is emitted, so each
+    /// call sees a strictly more complete CFG. This function mutates no
+    /// persistent state and is safe to call before every release walk.
     pub fn computeDominators(self: *Lowerer) ![]bool {
-        try self.closeBlock();
-        const n: u32 = @intCast(self.edges.items.len);
-        const unsnapped = std.math.maxInt(u32);
+        const n: usize = @max(self.succ_names.items.len, self.block_serial + 1);
         if (n == 0) return self.allocator.alloc(bool, 0);
 
-        const dom = try self.allocator.alloc(u32, n);
-        for (dom, 0..) |*d, i| d.* = if (i == 0) 0 else unsnapped;
-
-        var changed = true;
-        while (changed) {
-            changed = false;
-            var b: u32 = 1;
-            while (b < n) : (b += 1) {
-                if (self.edges.items[b].items.len == 0) continue;
-                var new_idom: u32 = unsnapped;
-                for (self.edges.items[b].items) |succ| {
-                    if (succ >= n) continue;
-                    if (dom[succ] == unsnapped) continue;
-                    if (new_idom == unsnapped) {
-                        new_idom = dom[succ];
-                    } else {
-                        new_idom = try intersectDominators(self.allocator, dom, new_idom, dom[succ]);
+        // Resolve successor names to serials; skip labels not yet written.
+        var succs = try self.allocator.alloc(std.ArrayListUnmanaged(u32), n);
+        defer {
+            for (succs) |*l| l.deinit(self.allocator);
+            self.allocator.free(succs);
+        }
+        for (succs) |*l| l.* = .{};
+        for (self.succ_names.items, 0..) |*names, from| {
+            if (from >= n) break;
+            for (names.items) |tgt| {
+                // The current block's own label is still sitting in
+                // pending_label (flushed by the next emit, after this walk),
+                // so it resolves to block_serial explicitly — otherwise the
+                // block being released into looks unreachable and every
+                // release is vetoed.
+                if (self.pending_label) |pl| {
+                    if (std.mem.eql(u8, tgt, pl)) {
+                        if (self.block_serial < n) succs[from].append(self.allocator, self.block_serial) catch {};
+                        continue;
                     }
                 }
-                if (new_idom != unsnapped and new_idom != dom[b]) {
-                    dom[b] = new_idom;
-                    changed = true;
+                if (self.written_serials.get(tgt)) |to| {
+                    if (to < n) succs[from].append(self.allocator, to) catch {};
                 }
             }
         }
 
-        // idom array -> dominance relation the release walk can query.
+        // Predecessor lists. idom[b] is the common dominator of dom[p] over
+        // all predecessors p of b.
+        var preds = try self.allocator.alloc(std.ArrayListUnmanaged(u32), n);
+        defer {
+            for (preds) |*l| l.deinit(self.allocator);
+            self.allocator.free(preds);
+        }
+        for (preds) |*l| l.* = .{};
+        for (succs, 0..) |*list, from| {
+            for (list.items) |to| {
+                preds[to].append(self.allocator, @intCast(from)) catch {};
+            }
+        }
+
+        // Classic bitset dataflow: Dom(entry) = {entry},
+        // Dom(b) = {b} ∪ (∩ Dom[p] over all predecessors p), iterated to a
+        // fixpoint. No processing order or finger-walk subtleties: the sets
+        // only shrink, so iteration converges, and an idom-free formulation
+        // cannot mis-snap a loop head to entry the way the previous
+        // immediate-dominator loop did (it seeded from idom values instead
+        // of predecessor blocks, permanently dropping real dominators).
+        const words: usize = (n + 63) / 64;
+        var dom = try self.allocator.alloc(u64, n * words);
+        defer self.allocator.free(dom);
+        for (0..n) |b| {
+            for (0..words) |w| dom[b * words + w] = std.math.maxInt(u64);
+        }
+        for (0..words) |w| dom[0 * words + w] = 0;
+        dom[0] |= @as(u64, 1);
+
+        var tmp = try self.allocator.alloc(u64, words);
+        defer self.allocator.free(tmp);
+
+        var changed = true;
+        while (changed) {
+            changed = false;
+            var b: usize = 1;
+            while (b < n) : (b += 1) {
+                if (preds[b].items.len == 0) {
+                    // Unreachable: dominates nothing but itself.
+                    for (0..words) |w| {
+                        const want: u64 = if (b / 64 == w) @as(u64, 1) << @intCast(b % 64) else 0;
+                        if (dom[b * words + w] != want) {
+                            dom[b * words + w] = want;
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
+                for (0..words) |w| tmp[w] = std.math.maxInt(u64);
+                for (preds[b].items) |p| {
+                    for (0..words) |w| tmp[w] &= dom[@as(usize, p) * words + w];
+                }
+                tmp[b / 64] |= @as(u64, 1) << @intCast(b % 64);
+                for (0..words) |w| {
+                    if (dom[b * words + w] != tmp[w]) {
+                        dom[b * words + w] = tmp[w];
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Dom sets -> dominance relation the release walk can query: row `at`
+        // holds every block dominating `at`.
         const reaches = try self.allocator.alloc(bool, n * n);
         @memset(reaches, false);
-        for (0..n) |i| {
-            var cur: u32 = @intCast(i);
-            while (true) {
-                reaches[i * n + cur] = true;
-                if (cur == 0 or dom[cur] == unsnapped) break;
-                cur = dom[cur];
+        for (0..n) |at| {
+            for (0..n) |def| {
+                if (dom[at * words + def / 64] & (@as(u64, 1) << @intCast(def % 64)) != 0) {
+                    reaches[at * n + def] = true;
+                }
             }
         }
         return reaches;
@@ -350,10 +388,10 @@ pub const Lowerer = struct {
 
     /// Reset per-function block state.
     pub fn beginFunction(self: *Lowerer) void {
-        self.edges.clearRetainingCapacity();
-        self.pending_edges.clearRetainingCapacity();
+        for (self.succ_names.items) |*l| l.clearRetainingCapacity();
+        self.succ_names.clearRetainingCapacity();
+        self.written_serials.clearRetainingCapacity();
         self.block_serial = 0;
-        self.labels_written = 0;
         self.pending_label = null;
         self.block_empty = true;
         self.block_terminated = false;

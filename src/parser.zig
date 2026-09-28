@@ -304,6 +304,7 @@ pub const Parser = struct {
     /// `return`, `break` or `continue` is terminated, and a release written
     /// after it would be unreachable.
     fn exitScopeReleasingLocals(self: *Parser) anyerror!void {
+        try self.refreshDominators();
         if (!self.lowerer.isTerminated()) {
             try self.scope_manager.releaseCurrentScopeOwned(self.lowerer);
         }
@@ -386,8 +387,12 @@ pub const Parser = struct {
 
     /// Refresh the cached dominance matrix for the block being emitted.
     ///
-    /// Called at a branch boundary, where the CFG so far is complete enough to
-    /// decide which definitions are live at the merge point.
+    /// Called before every release walk, where the CFG so far is complete
+    /// enough to decide which definitions are live at the release point:
+    /// every path to the current block consists of already-emitted blocks,
+    /// and no future edge can add a new path into the past. A stale matrix
+    /// (kept across a branch boundary) is what used to veto required
+    /// releases, so each walk recomputes instead of reusing one.
     fn refreshDominators(self: *Parser) anyerror!void {
         if (self.dominators) |d| self.allocator.free(d);
         self.dominators = try self.lowerer.computeDominators();
@@ -399,6 +404,7 @@ pub const Parser = struct {
     /// The register holding a returned value must not be released before the
     /// `return`: the assembler reports that as a use-after-move.
     fn releaseLiveRegistersExcept(self: *Parser, keep: ?[]const u8) anyerror!void {
+        try self.refreshDominators();
         try self.scope_manager.releaseAllOwnedExcept(self.lowerer, keep);
     }
 
@@ -476,6 +482,7 @@ pub const Parser = struct {
                     // every open scope would free the enclosing function's
                     // locals here, leaving the merge point to see one arm with
                     // a consumed register and the other still holding it.
+                    try self.refreshDominators();
                     try self.scope_manager.releaseScopesDeeperThan(self.lowerer, target.scope_depth);
                     try self.lowerer.useLabel(target.label);
                     try self.lowerer.emitJumpTo(target.label);
@@ -494,6 +501,7 @@ pub const Parser = struct {
                 // to a function-exit walk that will never see them.
                 if (self.continue_stack.items.len > 0) {
                     const target = self.continue_stack.items[self.continue_stack.items.len - 1];
+                    try self.refreshDominators();
                     try self.scope_manager.releaseScopesDeeperThan(self.lowerer, target.scope_depth);
                     try self.lowerer.useLabel(target.label);
                     try self.lowerer.emitJumpTo(target.label);
@@ -729,6 +737,67 @@ pub const Parser = struct {
     // Let / Const
     // ==========================================
 
+    /// Parse `{ field: value, ... }` with the cursor on `{` as a value of the
+    /// interface `type_name`: allocate a fresh register, store each field
+    /// into it, and return the register.
+    ///
+    /// A nested `{ ... }` field value reuses the outer interface's field type
+    /// as its layout, so arbitrarily nested literals lower without an
+    /// annotation at every level. The fresh register is retagged from `i32`
+    /// to the struct type so chained property access (`o.inner.a`) resolves
+    /// the layout through it.
+    fn parseNewStructLiteral(self: *Parser, type_name: []const u8) anyerror![]const u8 {
+        const layout = self.layout_table.find(type_name) orelse {
+            std.debug.print("error:{d}:{d}: struct literal of unknown interface '{s}'\n", .{
+                self.current.line,
+                self.current.col,
+                type_name,
+            });
+            return error.UnknownInterface;
+        };
+        const dest = try self.newTemp();
+        if (self.scope_manager.lookup(dest)) |tv| {
+            self.allocator.free(tv.type_name);
+            tv.type_name = try self.allocator.dupe(u8, type_name);
+        }
+        try self.lowerer.emit("    {s} = alloc {d}\n", .{ dest, layout.size });
+        try self.expect(.l_brace);
+        try self.parseStructLiteralFields(dest, layout);
+        return dest;
+    }
+
+    /// Parse the `field: value, ... }` tail of a struct literal, storing each
+    /// field into the already-allocated register `dest`.
+    fn parseStructLiteralFields(self: *Parser, dest: []const u8, layout: *StructLayout) anyerror!void {
+        while (self.current.tag != .r_brace and self.current.tag != .eof) {
+            const f_name_tok = self.current;
+            try self.expect(.identifier);
+            const f_name = self.tokenText(f_name_tok);
+
+            try self.expect(.colon);
+
+            var found_field: ?Field = null;
+            for (layout.fields.items) |f| {
+                if (std.mem.eql(u8, f.name, f_name)) {
+                    found_field = f;
+                    break;
+                }
+            }
+            const field = found_field orelse return error.UnknownField;
+
+            const val: []const u8 = if (self.current.tag == .l_brace)
+                try self.parseNewStructLiteral(field.type_name)
+            else
+                try self.parseExpression();
+
+            try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ dest, field.offset, val, saTypeOf(field.type_name) });
+
+            _ = try self.accept(.comma);
+            _ = try self.accept(.semicolon);
+        }
+        try self.expect(.r_brace);
+    }
+
     fn parseLet(self: *Parser) anyerror!void {
         const is_const = self.current.tag == .keyword_const;
         if (is_const) {
@@ -757,30 +826,7 @@ pub const Parser = struct {
 
             try self.lowerer.emit("    {s} = alloc {d}\n", .{ var_name, layout.size });
 
-            while (self.current.tag != .r_brace and self.current.tag != .eof) {
-                const f_name_tok = self.current;
-                try self.expect(.identifier);
-                const f_name = self.tokenText(f_name_tok);
-
-                try self.expect(.colon);
-
-                const val = try self.parseExpression();
-
-                var found_field: ?Field = null;
-                for (layout.fields.items) |f| {
-                    if (std.mem.eql(u8, f.name, f_name)) {
-                        found_field = f;
-                        break;
-                    }
-                }
-                const field = found_field orelse return error.UnknownField;
-
-                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ var_name, field.offset, val, saTypeOf(field.type_name) });
-
-                _ = try self.accept(.comma);
-                _ = try self.accept(.semicolon);
-            }
-            try self.expect(.r_brace);
+            try self.parseStructLiteralFields(var_name, layout);
         } else if (try self.accept(.l_bracket)) {
             // Array literal initialization: let arr = [1, 2, 3]
             const elem_type = type_name orelse "i32";
@@ -1126,6 +1172,72 @@ pub const Parser = struct {
         self.popLoopTargets();
     }
 
+    /// Parse the increment clause of a C-style `for` header.
+    ///
+    /// An assignment (`i = i + 2`, `i = i - 1`) is a statement shape, not an
+    /// expression: routing it through `parseExpression` parses just the `i`,
+    /// leaves `= ...` unconsumed, and the following `expect(.r_paren)` fails.
+    /// That error is recorded only in `Parser.errors`, which the CLI never
+    /// prints, so the whole rest of the function was silently dropped while
+    /// the CLI still reported success. `i++` / `i--` already parse as
+    /// expressions and keep that path.
+    /// Emit `!name` if `name` currently owns an unreleased moved value.
+    ///
+    /// SA-ASM is affine: moving a register into a name that already owns a
+    /// moved value (`total = t_1` after `total = t_0`) fails with
+    /// RegisterRedefinition, while rebinding a const-bound scalar rebinds
+    /// freely. Anything heap-marked and unreleased must be freed first.
+    /// `def_block` is deliberately left alone so the function-exit walk
+    /// still sees the entry definition dominate and releases whichever
+    /// value is live on each path.
+    fn releaseOwnedIfLive(self: *Parser, name: []const u8) anyerror!void {
+        const v = self.scope_manager.lookup(name) orelse return;
+        if (v.is_heap_allocated and !v.is_consumed and !v.is_released) {
+            try self.lowerer.emit("    !{s}\n", .{v.reg});
+            v.is_released = true;
+        }
+    }
+
+    /// Mark `name` as freshly bound: the new value is live and needs its own
+    /// future release, even if the previous value was just released or the
+    /// name was consumed before.
+    fn markRebound(self: *Parser, name: []const u8) void {
+        if (self.scope_manager.lookup(name)) |v| {
+            v.is_released = false;
+            v.is_consumed = false;
+        }
+    }
+
+    /// Lower `name = val` with move semantics, releasing first if needed.
+    ///
+    /// The old value is released via `releaseOwnedIfLive`; the fresh value
+    /// then needs its own future release, hence the flag reset.
+    fn emitMove(self: *Parser, name: []const u8, val: []const u8) anyerror!void {
+        if (!std.mem.eql(u8, name, val)) {
+            try self.releaseOwnedIfLive(name);
+            if (self.scope_manager.lookup(val) != null) {
+                self.scope_manager.markConsumed(val);
+            }
+        }
+        try self.lowerer.emit("    {s} = {s}\n", .{ name, val });
+        self.markRebound(name);
+    }
+
+    fn parseForIncrement(self: *Parser) anyerror!void {
+        if (self.current.tag == .identifier and self.peek.tag == .equal) {
+            const name_tok = self.current;
+            try self.advance();
+            const name = self.tokenText(name_tok);
+            try self.expect(.equal);
+            const val = try self.parseExpression();
+            // Same move semantics as a statement-level assignment, including
+            // the release-before-rebind a move-bound induction variable needs.
+            try self.emitMove(name, val);
+            return;
+        }
+        _ = try self.parseExpression();
+    }
+
     fn parseFor(self: *Parser) anyerror!void {
         try self.expect(.keyword_for);
         try self.expect(.l_paren);
@@ -1270,7 +1382,7 @@ pub const Parser = struct {
         if (self.current.tag != .r_paren) {
             var buf = std.ArrayList(u8).init(self.allocator);
             self.lowerer.capture = &buf;
-            const inc_result = self.parseExpression();
+            const inc_result = self.parseForIncrement();
             self.lowerer.capture = null;
             // Surface parse errors, but keep the captured text.
             _ = try inc_result;
@@ -2110,8 +2222,14 @@ pub const Parser = struct {
                     try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ left_name, field.offset, val, saTypeOf(field.type_name) });
                     return;
                 } else {
-                    // Load intermediate
+                    // Load intermediate. The temp is retagged from `i32` to
+                    // the field type so a further `.x` resolves the layout
+                    // through it (`o.inner.a`).
                     const temp_name = try self.newTemp();
+                    if (self.scope_manager.lookup(temp_name)) |tv| {
+                        self.allocator.free(tv.type_name);
+                        tv.type_name = try self.allocator.dupe(u8, field.type_name);
+                    }
                     const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
                         field.type_name
                     else
@@ -2143,20 +2261,51 @@ pub const Parser = struct {
                 try self.lowerer.emit("    store {s} + 0, {s} as i32\n", .{ addr_temp, val });
             }
         } else if (self.current.tag == .equal) {
-            // Simple assignment: x = expr
+            // Simple assignment: x = expr, or x = { ... } for a struct.
             try self.advance();
+            if (self.current.tag == .l_brace) {
+                // Struct literal reassignment reuses the existing allocation;
+                // the layout comes from the variable's declared type, so no
+                // new annotation is needed at the assignment site.
+                const v = self.scope_manager.lookup(name) orelse {
+                    std.debug.print("error:{d}:{d}: assignment to undefined variable '{s}'\n", .{
+                        name_tok.line,
+                        name_tok.col,
+                        name,
+                    });
+                    return error.UndefinedVariable;
+                };
+                const layout = self.layout_table.find(v.type_name) orelse {
+                    std.debug.print("error:{d}:{d}: struct literal assigned to non-interface variable '{s}'\n", .{
+                        self.current.line,
+                        self.current.col,
+                        name,
+                    });
+                    return error.TypeIsNotAnInterface;
+                };
+                try self.advance(); // consume {
+                try self.parseStructLiteralFields(name, layout);
+                _ = try self.accept(.semicolon);
+                return;
+            }
             const val = try self.parseExpression();
             _ = try self.accept(.semicolon);
 
             // A register-to-register assignment moves its source. Inside a
-            // conditional that is unsound: the source ends up Consumed on the
-            // taken arm and Active on the other, and the verifier's merge at
-            // the join point reports PhiStateConflict. This is the common
-            // "conditionally update an accumulator" shape, so emit a
-            // non-moving copy there instead. Arithmetic leaves its operands
-            // live, so both arms agree.
-            if (self.branch_depth > 0 and self.scope_manager.lookup(val) != null) {
-                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ name, val });
+            // conditional that is unsound when the source is an outer
+            // variable: it ends up Consumed on the taken arm and Active on
+            // the other, and the verifier's merge at the join point reports
+            // PhiStateConflict. This is the common "conditionally update an
+            // accumulator" shape, so emit a non-moving copy there instead.
+            // The copy goes through a fresh temp: computing directly into
+            // `name` (`total = add t, 0`) redefines a live register.
+            // Arithmetic temps are arm-local and symmetric on both arms, so
+            // the plain move below stays for them.
+            if (self.branch_depth > 0 and self.scope_manager.isOuterVariable(val)) {
+                const tmp = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ tmp, val });
+                self.scope_manager.markConsumed(tmp);
+                try self.emitMove(name, tmp);
                 return;
             }
 
@@ -2164,22 +2313,25 @@ pub const Parser = struct {
             // `!` for it afterwards is a use-after-move error. Compound right
             //-hand sides (arithmetic, calls) leave their operands live and are
             // released normally.
-            if (self.scope_manager.lookup(val) != null) {
-                self.scope_manager.markConsumed(val);
-            }
-            try self.lowerer.emit("    {s} = {s}\n", .{ name, val });
+            try self.emitMove(name, val);
         } else if (self.current.tag == .plus_plus) {
             try self.advance();
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
             try self.lowerer.emit("    {s} = add {s}, 1\n", .{ temp, name });
+            try self.releaseOwnedIfLive(name);
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
+            self.scope_manager.markConsumed(temp);
+            self.markRebound(name);
         } else if (self.current.tag == .minus_minus) {
             try self.advance();
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
             try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ temp, name });
+            try self.releaseOwnedIfLive(name);
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
+            self.scope_manager.markConsumed(temp);
+            self.markRebound(name);
         } else {
             std.debug.print("error:{d}:{d}: unexpected statement starting with identifier '{s}'\n", .{
                 name_tok.line,
@@ -2462,7 +2614,13 @@ pub const Parser = struct {
                 }
                 const field = found_field orelse return error.UnknownField;
 
+                // The temp is retagged from `i32` to the field type so a
+                // further `.x` resolves the layout through it (`o.inner.a`).
                 const temp_name = try self.newTemp();
+                if (self.scope_manager.lookup(temp_name)) |tv| {
+                    self.allocator.free(tv.type_name);
+                    tv.type_name = try self.allocator.dupe(u8, field.type_name);
+                }
 
                 const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
                     field.type_name
@@ -2497,12 +2655,20 @@ pub const Parser = struct {
         }
 
         // Postfix increment/decrement: i++ / i--
+        // Lowers to `t = add i, 1` + `i = t`: the temp is moved into the
+        // target, so it must be marked consumed — otherwise the
+        // function-exit walk emits `!t` on paths where this definition
+        // never ran (UnknownRegister). Same release-before-rebind as the
+        // statement-level `i++` below.
         if (tag == .plus_plus or tag == .minus_minus) {
             try self.advance();
             const temp_name = try self.newTemp();
             const sa_op: []const u8 = if (tag == .plus_plus) "add" else "sub";
             try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ temp_name, sa_op, left });
+            try self.releaseOwnedIfLive(left);
             try self.lowerer.emit("    {s} = {s}\n", .{ left, temp_name });
+            self.scope_manager.markConsumed(temp_name);
+            self.markRebound(left);
             return temp_name;
         }
 

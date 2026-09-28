@@ -46,6 +46,13 @@ def strip(src: str) -> str:
                  r'\1\2\3', out, flags=re.M)
     out = re.sub(r'^(\s*)(\w+)\s*:\s*' + TS_TYPE + r'(\s*=)', r'\1\2\3', out, flags=re.M)
 
+    # for (let i: i32 = 0; ...)  ->  for (let i = 0; ...)
+    # The line-anchored rules above miss declarations inside a for header, so
+    # those demos kept their annotations and Node rejected them with a
+    # SyntaxError, leaving an empty oracle that verify_demos.sh auto-passes.
+    out = re.sub(r'(\bfor\s*\(\s*(?:const|let|var)\s+\w+)\s*:\s*' + TS_TYPE + r'(?=\s*=)',
+                 r'\1', out)
+
     return out
 
 

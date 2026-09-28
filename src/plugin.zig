@@ -14,8 +14,14 @@ const skills = [_]plugin_api.SkillSection{
         .name = "ts",
         .summary = "TypeScript to SA-ASM ahead-of-time lowerer",
         .items = &.{
-            "ts lower <file.ts>        — lower a TypeScript file to SA-ASM",
-            "ts lower --out <out> <file.ts> — lower and write output to file",
+            "ts lower [file] [--out <out>] [-p <package>] — lower a TypeScript file to SA-ASM",
+            "ts check [file] [-p <package>] — parse and lower without writing output",
+            "ts build [file] [--out <out>] [-p <package>] — lower and write a .sai file",
+            "ts build-exe [file] [-p <package>] [sa-build-exe-options...] — lower and link an executable via sa",
+            "ts test [file] [-p <package>] [sa-test-options...] — lower and run sa test on the result",
+            "ts init [path] — scaffold a minimal TS project (sa.mod + src/main.ts)",
+            "ts skills [--json] — show plugin skills",
+            "ts help — show this help",
             "zero-copy string slices and static struct layout",
             "ownership injection (!, ^) based on lexical scope",
             "Pratt expression parser with correct operator precedence",
@@ -24,6 +30,201 @@ const skills = [_]plugin_api.SkillSection{
         },
     },
 };
+
+fn isHelpArg(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
+}
+
+fn writeTsHelp(stderr: std.io.AnyWriter) !void {
+    try stderr.writeAll("usage: ts <command> [options]\n");
+    try stderr.writeAll("       sa ts <command> [options]\n\n");
+    try stderr.writeAll("Commands:\n");
+    try stderr.writeAll("  lower      [file] [--out <file>] [-p <package>]\n");
+    try stderr.writeAll("  check      [file] [-p <package>]\n");
+    try stderr.writeAll("  build      [file] [--out <file>] [-p <package>]\n");
+    try stderr.writeAll("  build-exe  [file] [-p <package>] [sa-build-exe-options...]\n");
+    try stderr.writeAll("  test       [file] [-p <package>] [sa-test-options...]\n");
+    try stderr.writeAll("  init       [path]\n");
+    try stderr.writeAll("  skills     [--json]\n");
+    try stderr.writeAll("  help\n\n");
+    try stderr.writeAll("Options:\n");
+    try stderr.writeAll("  -p, --package <name>   Select a workspace member package (also -p=name, --package=name)\n");
+    try stderr.writeAll("  --out, -o <file>       Write output to file (lower/build only)\n");
+    try stderr.writeAll("  --json                 Emit JSON where supported\n");
+    try stderr.writeAll("  -h, --help             Show this help message\n");
+}
+
+fn runTsSkillsCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    var json_mode = ctx.json_mode;
+    var idx = option_start;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (isHelpArg(arg)) {
+            try stderr.writeAll("usage: sa ts skills [--json]\n");
+            return 0;
+        }
+        if (std.mem.eql(u8, arg, "--json")) {
+            json_mode = true;
+            continue;
+        }
+        try stderr.print("error[SA-TS]: unknown ts skills option '{s}'\n", .{arg});
+        try stderr.writeAll("usage: sa ts skills [--json]\n");
+        return 1;
+    }
+    if (json_mode) {
+        try stdout.writeAll("{\"skills\":[\"ts.lower\",\"ts.check\",\"ts.build\",\"ts.build-exe\",\"ts.test\",\"ts.init\"]}");
+        try stdout.writeByte('\n');
+    } else {
+        try stdout.writeAll("ts TypeScript to SA-ASM lowerer\n");
+        for (skills) |section| {
+            try stdout.print("{s}: {s}\n", .{ section.name, section.summary });
+            for (section.items) |item| try stdout.print("  - {s}\n", .{item});
+        }
+    }
+    return 0;
+}
+
+const TsFileArgs = struct {
+    file: ?[]const u8 = null,
+    out: ?[]const u8 = null,
+    package_name: ?[]const u8 = null,
+    json_mode: bool = false,
+    help_requested: bool = false,
+    extra_arg: ?[]const u8 = null,
+};
+
+fn parseTsFileArgs(args: []const []const u8, option_start: usize) TsFileArgs {
+    var parsed = TsFileArgs{};
+    var idx = option_start;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (isHelpArg(arg)) {
+            parsed.help_requested = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            parsed.json_mode = true;
+        } else if (std.mem.eql(u8, arg, "--out") or std.mem.eql(u8, arg, "-o")) {
+            idx += 1;
+            if (idx < args.len) parsed.out = args[idx];
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--package")) {
+            idx += 1;
+            if (idx < args.len) parsed.package_name = args[idx];
+        } else if (std.mem.startsWith(u8, arg, "--out=")) {
+            parsed.out = arg["--out=".len..];
+        } else if (std.mem.startsWith(u8, arg, "-p=")) {
+            parsed.package_name = arg["-p=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--package=")) {
+            parsed.package_name = arg["--package=".len..];
+        } else if (parsed.file == null) {
+            parsed.file = arg;
+        } else {
+            parsed.extra_arg = arg;
+        }
+    }
+    return parsed;
+}
+
+/// Argument parser for the delegating commands (`build-exe`, `test`).
+///
+/// Only `-p`/`--package` (all three `-p name`, `-p=name`, `--package=name`
+/// forms), `-h`/`--help` are consumed. The first positional token is the
+/// input file; every other token passes through to the delegated `sa`
+/// command untouched, so `ts build-exe src/main.ts -o bin/app --release-fast`
+/// forwards `-o bin/app --release-fast` verbatim.
+const TsDelegateArgs = struct {
+    file: ?[]const u8 = null,
+    package_name: ?[]const u8 = null,
+    help_requested: bool = false,
+    passthrough: std.ArrayListUnmanaged([]const u8) = .{},
+};
+
+fn parseTsDelegateArgs(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+    option_start: usize,
+) !TsDelegateArgs {
+    var parsed = TsDelegateArgs{};
+    errdefer parsed.passthrough.deinit(allocator);
+    var idx = option_start;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (isHelpArg(arg)) {
+            parsed.help_requested = true;
+        } else if (std.mem.eql(u8, arg, "-p") or std.mem.eql(u8, arg, "--package")) {
+            idx += 1;
+            if (idx < args.len) parsed.package_name = args[idx];
+        } else if (std.mem.startsWith(u8, arg, "-p=")) {
+            parsed.package_name = arg["-p=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--package=")) {
+            parsed.package_name = arg["--package=".len..];
+        } else if (isValueTakingPassthroughFlag(arg)) {
+            // Options forwarded to `sa` whose value is a separate token
+            // (e.g. `-o out`, `--jobs 4`): forward both verbatim so the
+            // value is never mistaken for the input file.
+            try parsed.passthrough.append(allocator, arg);
+            idx += 1;
+            if (idx < args.len) try parsed.passthrough.append(allocator, args[idx]);
+        } else if (parsed.file == null and !std.mem.startsWith(u8, arg, "-")) {
+            parsed.file = arg;
+        } else {
+            try parsed.passthrough.append(allocator, arg);
+        }
+    }
+    return parsed;
+}
+
+/// Delegated `sa` options that take a space-separated value. `-p` is
+/// deliberately absent: it is consumed by the plugin for workspace members.
+fn isValueTakingPassthroughFlag(arg: []const u8) bool {
+    for ([_][]const u8{ "-o", "--out", "--jobs", "--filter", "--skip", "--test-backend" }) |flag| {
+        if (std.mem.eql(u8, arg, flag)) return true;
+    }
+    return false;
+}
+
+fn hasJobsArg(passthrough: []const []const u8) bool {
+    for (passthrough) |arg| {
+        if (std.mem.eql(u8, arg, "--jobs")) return true;
+        if (std.mem.startsWith(u8, arg, "--jobs=")) return true;
+    }
+    return false;
+}
+
+/// Append `--jobs auto` unless the user already controls `--jobs`,
+/// mirroring the `sa sla` convention for delegated commands.
+fn appendDefaultJobsAuto(argv: *std.ArrayList([]const u8), passthrough: []const []const u8) !void {
+    if (hasJobsArg(passthrough)) return;
+    try argv.append("--jobs");
+    try argv.append("auto");
+}
+
+fn lowerFileToSa(
+    ctx: *const plugin_api.Context,
+    input_path: []const u8,
+    stderr: std.io.AnyWriter,
+) anyerror![]u8 {
+    plugin_api.emitLog(ctx, .info, "reading TypeScript source file");
+    const source = std.fs.cwd().readFileAlloc(ctx.allocator, input_path, 16 * 1024 * 1024) catch |err| {
+        try stderr.print("error[SA-TS]: cannot read '{s}': {}\n", .{ input_path, err });
+        return err;
+    };
+    defer ctx.allocator.free(source);
+    plugin_api.emitLog(ctx, .info, "lowering TypeScript to SA-ASM");
+    return try lowerSource(ctx, source, stderr);
+}
+
+fn defaultSaiOut(allocator: std.mem.Allocator, file: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, file, ".ts")) {
+        const base = file[0 .. file.len - 3];
+        return try std.fmt.allocPrint(allocator, "{s}.sai", .{base});
+    }
+    return try std.fmt.allocPrint(allocator, "{s}.sai", .{file});
+}
 
 // ==========================================
 // Core lowering logic (shared by ABI + CLI)
@@ -73,71 +274,394 @@ fn lowerSource(
 // CLI handle_command
 // ==========================================
 
-fn runTsCommand(
-    ctx: *const plugin_api.Context,
-    argv: []const []const u8,
+/// Resolve the host `sa` executable for `ts test` / `ts build-exe` delegation.
+///
+/// Mirrors sa_plugin_sla's host_paths.resolveSaExecutable search order:
+/// SA_EXE env override, SCI_ROOT dev layout, the directory of the host that
+/// loaded this plugin, PATH walk, then a bare "sa" fallback.
+fn resolveSaExecutable(allocator: std.mem.Allocator) []const u8 {
+    if (std.process.getEnvVarOwned(allocator, "SA_EXE")) |override_path| {
+        if (override_path.len > 0) {
+            std.fs.cwd().access(override_path, .{}) catch {
+                allocator.free(override_path);
+                return "sa";
+            };
+            return override_path;
+        }
+        allocator.free(override_path);
+    } else |_| {}
+
+    if (std.process.getEnvVarOwned(allocator, "SCI_ROOT")) |sci_root| {
+        defer allocator.free(sci_root);
+        const dev_sa = std.fs.path.join(allocator, &.{ sci_root, "zig-out", "bin", "sa" }) catch return "sa";
+        std.fs.cwd().access(dev_sa, .{}) catch {
+            allocator.free(dev_sa);
+            return "sa";
+        };
+        return dev_sa;
+    } else |_| {}
+
+    if (std.fs.selfExePathAlloc(allocator)) |self_path| {
+        defer allocator.free(self_path);
+        if (std.fs.path.dirname(self_path)) |self_dir| {
+            const cand = std.fs.path.join(allocator, &.{ self_dir, "sa" }) catch return "sa";
+            std.fs.cwd().access(cand, .{}) catch {
+                allocator.free(cand);
+                return "sa";
+            };
+            return cand;
+        }
+    } else |_| {}
+
+    if (std.process.getEnvVarOwned(allocator, "PATH")) |path_val| {
+        defer allocator.free(path_val);
+        var it = std.mem.tokenizeAny(u8, path_val, ":;\x0a");
+        while (it.next()) |entry| {
+            if (entry.len == 0) continue;
+            const cand = std.fs.path.join(allocator, &.{ entry, "sa" }) catch return "sa";
+            std.fs.cwd().access(cand, .{}) catch {
+                allocator.free(cand);
+                continue;
+            };
+            return cand;
+        }
+    } else |_| {}
+
+    return "sa";
+}
+
+var ts_tmp_counter: u32 = 0;
+
+/// Write `sa_code` to a temp .sai next to `sibling_path` and return its path.
+/// Caller must delete the file when done.
+fn writeTsTempSai(allocator: std.mem.Allocator, sibling_path: []const u8, sa_code: []const u8) ![]u8 {
+    ts_tmp_counter +%= 1;
+    const uniq = std.time.nanoTimestamp();
+    const dir = std.fs.path.dirname(sibling_path) orelse ".";
+    const base = std.fs.path.basename(sibling_path);
+    const tmp = try std.fmt.allocPrint(allocator, "{s}/.ts-tmp-{d}-{d}-{s}.sai", .{ dir, uniq, ts_tmp_counter, base });
+    std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = sa_code }) catch |err| {
+        allocator.free(tmp);
+        return err;
+    };
+    return tmp;
+}
+
+/// Minimal `sa.mod` workspace resolution for TS projects, mirroring the
+/// `sa sla` convention: an explicit file always wins; otherwise walk up from
+/// the current directory for an `sa.mod`.
+///
+/// Supported manifests:
+///   `package "name"` — single-package project, entry is the manifest dir.
+///   `workspace { members [...]; default_member "..." }` — `-p` selects a
+///     member (by directory basename or by the member's own package name);
+///     without `-p` the default member is used.
+/// The entry source is `<member>/src/main.ts`, falling back to
+/// `<member>/main.ts`.
+fn readPackageName(allocator: std.mem.Allocator, manifest_path: []const u8) !?[]u8 {
+    const content = std.fs.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
+    defer allocator.free(content);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or std.mem.startsWith(u8, line, "#")) continue;
+        if (std.mem.startsWith(u8, line, "//")) continue;
+        if (std.mem.startsWith(u8, line, "package")) {
+            const rest = std.mem.trim(u8, line["package".len..], " \t");
+            if (rest.len >= 2 and rest[0] == '"' and rest[rest.len - 1] == '"') {
+                return try allocator.dupe(u8, rest[1 .. rest.len - 1]);
+            }
+            return try allocator.dupe(u8, rest);
+        }
+    }
+    return null;
+}
+
+fn parseWorkspaceMembers(allocator: std.mem.Allocator, manifest_path: []const u8) !?struct {
+    members: std.ArrayListUnmanaged([]const u8),
+    default_member: ?[]u8,
+} {
+    const content = std.fs.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
+    defer allocator.free(content);
+    if (std.mem.indexOf(u8, content, "workspace") == null) return null;
+    var out_members = std.ArrayListUnmanaged([]const u8){};
+    errdefer {
+        for (out_members.items) |m| allocator.free(m);
+        out_members.deinit(allocator);
+    }
+    var default_member: ?[]u8 = null;
+    errdefer if (default_member) |m| allocator.free(m);
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |raw| {
+        var line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (std.mem.startsWith(u8, line, "//")) continue;
+        if (std.mem.startsWith(u8, line, "members")) {
+            const open = std.mem.indexOfScalar(u8, line, '[') orelse continue;
+            const close = std.mem.lastIndexOfScalar(u8, line, ']') orelse continue;
+            if (close <= open) continue;
+            var it = std.mem.splitScalar(u8, line[open + 1 .. close], ',');
+            while (it.next()) |frag| {
+                const tok = std.mem.trim(u8, frag, " \t\"");
+                if (tok.len == 0) continue;
+                try out_members.append(allocator, try allocator.dupe(u8, tok));
+            }
+        } else if (std.mem.startsWith(u8, line, "default_member")) {
+            const rest = std.mem.trim(u8, line["default_member".len..], " \t\"");
+            if (rest.len > 0) default_member = try allocator.dupe(u8, rest);
+        }
+    }
+    return .{ .members = out_members, .default_member = default_member };
+}
+
+fn entrySourceIfExists(allocator: std.mem.Allocator, member_dir: []const u8) !?[]u8 {
+    for ([_][]const u8{ "src/main.ts", "main.ts" }) |rel| {
+        const cand = try std.fs.path.join(allocator, &.{ member_dir, rel });
+        std.fs.cwd().access(cand, .{}) catch {
+            allocator.free(cand);
+            continue;
+        };
+        return cand;
+    }
+    return null;
+}
+
+fn resolveTsWorkspaceEntry(
+    allocator: std.mem.Allocator,
+    package_name: ?[]const u8,
+    stderr: std.io.AnyWriter,
+) !?[]u8 {
+    const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch return null;
+    defer allocator.free(cwd);
+
+    var dir = try allocator.dupe(u8, cwd);
+    defer allocator.free(dir);
+    while (true) {
+        const manifest = try std.fs.path.join(allocator, &.{ dir, "sa.mod" });
+        defer allocator.free(manifest);
+        const has_manifest = blk: {
+            std.fs.cwd().access(manifest, .{}) catch break :blk false;
+            break :blk true;
+        };
+        if (has_manifest) {
+            if (try parseWorkspaceMembers(allocator, manifest)) |*ws| {
+                var members = ws.members;
+                defer {
+                    for (members.items) |m| allocator.free(m);
+                    members.deinit(allocator);
+                }
+                defer if (ws.default_member) |m| allocator.free(m);
+                var member_dir: ?[]u8 = null;
+                defer if (member_dir) |m| allocator.free(m);
+                if (package_name) |want| {
+                    for (members.items) |m| {
+                        const cand = try std.fs.path.join(allocator, &.{ dir, m });
+                        defer allocator.free(cand);
+                        const base = std.fs.path.basename(m);
+                        var matches = std.mem.eql(u8, base, want) or std.mem.eql(u8, m, want);
+                        if (!matches) {
+                            const member_manifest = try std.fs.path.join(allocator, &.{ cand, "sa.mod" });
+                            defer allocator.free(member_manifest);
+                            if (try readPackageName(allocator, member_manifest)) |pkg| {
+                                defer allocator.free(pkg);
+                                matches = std.mem.eql(u8, pkg, want);
+                            }
+                        }
+                        if (matches) {
+                            member_dir = try allocator.dupe(u8, cand);
+                            break;
+                        }
+                    }
+                    if (member_dir == null) {
+                        try stderr.print("Error: unknown workspace package: {s}\n", .{want});
+                        return null;
+                    }
+                } else if (ws.default_member) |def| {
+                    // default_member names a member (like `app`), not a path.
+                    // Match it against the members list by directory basename
+                    // or by the member's own package name first.
+                    for (members.items) |m| {
+                        const cand = try std.fs.path.join(allocator, &.{ dir, m });
+                        defer allocator.free(cand);
+                        if (std.mem.eql(u8, std.fs.path.basename(m), def) or std.mem.eql(u8, m, def)) {
+                            member_dir = try allocator.dupe(u8, cand);
+                            break;
+                        }
+                        const member_manifest = try std.fs.path.join(allocator, &.{ cand, "sa.mod" });
+                        defer allocator.free(member_manifest);
+                        if (try readPackageName(allocator, member_manifest)) |pkg| {
+                            defer allocator.free(pkg);
+                            if (std.mem.eql(u8, pkg, def)) {
+                                member_dir = try allocator.dupe(u8, cand);
+                                break;
+                            }
+                        }
+                    }
+                    if (member_dir == null) {
+                        member_dir = try std.fs.path.join(allocator, &.{ dir, def });
+                    }
+                } else {
+                    try stderr.writeAll("Error: workspace has no resolvable default member; pass -p/--package or run inside a member directory\n");
+                    return null;
+                }
+                if (try entrySourceIfExists(allocator, member_dir.?)) |entry| return entry;
+                try stderr.writeAll("Error: workspace member has no src/main.ts or main.ts entry source\n");
+                return null;
+            }
+            if (package_name) |want| {
+                if (try readPackageName(allocator, manifest)) |pkg| {
+                    defer allocator.free(pkg);
+                    const base = std.fs.path.basename(dir);
+                    if (!std.mem.eql(u8, pkg, want) and !std.mem.eql(u8, base, want)) {
+                        try stderr.print("Error: unknown workspace package: {s}\n", .{want});
+                        return null;
+                    }
+                } else if (!std.mem.eql(u8, std.fs.path.basename(dir), want)) {
+                    try stderr.print("Error: unknown workspace package: {s}\n", .{want});
+                    return null;
+                }
+            }
+            if (try entrySourceIfExists(allocator, dir)) |entry| return entry;
+            try stderr.writeAll("Error: workspace member has no src/main.ts or main.ts entry source\n");
+            return null;
+        }
+        const parent = std.fs.path.dirname(dir) orelse break;
+        if (std.mem.eql(u8, parent, dir)) break;
+        const next = try allocator.dupe(u8, parent);
+        allocator.free(dir);
+        dir = next;
+    }
+    try stderr.writeAll("Error: missing file argument and no workspace source could be resolved from the current directory\n");
+    return null;
+}
+
+/// Explicit file wins; otherwise fall back to `sa.mod` workspace resolution.
+fn resolveTsInputFile(
+    allocator: std.mem.Allocator,
+    file: ?[]const u8,
+    package_name: ?[]const u8,
+    stderr: std.io.AnyWriter,
+) !?[]u8 {
+    if (file) |f| return try allocator.dupe(u8, f);
+    return try resolveTsWorkspaceEntry(allocator, package_name, stderr);
+}
+
+fn writeNewFile(path: []const u8, bytes: []const u8, stderr: std.io.AnyWriter) !bool {
+    var file = std.fs.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
+        try stderr.print("File Error: failed to create {s}: {}\n", .{ path, err });
+        return false;
+    };
+    defer file.close();
+    file.writeAll(bytes) catch |err| {
+        try stderr.print("File Error: failed to write {s}: {}\n", .{ path, err });
+        return false;
+    };
+    return true;
+}
+
+fn runTsInitCommand(
+    args: []const []const u8,
+    option_start: usize,
     stdout: std.io.AnyWriter,
     stderr: std.io.AnyWriter,
-) anyerror!?u8 {
-    // argv[0] = "sa", argv[1] = "ts", argv[2..] = subcommand args
-    if (argv.len < 3) {
-        try stderr.print("usage: sa ts lower <file.ts>\n", .{});
-        return 1;
-    }
-
-    const sub = argv[2];
-    if (!std.mem.eql(u8, sub, "lower")) {
-        try stderr.print("error[SA-TS]: unknown subcommand '{s}'\n", .{sub});
-        try stderr.print("usage: sa ts lower <file.ts>\n", .{});
-        return 1;
-    }
-
-    // Parse optional --out <path>
-    var out_path: ?[]const u8 = null;
-    var file_path: ?[]const u8 = null;
-    var i: usize = 3;
-    while (i < argv.len) : (i += 1) {
-        const arg = argv[i];
-        if (std.mem.eql(u8, arg, "--out")) {
-            if (i + 1 >= argv.len) {
-                try stderr.print("error[SA-TS]: --out requires a path argument\n", .{});
-                return 1;
-            }
-            i += 1;
-            out_path = argv[i];
-        } else if (file_path == null) {
-            file_path = arg;
-        } else {
-            try stderr.print("error[SA-TS]: unexpected argument '{s}'\n", .{arg});
+) !u8 {
+    var project_path: ?[]const u8 = null;
+    var idx = option_start;
+    while (idx < args.len) : (idx += 1) {
+        const arg = args[idx];
+        if (isHelpArg(arg)) {
+            try stderr.writeAll("usage: sa ts init [path]\n");
+            return 0;
+        }
+        if (std.mem.startsWith(u8, arg, "-")) {
+            try stderr.print("Unknown ts init option: {s}\n", .{arg});
+            try stderr.writeAll("usage: sa ts init [path]\n");
             return 1;
         }
+        if (project_path != null) {
+            try stderr.print("Unexpected ts init argument: {s}\n", .{arg});
+            try stderr.writeAll("usage: sa ts init [path]\n");
+            return 1;
+        }
+        project_path = arg;
     }
 
-    const input_path = file_path orelse {
-        try stderr.print("error[SA-TS]: missing required input file path\n", .{});
-        try stderr.print("usage: sa ts lower [--out <path>] <file.ts>\n", .{});
+    const root = project_path orelse ".";
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const package_name: []const u8 = blk: {
+        if (std.mem.eql(u8, root, ".")) break :blk "app";
+        const base = std.fs.path.basename(root);
+        if (base.len == 0 or std.mem.eql(u8, base, ".")) break :blk "app";
+        break :blk base;
+    };
+    std.fs.cwd().makePath(root) catch |err| {
+        try stderr.print("File Error: failed to create directory {s}: {}\n", .{ root, err });
+        return 1;
+    };
+    const src_dir = try std.fs.path.join(allocator, &.{ root, "src" });
+    std.fs.cwd().makePath(src_dir) catch |err| {
+        try stderr.print("File Error: failed to create directory {s}: {}\n", .{ src_dir, err });
         return 1;
     };
 
-    plugin_api.emitLog(ctx, .info, "reading TypeScript source file");
+    const manifest_path = try std.fs.path.join(allocator, &.{ root, "sa.mod" });
+    const manifest = try std.fmt.allocPrint(allocator, "# generated by ts init\npackage \"{s}\"\n", .{package_name});
+    if (!try writeNewFile(manifest_path, manifest, stderr)) return 1;
 
-    const source = std.fs.cwd().readFileAlloc(ctx.allocator, input_path, 16 * 1024 * 1024) catch |err| {
-        try stderr.print("error[SA-TS]: cannot read '{s}': {}\n", .{ input_path, err });
+    const main_path = try std.fs.path.join(allocator, &.{ root, "src", "main.ts" });
+    if (!try writeNewFile(main_path,
+        \\function main(): i32 {
+        \\  return 0;
+        \\}
+        \\
+    , stderr)) return 1;
+
+    const gitignore_path = try std.fs.path.join(allocator, &.{ root, ".gitignore" });
+    if (!try writeNewFile(gitignore_path,
+        \\.sla-cache/
+        \\.zig-cache/
+        \\.sa_cache/
+        \\zig-out/
+        \\*.out
+        \\*.sa.bc
+        \\
+    , stderr)) return 1;
+
+    try stdout.print("Initialized TS binary project: {s}\n", .{root});
+    try stdout.print("Entry: {s}\n", .{main_path});
+    return 0;
+}
+
+fn runTsLowerCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    const parsed = parseTsFileArgs(args, option_start);
+    if (parsed.help_requested) {
+        try stderr.writeAll("usage: sa ts lower [file] [--out <path>] [-p <package>]\n");
+        return 0;
+    }
+    if (parsed.extra_arg) |extra| {
+        try stderr.print("error[SA-TS]: unexpected argument '{s}'\n", .{extra});
         return 1;
-    };
-    defer ctx.allocator.free(source);
+    }
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const input_path = (try resolveTsInputFile(arena.allocator(), parsed.file, parsed.package_name, stderr)) orelse return 1;
 
-    plugin_api.emitLog(ctx, .info, "lowering TypeScript to SA-ASM");
-
-    const sa_code = lowerSource(ctx, source, stderr) catch |err| {
-        if (isTsCliError(err)) {
-            return 1;
-        }
+    const sa_code = lowerFileToSa(ctx, input_path, stderr) catch |err| {
+        if (isTsCliError(err)) return 1;
         return @intFromEnum(plugin_api.AbiStatus.failed);
     };
     defer ctx.allocator.free(sa_code);
 
-    if (out_path) |path| {
+    if (parsed.out) |path| {
         var file = std.fs.cwd().createFile(path, .{}) catch |err| {
             try stderr.print("error[SA-TS]: cannot write to '{s}': {}\n", .{ path, err });
             return 1;
@@ -152,8 +676,219 @@ fn runTsCommand(
     } else {
         try stdout.writeAll(sa_code);
     }
-
     return 0;
+}
+
+fn runTsCheckCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    const parsed = parseTsFileArgs(args, option_start);
+    if (parsed.help_requested) {
+        try stderr.writeAll("usage: sa ts check [file] [-p <package>]\n");
+        return 0;
+    }
+    if (parsed.extra_arg) |extra| {
+        try stderr.print("error[SA-TS]: unexpected argument '{s}'\n", .{extra});
+        return 1;
+    }
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const input_path = (try resolveTsInputFile(arena.allocator(), parsed.file, parsed.package_name, stderr)) orelse return 1;
+
+    const sa_code = lowerFileToSa(ctx, input_path, stderr) catch |err| {
+        if (isTsCliError(err)) return 1;
+        return @intFromEnum(plugin_api.AbiStatus.failed);
+    };
+    defer ctx.allocator.free(sa_code);
+
+    try stdout.print("Ts Compiler: Successfully parsed and lowered {s} ({d} bytes).\n", .{ input_path, sa_code.len });
+    return 0;
+}
+
+fn runTsBuildCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    const parsed = parseTsFileArgs(args, option_start);
+    if (parsed.help_requested) {
+        try stderr.writeAll("usage: sa ts build [file] [--out <file>] [-p <package>]\n");
+        return 0;
+    }
+    if (parsed.extra_arg) |extra| {
+        try stderr.print("error[SA-TS]: unexpected argument '{s}'\n", .{extra});
+        return 1;
+    }
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    const input_path = (try resolveTsInputFile(arena.allocator(), parsed.file, parsed.package_name, stderr)) orelse return 1;
+
+    const sa_code = lowerFileToSa(ctx, input_path, stderr) catch |err| {
+        if (isTsCliError(err)) return 1;
+        return @intFromEnum(plugin_api.AbiStatus.failed);
+    };
+    defer ctx.allocator.free(sa_code);
+
+    const final_out_owned: []const u8 = if (parsed.out) |path| path else try defaultSaiOut(arena.allocator(), input_path);
+
+    std.fs.cwd().writeFile(.{ .sub_path = final_out_owned, .data = sa_code }) catch |err| {
+        try stderr.print("error[SA-TS]: cannot write to '{s}': {}\n", .{ final_out_owned, err });
+        return 1;
+    };
+
+    try stdout.print("Ts Compiler: Successfully compiled {s} to {s}.\n", .{ input_path, final_out_owned });
+    return 0;
+}
+
+fn runTsTestCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    _ = stdout;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    var parsed = try parseTsDelegateArgs(arena.allocator(), args, option_start);
+    defer parsed.passthrough.deinit(arena.allocator());
+    if (parsed.help_requested) {
+        try stderr.writeAll("usage: sa ts test [file] [-p <package>] [sa-test-options...]\n");
+        return 0;
+    }
+    const input_path = (try resolveTsInputFile(arena.allocator(), parsed.file, parsed.package_name, stderr)) orelse return 1;
+
+    const sa_code = lowerFileToSa(ctx, input_path, stderr) catch |err| {
+        if (isTsCliError(err)) return 1;
+        return @intFromEnum(plugin_api.AbiStatus.failed);
+    };
+    defer ctx.allocator.free(sa_code);
+
+    const tmp_sai = writeTsTempSai(arena.allocator(), input_path, sa_code) catch |err| {
+        try stderr.print("error[SA-TS]: cannot write temp SA file: {}\n", .{err});
+        return 1;
+    };
+    defer std.fs.cwd().deleteFile(tmp_sai) catch {};
+
+    var argv = std.ArrayList([]const u8).init(arena.allocator());
+    try argv.append(resolveSaExecutable(arena.allocator()));
+    try argv.append("test");
+    try argv.append(tmp_sai);
+    try argv.appendSlice(parsed.passthrough.items);
+    try appendDefaultJobsAuto(&argv, parsed.passthrough.items);
+
+    var child = std.process.Child.init(argv.items, arena.allocator());
+    const term = child.spawnAndWait() catch |err| {
+        try stderr.print("error[SA-TS]: failed to run 'sa test': {}\n", .{err});
+        return 1;
+    };
+    return switch (term) {
+        .Exited => |code| code,
+        else => 1,
+    };
+}
+
+fn runTsBuildExeCommand(
+    ctx: *const plugin_api.Context,
+    args: []const []const u8,
+    option_start: usize,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) !u8 {
+    _ = stdout;
+    var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer arena.deinit();
+    var parsed = try parseTsDelegateArgs(arena.allocator(), args, option_start);
+    defer parsed.passthrough.deinit(arena.allocator());
+    if (parsed.help_requested) {
+        try stderr.writeAll("usage: sa ts build-exe [file] [-p <package>] [sa-build-exe-options...]\n");
+        return 0;
+    }
+    const input_path = (try resolveTsInputFile(arena.allocator(), parsed.file, parsed.package_name, stderr)) orelse return 1;
+
+    const sa_code = lowerFileToSa(ctx, input_path, stderr) catch |err| {
+        if (isTsCliError(err)) return 1;
+        return @intFromEnum(plugin_api.AbiStatus.failed);
+    };
+    defer ctx.allocator.free(sa_code);
+
+    const tmp_sai = writeTsTempSai(arena.allocator(), input_path, sa_code) catch |err| {
+        try stderr.print("error[SA-TS]: cannot write temp SA file: {}\n", .{err});
+        return 1;
+    };
+    defer std.fs.cwd().deleteFile(tmp_sai) catch {};
+
+    var argv = std.ArrayList([]const u8).init(arena.allocator());
+    try argv.append(resolveSaExecutable(arena.allocator()));
+    try argv.append("build-exe");
+    try argv.append(tmp_sai);
+    try argv.appendSlice(parsed.passthrough.items);
+    try appendDefaultJobsAuto(&argv, parsed.passthrough.items);
+
+    var child = std.process.Child.init(argv.items, arena.allocator());
+    const term = child.spawnAndWait() catch |err| {
+        try stderr.print("error[SA-TS]: failed to run 'sa build-exe': {}\n", .{err});
+        return 1;
+    };
+    return switch (term) {
+        .Exited => |code| code,
+        else => 1,
+    };
+}
+
+fn runTsCommand(
+    ctx: *const plugin_api.Context,
+    argv: []const []const u8,
+    stdout: std.io.AnyWriter,
+    stderr: std.io.AnyWriter,
+) anyerror!?u8 {
+    // argv[0] = "sa", argv[1] = "ts", argv[2..] = subcommand args
+    if (argv.len < 2) return null;
+    if (argv.len < 3) {
+        try writeTsHelp(stderr);
+        return 1;
+    }
+
+    const sub = argv[2];
+    if (isHelpArg(sub)) {
+        try writeTsHelp(stderr);
+        return 0;
+    }
+    if (std.mem.eql(u8, sub, "help")) {
+        try writeTsHelp(stderr);
+        return 0;
+    }
+    if (std.mem.eql(u8, sub, "skills")) {
+        return try runTsSkillsCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "lower")) {
+        return try runTsLowerCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "check")) {
+        return try runTsCheckCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "build")) {
+        return try runTsBuildCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "build-exe")) {
+        return try runTsBuildExeCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "test")) {
+        return try runTsTestCommand(ctx, argv, 3, stdout, stderr);
+    }
+    if (std.mem.eql(u8, sub, "init")) {
+        return try runTsInitCommand(argv, 3, stdout, stderr);
+    }
+
+    try stderr.print("error[SA-TS]: unknown subcommand '{s}'\n", .{sub});
+    try writeTsHelp(stderr);
+    return 1;
 }
 
 fn isTsCliError(err: anyerror) bool {
@@ -1454,5 +2189,341 @@ test "sa_plugin_ts emits a block-local release before the terminator, never afte
             return error.TestExpectedEqual;
         }
         if (std.mem.startsWith(u8, t, "return")) saw_return = true;
+    }
+}
+
+// ==========================================
+// Runtime expectation tests
+// ------------------------------------------
+// The substring tests above prove the lowerer emits the right shapes; these
+// prove the emitted program computes the right value. Each case lowers a
+// small program in-process, assembles it with `sa build`, runs the
+// executable, and asserts the exit status equals the value Node produces for
+// the same program (verified via tools/strip_ts.py, which also strips
+// annotations inside C-style for headers).
+// ==========================================
+
+const RuntimeCase = struct {
+    name: []const u8,
+    source: []const u8,
+    expected: u8,
+};
+
+const runtime_cases = [_]RuntimeCase{
+    .{
+        .name = "arithmetic precedence",
+        .expected = 11,
+        .source =
+        \\function main(): i32 {
+        \\  const v: i32 = 2 + 3 * 4 - 6 / 2;
+        \\  return v;
+        \\}
+        ,
+    },
+    .{
+        .name = "if/else max",
+        .expected = 20,
+        .source =
+        \\function max(a: i32, b: i32): i32 {
+        \\  if (a > b) { return a; } else { return b; }
+        \\}
+        \\function main(): i32 {
+        \\  return max(10, 20);
+        \\}
+        ,
+    },
+    .{
+        .name = "while accumulation",
+        .expected = 10,
+        .source =
+        \\function sum_to(n: i32): i32 {
+        \\  let total: i32 = 0;
+        \\  let i: i32 = 0;
+        \\  while (i < n) {
+        \\    total = total + i;
+        \\    i = i + 1;
+        \\  }
+        \\  return total;
+        \\}
+        \\function main(): i32 {
+        \\  return sum_to(5);
+        \\}
+        ,
+    },
+    .{
+        .name = "c-style for",
+        .expected = 10,
+        .source =
+        \\function main(): i32 {
+        \\  let total: i32 = 0;
+        \\  for (let i = 0; i < 5; i++) { total = total + i; }
+        \\  return total;
+        \\}
+        ,
+    },
+    .{
+        .name = "for-of array sum",
+        .expected = 6,
+        .source =
+        \\function main(): i32 {
+        \\  const arr: i32[] = [1, 2, 3];
+        \\  let t: i32 = 0;
+        \\  for (const v of arr) { t = t + v; }
+        \\  return t;
+        \\}
+        ,
+    },
+    .{
+        .name = "recursion factorial",
+        .expected = 120,
+        .source =
+        \\function fact(n: i32): i32 {
+        \\  if (n <= 1) { return 1; }
+        \\  return n * fact(n - 1);
+        \\}
+        \\function main(): i32 {
+        \\  return fact(5);
+        \\}
+        ,
+    },
+    .{
+        .name = "recursion fibonacci",
+        .expected = 55,
+        .source =
+        \\function fib(n: i32): i32 {
+        \\  if (n < 2) { return n; }
+        \\  return fib(n - 1) + fib(n - 2);
+        \\}
+        \\function main(): i32 {
+        \\  return fib(10);
+        \\}
+        ,
+    },
+    .{
+        .name = "struct field read",
+        .expected = 3,
+        .source =
+        \\interface Point { x: i32; y: i32; }
+        \\function main(): i32 {
+        \\  const p: Point = { x: 3, y: 4 };
+        \\  return p.x;
+        \\}
+        ,
+    },
+    .{
+        .name = "enum switch",
+        .expected = 20,
+        .source =
+        \\enum Color { Red, Green, Blue }
+        \\function classify(c: i32): i32 {
+        \\  let r: i32 = 0;
+        \\  switch (c) {
+        \\    case 0: { r = 10; break; }
+        \\    case 1: { r = 20; break; }
+        \\    default: { r = 30; }
+        \\  }
+        \\  return r;
+        \\}
+        \\function main(): i32 {
+        \\  return classify(1);
+        \\}
+        ,
+    },
+    .{
+        .name = "array write then sum",
+        .expected = 15,
+        .source =
+        \\function main(): i32 {
+        \\  let arr: i32[] = [1, 2, 3];
+        \\  arr[0] = 10;
+        \\  let t: i32 = 0;
+        \\  for (const v of arr) { t = t + v; }
+        \\  return t;
+        \\}
+        ,
+    },
+    .{
+        .name = "function call chain",
+        .expected = 12,
+        .source =
+        \\function a(x: i32): i32 { return x + 1; }
+        \\function b(x: i32): i32 { return a(x) * 2; }
+        \\function c(x: i32): i32 { return b(x) + a(x); }
+        \\function main(): i32 {
+        \\  return c(3);
+        \\}
+        ,
+    },
+    .{
+        .name = "modulo",
+        .expected = 2,
+        .source =
+        \\function rem(a: i32, b: i32): i32 {
+        \\  return a % b;
+        \\}
+        \\function main(): i32 {
+        \\  return rem(17, 5);
+        \\}
+        ,
+    },
+    .{
+        .name = "negated condition",
+        .expected = 1,
+        .source =
+        \\function main(): i32 {
+        \\  const ready: i32 = 0;
+        \\  if (!ready) { return 1; }
+        \\  return 0;
+        \\}
+        ,
+    },
+    .{
+        .name = "nested loops",
+        .expected = 9,
+        .source =
+        \\function main(): i32 {
+        \\  let t: i32 = 0;
+        \\  let i: i32 = 0;
+        \\  while (i < 3) {
+        \\    for (let j = 0; j < 3; j++) { t = t + 1; }
+        \\    i = i + 1;
+        \\  }
+        \\  return t;
+        \\}
+        ,
+    },
+    .{
+        .name = "c-for assignment increment",
+        .expected = 15,
+        .source =
+        \\function main(): i32 {
+        \\  let t: i32 = 0;
+        \\  for (let i: i32 = 5; i > 0; i = i - 1) { t = t + i; }
+        \\  return t;
+        \\}
+        ,
+    },
+    .{
+        .name = "nested struct literal with chained access",
+        .expected = 6,
+        .source =
+        \\interface Inner { a: i32; b: i32; }
+        \\interface Outer { inner: Inner; tag: i32; }
+        \\function main(): i32 {
+        \\  const o: Outer = { inner: { a: 1, b: 2 }, tag: 3 };
+        \\  return o.tag + o.inner.a + o.inner.b;
+        \\}
+        ,
+    },
+    .{
+        .name = "struct literal reassignment",
+        .expected = 4,
+        .source =
+        \\interface Point { x: i32; y: i32; }
+        \\function main(): i32 {
+        \\  let p: Point = { x: 1, y: 1 };
+        \\  p = { x: 2, y: 2 };
+        \\  return p.x + p.y;
+        \\}
+        ,
+    },
+    .{
+        .name = "struct field as loop bound with stepped increment",
+        .expected = 8,
+        .source =
+        \\interface Bundle { version: i32; files: i32; }
+        \\function main(): i32 {
+        \\  const b: Bundle = { version: 2, files: 12 };
+        \\  let t: i32 = 0;
+        \\  for (let i: i32 = 0; i < b.files; i = i + 2) { t = t + 1; }
+        \\  return t + b.version;
+        \\}
+        ,
+    },
+    .{
+        .name = "deep struct field read",
+        .expected = 9,
+        .source =
+        \\interface Inner { a: i32; b: i32; }
+        \\interface Outer { inner: Inner; tag: i32; }
+        \\function main(): i32 {
+        \\  const o: Outer = { inner: { a: 9, b: 8 }, tag: 1 };
+        \\  return o.inner.a;
+        \\}
+        ,
+    },
+};
+
+fn lowerForRuntimeTest(allocator: std.mem.Allocator, tc: *const RuntimeCase) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, tc.source, &low);
+    defer p.deinit();
+    try p.parse();
+
+    if (p.errors.items.len != 0) {
+        std.debug.print("lower diagnostics for '{s}':\n", .{tc.name});
+        for (p.errors.items) |e| std.debug.print("  {s}\n", .{e.message});
+        return error.RuntimeCaseLowerFailed;
+    }
+    const out = try low.toOwnedSlice();
+    return try allocator.dupe(u8, out);
+}
+
+fn findSaForRuntimeTest(allocator: std.mem.Allocator) !?[]u8 {
+    if (std.process.getEnvVarOwned(allocator, "SA_BIN")) |v| return v else |_| {}
+    const dev_path = "/content/sa_all/sci/zig-out/bin/sa";
+    std.fs.accessAbsolute(dev_path, .{}) catch return null;
+    return try allocator.dupe(u8, dev_path);
+}
+
+fn runRuntimeCase(allocator: std.mem.Allocator, sa_path: []const u8, tc: *const RuntimeCase) !void {
+    errdefer std.debug.print("runtime case failed: {s} (expected status {d})\n", .{ tc.name, tc.expected });
+    const sa_code = try lowerForRuntimeTest(allocator, tc);
+    defer allocator.free(sa_code);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    const sai_path = try std.fs.path.join(allocator, &.{ dir_path, "case.sai" });
+    defer allocator.free(sai_path);
+    const exe_path = try std.fs.path.join(allocator, &.{ dir_path, "case.exe" });
+    defer allocator.free(exe_path);
+
+    const sai_file = try std.fs.createFileAbsolute(sai_path, .{});
+    try sai_file.writeAll(sa_code);
+    sai_file.close();
+
+    var build_child = std.process.Child.init(&.{ sa_path, "build", sai_path, "-o", exe_path }, allocator);
+    build_child.stdout_behavior = .Ignore;
+    build_child.stderr_behavior = .Ignore;
+    const build_term = try build_child.spawnAndWait();
+    if (build_term != .Exited or build_term.Exited != 0) {
+        std.debug.print("sa build failed for '{s}': {any}\n", .{ tc.name, build_term });
+        return error.TestExpectedEqual;
+    }
+
+    var run_child = std.process.Child.init(&.{exe_path}, allocator);
+    run_child.stdout_behavior = .Ignore;
+    run_child.stderr_behavior = .Ignore;
+    const run_term = try run_child.spawnAndWait();
+    if (run_term != .Exited or run_term.Exited != tc.expected) {
+        std.debug.print("wrong result for '{s}': got {any}, want status {d}\n", .{ tc.name, run_term, tc.expected });
+        return error.TestExpectedEqual;
+    }
+}
+
+test "sa_plugin_ts runtime results match node-verified expectations" {
+    const allocator = std.testing.allocator;
+    const sa_path = try findSaForRuntimeTest(allocator) orelse return error.SkipZigTest;
+    defer allocator.free(sa_path);
+    for (&runtime_cases) |*tc| {
+        try runRuntimeCase(allocator, sa_path, tc);
     }
 }

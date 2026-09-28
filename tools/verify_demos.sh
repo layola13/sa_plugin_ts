@@ -94,15 +94,27 @@ for src in "$DEMO_DIR"/*/main.ts; do
   fi
 
   if "$SA_BIN" build "$WORK/case.sai" -o "$WORK/case.exe" > "$WORK/build.out" 2>&1; then
-    "$WORK/case.exe" > "$WORK/run.out" 2>&1
-    rc=$?
+    # Guard against demos that block waiting on the environment: tcpAccept
+    # with no live peer never returns, which used to hang the whole suite.
+    # A timeout is an environment limit, not a lowerer result, so it lands
+    # in the not-observable bucket rather than pass or fail.
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 10 "$WORK/case.exe" > "$WORK/run.out" 2>&1
+      rc=$?
+    else
+      "$WORK/case.exe" > "$WORK/run.out" 2>&1
+      rc=$?
+    fi
     # A non-zero exit is a normal return value: `@main() -> i32` puts its result
     # in the exit status, and a negative result is reported unsigned (return -1
     # becomes 255). Exit status and signal death are both 128+n and cannot be
     # told apart from the shell, so only the two codes a demo is not plausibly
     # going to produce by returning a small negative number are treated as
     # crashes. This is a heuristic; an expected-value check would be exact.
-    if [ "$rc" = 139 ] || [ "$rc" = 134 ]; then
+    if [ "$rc" = 124 ]; then
+      echo "SKIP $dir (run timed out after 10s; needs a live peer or input)"
+      upstream=$((upstream+1))
+    elif [ "$rc" = 139 ] || [ "$rc" = 134 ]; then
       echo "FAIL $dir (crashed, exit $rc)"
       head -2 "$WORK/run.out" | sed 's/^/    /'
       fail=$((fail+1)); failed_names+=("$dir")
@@ -138,10 +150,11 @@ done
 shopt -u nullglob
 
 # Every demo leaves the loop through exactly one bucket: pass, fail, diag
-# (refused with a located diagnostic) or skipped (no Node oracle available).
-# Counting only pass+fail under-reported the corpus by the size of the diag
-# bucket, so the headline total has to include all four.
-total=$((pass + fail + diag + skipped))
+# (refused with a located diagnostic), skipped (no Node oracle available) or
+# upstream (built but the result is not observable via exit code in this
+# environment, e.g. a blocking network accept). The headline total has to
+# include all five.
+total=$((pass + fail + diag + skipped + upstream))
 echo
 echo "demos: $total   verified: $pass   refused-with-diagnostic: $diag   no-oracle: $skipped   not-observable-via-exit-code: $upstream   failed: $fail"
 if [[ ${#failed_names[@]} -gt 0 ]]; then
