@@ -1810,12 +1810,18 @@ pub const Parser = struct {
                 }
             }
             if (self.layout_table.find(parent_name) == null) {
-                _ = try self.refuseAt(
-                    "error: extends of unknown class '{s}': the parent must be defined earlier in the file",
-                    .{parent_name},
-                    error.UnknownParentClass,
-                );
-                return error.UnknownParentClass;
+                // Collection pass skips imports, so a cross-file parent is
+                // legitimately unknown here: record blindly and let the real
+                // pass (imports loaded) validate. Same for a same-file
+                // parent declared later (also refused in the real pass).
+                if (!self.collect_only) {
+                    _ = try self.refuseAt(
+                        "error: extends of unknown class '{s}': the parent must be defined earlier in the file",
+                        .{parent_name},
+                        error.UnknownParentClass,
+                    );
+                    return error.UnknownParentClass;
+                }
             }
             try self.class_parent.put(
                 try self.allocator.dupe(u8, class_name),
@@ -2176,7 +2182,16 @@ pub const Parser = struct {
                 _ = try self.accept(.semicolon);
                 _ = try self.accept(.comma);
             }
-            if (self.layout_table.find(class_name) == null) {
+            if (self.layout_table.find(class_name)) |existing| {
+                // Real pass rebuild: the collect pass may have registered
+                // this layout before imports loaded (cross-file parent
+                // fields missing). Overwrite with the fresh scan; the
+                // collect pass itself keeps first-write-wins.
+                if (!self.collect_only) {
+                    existing.fields = pre_fields;
+                    existing.size = pre_offset;
+                }
+            } else {
                 try self.layout_table.register(class_name, .{
                     .name = try self.allocator.dupe(u8, class_name),
                     .size = pre_offset,

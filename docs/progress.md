@@ -23,12 +23,16 @@
 | 13 | /tmp/talgo/data_structures/tree/binary_search_tree.ts | /tmp/talgo_sweep/binary_search_tree.nolink.ts → /tmp/talgo_sweep/binary_search_tree.sai | PASS | 箭头参数 `[]` 后缀 + self_call 免释放 + 短调用补0 + panic(1) + while(true) + prologue move |
 | 14 | /tmp/talgo/data_structures/queue/circular_queue.ts | /tmp/talgo_sweep/circular_queue.nolink.ts → /tmp/talgo_sweep/circular_queue.sai | PASS | 动态 `new Array(size)` 经 mem_set 补齐 |
 | 15 | /tmp/talgo/data_structures/disjoint_set/disjoint_set.ts | /tmp/talgo_sweep/disjoint_set.nolink.ts → /tmp/talgo_sweep/disjoint_set.sai | PASS | `Array.from`/`fill`+`+=`/`[a,b]=[b,a]`补齐 |
-| 16 | /tmp/talgo/data_structures/set/hash_map_set.ts | /tmp/talgo_sweep/hash_map_set.nolink.ts → /tmp/talgo_sweep/hash_map_set.sai | LOWER-ERR | `class extends is not supported yet`（`extends MapSet` 跨文件父类 + `protected` + 抽象 `initMap`） |
+| 16 | /tmp/talgo/data_structures/set/hash_map_set.ts | 原文件直降（import intact）→ /tmp/talgo_sweep/hash_map_set.sai | PASS | 跨文件`extends MapSet`经整程序导入（收集遍延迟检查+布局重建） |
 | 17 | /tmp/talgo/data_structures/heap/heap.ts | /tmp/talgo_sweep/heap.nolink.ts → /tmp/talgo_sweep/heap.sai | PASS | 同文件 extends（copy-down+super/super.m+覆写+别名透传）+间接调用+`Math.floor`恒等+while回边/phicopy |
-| 18 | /tmp/talgo/data_structures/stack/linked_list_stack.ts | /tmp/talgo_sweep/linked_list_stack.nolink.ts → /tmp/talgo_sweep/linked_list_stack.sai | LOWER-ERR | `new of unknown type 'SinglyLinkedList'`（跨文件 import 类）+ `26:10` 泛型 colon |
-| 19 | /tmp/talgo/data_structures/queue/stack_queue.ts | /tmp/talgo_sweep/stack_queue.nolink.ts → /tmp/talgo_sweep/stack_queue.sai | LOWER-ERR | `new of unknown type 'Stack'`（同上跨文件 new）+ `property access on undefined variable 'this'` |
+| 18 | /tmp/talgo/data_structures/stack/linked_list_stack.ts | 原文件直降（import intact）→ /tmp/talgo_sweep/linked_list_stack.sai | PASS | 跨文件`new SinglyLinkedList`经整程序导入 |
+| 19 | /tmp/talgo/data_structures/queue/stack_queue.ts | 原文件直降（import intact）→ /tmp/talgo_sweep/stack_queue.sai | PASS | 跨文件`new Stack`/`Queue`经整程序导入 |
 
-## PASS：16/19；lower 通过：16/19
+## PASS：19/19（`tools/verify_talgo.sh` 原文件验收）；lower 通过：19/19
+
+## 验收方式变更
+- 跨文件 3 件（hash_map_set、linked_list_stack、stack_queue）改走**原文件直降**（import intact，整程序导入 SLA 式展开）；nolink 手工内联路线作废。
+- `tools/verify_talgo.sh` 为验收脚本（19 原文件 lower+check 双零错）；`zig build test` + `verify_e2e.sh` 回归不变。
 
 ## 修复优先级（JEV jev_rank，ROI）
 

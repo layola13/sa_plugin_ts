@@ -1933,6 +1933,61 @@ test "sa_plugin_ts copies loop-carried scalars instead of moving them" {
     try std.testing.expect(std.mem.indexOf(u8, lc, "L_while_") != null);
 }
 
+test "sa_plugin_ts resolves a cross-file parent via relative import" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(dir_path);
+    try tmp.dir.writeFile(.{
+        .sub_path = "base.ts",
+        .data =
+        \\export class Base {
+        \\  x: i32
+        \\  constructor(v: i32) {
+        \\    this.x = v
+        \\  }
+        \\  get(): i32 {
+        \\    return this.x
+        \\  }
+        \\}
+        \\
+        ,
+    });
+
+    const source =
+        \\import { Base } from './base'
+        \\class Child extends Base {
+        \\  constructor(v: i32) {
+        \\    super(v)
+        \\  }
+        \\}
+        \\function main(): i32 {
+        \\  const c = new Child(7);
+        \\  return c.get();
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+    p.base_dir = dir_path;
+
+    try p.parse();
+
+    const ximp = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Parent body shared: super() runs Base_ctor, inherited get() reuses it.
+    try std.testing.expect(std.mem.indexOf(u8, ximp, "call @Base_ctor(this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ximp, "call @Base_get(c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ximp, "@Child_get(") == null);
+}
+
 test "sa_plugin_ts lowers Map.getSize to btree len" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
