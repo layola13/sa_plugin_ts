@@ -1774,6 +1774,35 @@ test "sa_plugin_ts accepts _ as an unused arrow parameter" {
     try std.testing.expect(std.mem.indexOf(u8, usc, "closure_callback") != null);
 }
 
+test "sa_plugin_ts lowers Array.from length-mapper to a fill loop" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(n: i32): i32 {
+        \\  const a = Array.from({ length: n }, (_, index) => index);
+        \\  return a[0];
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const frm = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Counted mapper loop over the register length ...
+    try std.testing.expect(std.mem.indexOf(u8, frm, "slt ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, frm, "call @closure_callback_") != null);
+    // ... writing each mapped value into the fresh buffer.
+    try std.testing.expect(std.mem.indexOf(u8, frm, "store ") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

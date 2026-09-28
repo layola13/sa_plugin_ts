@@ -4259,6 +4259,121 @@ pub const Parser = struct {
         try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, n_reg });
     }
 
+    /// `Array.from({length: n}, mapper?)`: allocate `n` slots, then call
+    /// `mapper(0, i)` per index and store the result. No mapper means a
+    /// zeroed array (same as the dynamic `new Array(n)` path). Only the
+    /// `{length: <expr>}` shape is accepted; other array-likes are loud
+    /// errors. Element type is the `i32` default (numeric mappers — the
+    /// Talgo `(_, index) => index` shape); the mapper's first slot gets
+    /// `0` (element is undefined for a fresh array), the second the index.
+    /// Cursor must be on `(` after `Array.from`; consumes the full call.
+    fn lowerArrayFrom(self: *Parser) anyerror![]const u8 {
+        try self.expect(.l_paren);
+        if (self.current.tag != .l_brace) {
+            return self.refuseAt(
+                "error: Array.from only supports the {{length: n}} shape",
+                .{},
+                error.ConstructorsNotSupported,
+            );
+        }
+        try self.advance();
+        const key_tok = self.current;
+        try self.expect(.identifier);
+        if (!std.mem.eql(u8, self.tokenText(key_tok), "length")) {
+            return self.refuseAt(
+                "error: Array.from only supports the {{length: n}} shape",
+                .{},
+                error.ConstructorsNotSupported,
+            );
+        }
+        try self.expect(.colon);
+        const n_reg = try self.parseExpression();
+        try self.expect(.r_brace);
+        var cb: ?[]const u8 = null;
+        var map_ctx: ?[]const u8 = null;
+        var map_arity: u8 = 0;
+        var map_self_call = false;
+        if (try self.accept(.comma)) {
+            const m = try self.parseExpression();
+            if (std.mem.startsWith(u8, m, "@")) {
+                // Inline arrow: parseArrowBody registered ctx/arity.
+                cb = m;
+                const raw = self.last_arrow_ctx orelse "^ctx";
+                map_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                map_arity = self.last_arrow_arity;
+            } else if (self.arrow_aliases.get(m)) |aarg| {
+                if (aarg.plain) {
+                    return self.refuseAt(
+                        "error: Array.from mapper must take a context",
+                        .{},
+                        error.PlainFunctionAsValue,
+                    );
+                }
+                cb = aarg.cb;
+                const raw = aarg.ctx;
+                map_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                map_arity = aarg.arity;
+                map_self_call = aarg.self_call;
+            } else {
+                return self.refuseAt(
+                    "error: Array.from mapper must be an arrow function",
+                    .{},
+                    error.ConstructorsNotSupported,
+                );
+            }
+        }
+        try self.expect(.r_paren);
+        const dest = try self.newTemp();
+        try self.emitArrayAllocReg(dest, "i32", n_reg, false);
+        if (cb == null) return dest;
+        const data = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, dest });
+        const id = self.nextLabelId();
+        const l_top = try std.fmt.allocPrint(self.allocator, "L_from_top_{d}", .{id});
+        const l_body = try std.fmt.allocPrint(self.allocator, "L_from_body_{d}", .{id});
+        const l_end = try std.fmt.allocPrint(self.allocator, "L_from_end_{d}", .{id});
+        try self.lowerer.reserveLabel(l_top);
+        try self.lowerer.reserveLabel(l_body);
+        try self.lowerer.reserveLabel(l_end);
+        const i = try self.newTemp();
+        try self.lowerer.emit("    {s} = 0\n", .{i});
+        try self.lowerer.emitLabel(l_top);
+        const c = try self.newTemp();
+        try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, n_reg });
+        try self.lowerer.emitBranchTo(c, l_body, l_end);
+        try self.lowerer.emitLabel(l_body);
+        // Mapper args: element slot is `0` (fresh array), index slot is
+        // `i`, any further slots are `0`.
+        var arg_buf = std.ArrayList(u8).init(self.allocator);
+        defer arg_buf.deinit();
+        var slot: u8 = 0;
+        while (slot < @max(map_arity, 1)) : (slot += 1) {
+            if (slot > 0) try arg_buf.appendSlice(", ");
+            if (slot == 1) {
+                try arg_buf.appendSlice(i);
+            } else {
+                try arg_buf.appendSlice("0");
+            }
+        }
+        const v = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ v, cb.?[1..], arg_buf.items, map_ctx.? });
+        const off = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, 4\n", .{ off, i });
+        const addr = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr, data, off });
+        try self.lowerer.emit("    store {s} + 0, {s} as i32\n", .{ addr, v });
+        const inext = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+        try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
+        self.scope_manager.markConsumed(inext);
+        try self.lowerer.emitJumpTo(l_top);
+        try self.lowerer.emitLabel(l_end);
+        // Caller-side context release, once (not per iteration): mirrors
+        // the alias direct-call borrow rule.
+        if (!map_self_call) try self.lowerer.emit("    !{s}\n", .{map_ctx.?});
+        return dest;
+    }
+
     fn lowerArrayPush(self: *Parser, arr: []const u8, val: []const u8) anyerror![]const u8 {
         var elem_type: []const u8 = "i32";
         if (self.scope_manager.lookup(arr)) |av| {
@@ -7304,7 +7419,13 @@ pub const Parser = struct {
         if (tag == .dot) {
             try self.advance();
             const member_tok = self.current;
-            try self.expect(.identifier);
+            // `from` lexes as a keyword (imports) but is a valid member
+            // name (`Array.from`); accept it alongside identifiers.
+            if (self.current.tag == .keyword_from) {
+                try self.advance();
+            } else {
+                try self.expect(.identifier);
+            }
             const member_name = self.tokenText(member_tok);
 
             if (self.current.tag == .l_paren) {
@@ -7346,6 +7467,11 @@ pub const Parser = struct {
                     return temp_name;
                 } else if (self.isMapVar(left)) {
                     return try self.lowerMapMethodCall(left, member_name);
+                } else if (std.mem.eql(u8, left, "Array") and std.mem.eql(u8, member_name, "from") and self.scope_manager.lookup(left) == null) {
+                    // `Array.from({length: n}, mapper?)`: static construction
+                    // helper, not a slice method. A user-declared `Array`
+                    // keeps the normal method path.
+                    return try self.lowerArrayFrom();
                 } else if (std.mem.eql(u8, member_name, "charCodeAt")) {
                     // `s.charCodeAt(i)`: byte load from the string slice.
                     try self.expect(.l_paren);
