@@ -1551,8 +1551,13 @@ pub const Parser = struct {
         }
         const vt_name = try std.fmt.allocPrint(self.allocator, "VT_{s}", .{cb_name[1..]});
         try self.lowerer.emitVTableFn(vt_name, cb_name);
+        // Address-take the table, then load the slot: a bare
+        // `load VT+0` verifies but the LLVM backend rejects it, and calling
+        // the table address itself segfaults (probed end-to-end).
+        const vt_reg = try self.newTemp();
+        try self.lowerer.emit("    {s} = &{s}\n", .{ vt_reg, vt_name });
         const fpreg = try self.newTemp();
-        try self.lowerer.emit("    {s} = load {s}+0 as ptr\n", .{ fpreg, vt_name });
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ fpreg, vt_reg });
         return fpreg;
     }
 
@@ -5521,7 +5526,12 @@ pub const Parser = struct {
     fn classMethodIsVoid(self: *Parser, static_type: []const u8, method: []const u8) anyerror!bool {
         const key = try self.methodKey(static_type, method);
         if (self.class_methods.get(key)) |sig| {
-            return sig.is_void or std.mem.eql(u8, method, "ctor");
+            if (sig.is_void or std.mem.eql(u8, method, "ctor")) return true;
+            // Unannotated methods emit void-typed functions (no `->`), so a
+            // value call would name a void result (LLVMBackend rejects it).
+            // Only known-real bodies count: pre-scan stubs (forward calls)
+            // keep the old assign-temp behavior.
+            if (sig.ret == null and sig.body_src != null) return true;
         }
         return false;
     }
@@ -7678,7 +7688,7 @@ pub const Parser = struct {
                     try self.lowerer.emit("    {s} = fneg {s}\n", .{ temp_name, operand });
                     try self.retagTemp(temp_name, "f64");
                 } else {
-                    try self.lowerer.emit("    {s} = neg {s}\n", .{ temp_name, operand });
+                    try self.lowerer.emit("    {s} = sub 0, {s}\n", .{ temp_name, operand });
                 }
                 return temp_name;
             },
@@ -8229,6 +8239,30 @@ pub const Parser = struct {
 
             if (self.current.tag == .l_paren) {
                 // Method call: obj.method(args)
+                // A real class method named `length` (Stack.length())
+                // shadows the string/array `.length()` spelling below: route
+                // such calls to the normal method dispatch instead. (An
+                // if/else-if chain never falls through, so this must gate
+                // the branch condition, not the branch body.)
+                var length_shadowed = false;
+                if (std.mem.eql(u8, member_name, "length")) {
+                    if (self.scope_manager.lookup(left)) |slv| {
+                        if (self.layout_table.find(slv.type_name) != null) {
+                            var kit = self.class_methods.keyIterator();
+                            while (kit.next()) |k| {
+                                const want_dot = std.mem.indexOf(u8, k.*, ".");
+                                if (want_dot) |di| {
+                                    if (std.mem.eql(u8, k.*[0..di], slv.type_name) and
+                                        std.mem.eql(u8, k.*[di + 1 ..], member_name))
+                                    {
+                                        length_shadowed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (std.mem.eql(u8, member_name, "slice")) {
                     try self.expect(.l_paren);
                     const start_val = try self.parseExpression();
@@ -8247,7 +8281,7 @@ pub const Parser = struct {
                     try self.lowerer.emit("    slice_len = sub {s}, {s}\n", .{ end_val, start_val });
                     try self.lowerer.emit("    store {s} + 8, slice_len as u32\n", .{slice_var_name});
                     return slice_var_name;
-                } else if (std.mem.eql(u8, member_name, "length")) {
+                } else if (std.mem.eql(u8, member_name, "length") and !length_shadowed) {
                     // `s.length()`: the method-call spelling of the string
                     // length. The load is the whole implementation; the
                     // parens must still be consumed, otherwise the leftover

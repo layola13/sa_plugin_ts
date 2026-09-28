@@ -2201,8 +2201,71 @@ test "sa_plugin_ts lowers this.compare() via call_indirect on the fn field" {
     const ind = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
     // Single-slot vtable materializes the code pointer ...
     try std.testing.expect(std.mem.indexOf(u8, ind, "vtable { call = @") != null);
+    // ... address-taken and slot-loaded (bare `load VT+0` verifies but the
+    // LLVM backend rejects it; calling the table address segfaults).
+    try std.testing.expect(std.mem.indexOf(u8, ind, "= &VT_") != null);
     // ... loaded from the field and invoked indirectly.
     try std.testing.expect(std.mem.indexOf(u8, ind, "call_indirect ") != null);
+}
+
+test "sa_plugin_ts calls unannotated methods as void (no named void result)" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class S {
+        \\  push(v: i32): void {
+        \\  }
+        \\  m(): void {
+        \\    this.push(1)
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const vd = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Bare call (a `t = call @S_push` would name a void value: LLVMBackend
+    // rejects it).
+    try std.testing.expect(std.mem.indexOf(u8, vd, "call @S_push(this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, vd, "= call @S_push(") == null);
+}
+
+test "sa_plugin_ts prefers a real length() method over the spelling" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class S {
+        \\  length(): number {
+        \\    return 1
+        \\  }
+        \\  m(): void {
+        \\    const n = this.length()
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const ls = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, ls, "call @S_length(this") != null);
 }
 
 test "sa_plugin_ts await unwraps and consumes the ready future" {
@@ -2388,7 +2451,7 @@ test "sa_plugin_ts compiles unary negation and logical not" {
 
     const result = low.output.items;
 
-    try std.testing.expect(std.mem.indexOf(u8, result, "neg a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "sub 0, a") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "eq b, 0") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "not ") == null);
 }
