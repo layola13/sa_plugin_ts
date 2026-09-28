@@ -5308,6 +5308,10 @@ pub const Parser = struct {
             offset += cap_size;
         }
 
+        // Short-call defaults replay here, mirroring methods: a call site
+        // padding a defaulted parameter with `0` gets the default value.
+        try self.emitDefaultPrologue(params);
+
         // Parse body statements
         if (self.current.tag == .l_brace) {
             try self.advance();
@@ -5386,6 +5390,17 @@ pub const Parser = struct {
             // Each arrow gets its own parent-side context register so two
             // arrows in one function do not clobber each other.
             self.last_arrow_ctx = try std.fmt.allocPrint(self.allocator, "^{s}", .{parent_ctx_early});
+            // Publish arity for the `const f = <arrow>` alias recorded by
+            // `parseLet`: short calls pad missing defaulted params with `0`.
+            // Set at exit (not entry) so a nested arrow's values do not stick.
+            self.last_arrow_arity = @as(u8, @intCast(params.len));
+            {
+                var req_count: u8 = 0;
+                for (params) |pp| {
+                    if (!pp.optional) req_count += 1;
+                }
+                self.last_arrow_required = req_count;
+            }
             return cb_name;
         }
         try self.scope_manager.exitScope(self.lowerer);
@@ -5429,6 +5444,18 @@ pub const Parser = struct {
 
         // Store context for caller to pick up as ^ctx_N
         self.last_arrow_ctx = try std.fmt.allocPrint(self.allocator, "^{s}", .{parent_ctx});
+
+        // Publish arity for the `const f = <arrow>` alias recorded by
+        // `parseLet`: short calls pad missing defaulted params with `0`.
+        // Set at exit (not entry) so a nested arrow's values do not stick.
+        self.last_arrow_arity = @as(u8, @intCast(params.len));
+        {
+            var req_count: u8 = 0;
+            for (params) |pp| {
+                if (!pp.optional) req_count += 1;
+            }
+            self.last_arrow_required = req_count;
+        }
 
         return cb_name;
     }
@@ -5768,6 +5795,23 @@ pub const Parser = struct {
                         try expanded.append(aarg.ctx);
                     } else {
                         try expanded.append(arg);
+                    }
+                }
+                // Short-call padding: missing defaulted params become `0`
+                // (the callee prologue replays the default); fewer than the
+                // required count is a loud error, not a silent mis-call.
+                if (alias.arity > 0) {
+                    if (args.items.len < alias.required) {
+                        _ = try self.refuseAt(
+                            "error: too few arguments in call",
+                            .{},
+                            error.TooFewArguments,
+                        );
+                        return error.TooFewArguments;
+                    }
+                    var need_pad: u8 = alias.arity - @as(u8, @intCast(@min(args.items.len, alias.arity)));
+                    while (need_pad > 0) : (need_pad -= 1) {
+                        try expanded.append("0");
                     }
                 }
                 const borrow_ctx = if (alias.ctx.len > 0 and alias.ctx[0] == '^') alias.ctx[1..] else alias.ctx;
@@ -7533,6 +7577,20 @@ pub const Parser = struct {
                         try expanded.append(aarg.ctx);
                     } else {
                         try expanded.append(arg);
+                    }
+                }
+                if (alias.arity > 0) {
+                    if (args.items.len < alias.required) {
+                        _ = try self.refuseAt(
+                            "error: too few arguments in call",
+                            .{},
+                            error.TooFewArguments,
+                        );
+                        return error.TooFewArguments;
+                    }
+                    var need_pad: u8 = alias.arity - @as(u8, @intCast(@min(args.items.len, alias.arity)));
+                    while (need_pad > 0) : (need_pad -= 1) {
+                        try expanded.append("0");
                     }
                 }
                 const borrow_ctx_v = if (alias.ctx.len > 0 and alias.ctx[0] == '^') alias.ctx[1..] else alias.ctx;
