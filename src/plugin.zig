@@ -1933,6 +1933,101 @@ test "sa_plugin_ts copies loop-carried scalars instead of moving them" {
     try std.testing.expect(std.mem.indexOf(u8, lc, "L_while_") != null);
 }
 
+test "sa_plugin_ts lowers Map.getSize to btree len" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class M {
+        \\  map: Map<string, number>
+        \\  n(): number {
+        \\    return this.map.getSize()
+        \\  }
+        \\  m(x: i32): i32 {
+        \\    return x
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const gs = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, gs, "call @sa_btree_map_len(&") != null);
+}
+
+test "sa_plugin_ts emits panic stubs for body-less abstract methods" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\abstract class B {
+        \\  constructor() {
+        \\    this.m()
+        \\  }
+        \\  protected abstract m(): number
+        \\  n(x: i32): i32 {
+        \\    return x
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const ab = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, ab, "panic(1)") != null);
+}
+
+test "sa_plugin_ts isolates branch-arm releases from siblings" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class A {
+        \\  v: i32
+        \\  m(c: boolean): void {
+        \\    if (c) {
+        \\      return
+        \\    }
+        \\    this.v = 1
+        \\  }
+        \\  n(x: i32): i32 {
+        \\    return x
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const bi = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Both the early return and the post-if store survive.
+    try std.testing.expect(std.mem.indexOf(u8, bi, "return") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bi, "store ") != null);
+}
+
 test "sa_plugin_ts treats return before a statement keyword as bare (ASI)" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

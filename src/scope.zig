@@ -158,6 +158,59 @@ pub const ScopeManager = struct {
         return self.scopes.items.len;
     }
 
+    /// Snapshot of one variable's release-relevant flags, for branch-arm
+    /// isolation (see snapshotFlags).
+    pub const FlagSnap = struct {
+        consumed: bool,
+        released: bool,
+    };
+
+    /// Snapshot `consumed`/`released` flags for every variable in every
+    /// open scope, innermost scope last, variables in declaration order.
+    ///
+    /// Releases emitted on one branch arm (e.g. parameter cleanup on an
+    /// early-`return` path) must not change emission decisions on sibling
+    /// paths: the flags are process-global while the emitted code is
+    /// per-path. Callers restore after a terminated arm, and before an
+    /// `else` arm (which must start from entry state, not then-end state).
+    /// Scopes only push/pop at the top and variables only append, so
+    /// restoring by (depth, index) prefix is stable; added scopes/vars are
+    /// left alone.
+    pub fn snapshotFlags(self: *ScopeManager, allocator: std.mem.Allocator) !std.ArrayList(std.ArrayList(FlagSnap)) {
+        var out = std.ArrayList(std.ArrayList(FlagSnap)).init(allocator);
+        for (self.scopes.items) |*scope| {
+            var one = std.ArrayList(FlagSnap).init(allocator);
+            for (scope.variables.items) |*v| {
+                try one.append(.{ .consumed = v.is_consumed, .released = v.is_released });
+            }
+            try out.append(one);
+        }
+        return out;
+    }
+
+    /// Restore a snapshot taken with snapshotFlags (prefix-wise; see above).
+    /// Emissions are untouched — only future emission decisions change.
+    pub fn restoreFlags(self: *ScopeManager, snap: std.ArrayList(std.ArrayList(FlagSnap))) void {
+        const n = @min(snap.items.len, self.scopes.items.len);
+        var d: usize = 0;
+        while (d < n) : (d += 1) {
+            const vars = &self.scopes.items[d].variables.items;
+            const m = @min(snap.items[d].items.len, vars.*.len);
+            var i: usize = 0;
+            while (i < m) : (i += 1) {
+                vars.*[i].is_consumed = snap.items[d].items[i].consumed;
+                vars.*[i].is_released = snap.items[d].items[i].released;
+            }
+        }
+    }
+
+    /// Free a snapshot taken with snapshotFlags.
+    pub fn freeSnap(self: *ScopeManager, snap: *std.ArrayList(std.ArrayList(FlagSnap))) void {
+        for (snap.items) |*one| one.deinit();
+        snap.deinit();
+        _ = self;
+    }
+
     /// Release the owned values held by every scope opened after `depth`.
     ///
     /// A `break` or `continue` abandons the scopes it jumps out of: those

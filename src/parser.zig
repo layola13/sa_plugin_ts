@@ -182,6 +182,12 @@ pub const Parser = struct {
     /// `Child.method` -> defining class for copy-down aliases (the shared
     /// body emits once as `@Parent_method`; dispatch must use that name).
     method_emit_owner: std.StringHashMap([]const u8) = undefined,
+    /// `Class.field` -> duplicated initializer source (`= <src>`). Field
+    /// initializers cannot emit at class scope (no `this`, and straight-line
+    /// emission there glues into the previous function); they replay at the
+    /// start of explicit ctors, or in a synthesized default ctor when the
+    /// class declares none. Filed during the member loop (single recorder).
+    field_inits: std.StringHashMap([]const u8) = undefined,
     /// Expected element type for a dynamic `new Array(n)` / `Array(n)` whose
     /// length is a runtime value: set from the assignment target's declared
     /// element type while lowering the right-hand side (`this.queue = ...`
@@ -337,7 +343,7 @@ pub const Parser = struct {
         parser_inst.class_traits = std.StringHashMap(void).init(allocator);
         parser_inst.class_parent = std.StringHashMap([]const u8).init(allocator);
         parser_inst.method_emit_owner = std.StringHashMap([]const u8).init(allocator);
-        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);
+        parser_inst.field_inits = std.StringHashMap([]const u8).init(allocator);        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);
         parser_inst.imported_files = std.StringHashMap(void).init(allocator);
 
         // Pre-register `async function` signatures (name -> inner value
@@ -1747,6 +1753,8 @@ pub const Parser = struct {
                     }
                 }
             }
+            // Field initializers replay before the body (body stores win).
+            try self.replayFieldInits(class_name);
         }
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
             try self.parseStatement();
@@ -1764,7 +1772,9 @@ pub const Parser = struct {
     /// Parse `class C [extends B] [implements I, ...] { ... }`.
     /// Trait downgrade Phase 1: fields register a struct layout (like
     /// interfaces); methods lower to `@C_m(this: ptr, ...)` with static
-    /// dispatch. `extends` is loudly refused (Phase 2 copy-down).
+    /// dispatch. Intra-file `extends` lowers via copy-down (parent layout
+    /// prefixes, inherited methods alias, `super()`/`super.m()` static);
+    /// body-less (abstract) own methods emit `panic(1)` stubs.
     fn parseClass(self: *Parser) anyerror!void {
         try self.expect(.keyword_class);
         const name_tok = self.current;
@@ -1919,13 +1929,17 @@ pub const Parser = struct {
                         // real fields: collect them into the layout in member
                         // order so `this.x` resolves in every method body.
                         // Defaults skip structurally (no emission pre-body).
+                        // Every param (property or plain) is also recorded
+                        // for forward `new` short-arg padding.
                         try self.expect(.l_paren);
+                        var pp_stored = std.ArrayList(StoredParam).init(self.allocator);
+                        defer pp_stored.deinit();
                         while (self.current.tag != .r_paren and self.current.tag != .eof) {
                             const pp_had_mod = try self.skipModifiers();
                             const pp_tok = self.current;
                             try self.expect(.identifier);
                             const pp_name = self.tokenText(pp_tok);
-                            _ = try self.accept(.question);
+                            var pp_optional = try self.accept(.question);
                             var pp_type: []const u8 = "i32";
                             if (try self.accept(.colon)) {
                                 if (self.current.tag == .keyword_void) {
@@ -1935,8 +1949,11 @@ pub const Parser = struct {
                                     pp_type = try self.parseTypeName();
                                 }
                             }
+                            var pp_default: ?[]const u8 = null;
                             if (try self.accept(.equal)) {
-                                try self.skipBalancedDefault();
+                                pp_optional = true;
+                                pp_default = try self.saveBalancedDefault();
+                                if (pp_default == null) try self.skipBalancedDefault();
                             }
                             if (pp_had_mod) {
                                 var pp_size: u32 = 8;
@@ -1950,9 +1967,28 @@ pub const Parser = struct {
                                 });
                                 pre_offset += pp_size;
                             }
+                            try pp_stored.append(.{
+                                .name = try self.allocator.dupe(u8, pp_name),
+                                .type_name = try self.allocator.dupe(u8, pp_type),
+                                .optional = pp_optional,
+                                .default_src = pp_default,
+                            });
                             _ = try self.accept(.comma);
                         }
                         try self.expect(.r_paren);
+                        // Merge params into the ctor stub (forward `new`
+                        // short-arg padding reads it before the real entry
+                        // lands). The member loop overwrites with the full
+                        // entry later.
+                        {
+                            const prev = self.class_methods.get(pre_key);
+                            const arr = try self.allocator.alloc(StoredParam, pp_stored.items.len);
+                            for (pp_stored.items, 0..) |p, idx| arr[idx] = p;
+                            try self.class_methods.put(pre_key, .{
+                                .is_void = if (prev) |pe| pe.is_void else true,
+                                .params = if (arr.len > 0) arr else null,
+                            });
+                        }
                         // Skip return annotation up to `{` or `;`, then the body.
                     } else if (self.current.tag == .l_paren) {
                         // Parse (not just skip) `(params)`: forward calls in
@@ -1995,6 +2031,17 @@ pub const Parser = struct {
                             const prev = self.class_methods.get(pre_key);
                             try self.class_methods.put(pre_key, .{
                                 .is_void = !is_ctor,
+                                .params = if (prev) |pe| pe.params else null,
+                            });
+                        } else if (self.current.tag == .identifier) {
+                            // Record the declared return for abstract-stub
+                            // emission (a body-less `initMap(): Map<..>`
+                            // stubs as `-> ptr`, not `-> i32`).
+                            const rt = try self.parseTypeName();
+                            const prev = self.class_methods.get(pre_key);
+                            try self.class_methods.put(pre_key, .{
+                                .is_void = false,
+                                .ret = try self.allocator.dupe(u8, rt),
                                 .params = if (prev) |pe| pe.params else null,
                             });
                         }
@@ -2194,6 +2241,29 @@ pub const Parser = struct {
                 f_type = try self.parseTypeName();
             }
             if (try self.accept(.equal)) {
+                // Field initializers cannot emit here (class scope has no
+                // `this`, and straight-line emission glues into the previous
+                // function): suppress emission into a discard buffer, record
+                // the source slice, and replay it in the ctor (explicit or
+                // synthesized). Imports/consts still land in the header.
+                const istart: usize = @as(usize, self.current.start);
+                var discard = std.ArrayList(u8).init(self.allocator);
+                defer discard.deinit();
+                const saved_cap = self.lowerer.capture;
+                self.lowerer.capture = &discard;
+                // Quarantine scope: the suppressed parse declares temps in
+                // the shared scope manager; without isolation they leak into
+                // later functions' exit walks (`!t_2` for a temp that was
+                // never defined there). Releases during the pop go to the
+                // discard buffer too.
+                try self.scope_manager.enterScope();
+                const quarantine_depth = self.scope_manager.scopeDepth();
+                errdefer {
+                    while (self.scope_manager.scopeDepth() > quarantine_depth - 1) {
+                        self.scope_manager.exitScope(self.lowerer) catch break;
+                    }
+                    self.lowerer.capture = saved_cap;
+                }
                 if (self.current.tag == .l_bracket) {
                     var depth: u32 = 0;
                     while (self.current.tag != .eof) {
@@ -2228,6 +2298,20 @@ pub const Parser = struct {
                 } else {
                     _ = try self.parseExpression();
                 }
+                try self.scope_manager.exitScope(self.lowerer);
+                self.lowerer.capture = saved_cap;
+                // A discarded arrow registers callbacks and leaves its
+                // context/arity published; reset so later call sites never
+                // pick up the stale names (would be loud UnknownRegisters).
+                self.last_arrow_ctx = null;
+                self.last_arrow_arity = 0;
+                self.last_arrow_required = 0;
+                const iend: usize = @as(usize, self.current.start);
+                if (iend > istart) {
+                    const fkey = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, f_name });
+                    const fsrc = self.lexer.source[istart..@min(iend, self.lexer.source.len)];
+                    try self.field_inits.put(fkey, try self.allocator.dupe(u8, fsrc));
+                }
             }
             var f_size: u32 = 8;
             var f_align: u32 = 8;
@@ -2243,6 +2327,61 @@ pub const Parser = struct {
             _ = try self.accept(.comma);
         }
         try self.expect(.r_brace);
+        // Abstract stubs: own methods that never got a body (no `body_src`)
+        // emit a `panic(1)` body with the declared signature. Calling an
+        // abstract method is a dynamic error (JS throws on unimplemented
+        // abstract dispatch); the stub keeps the callee declared so static
+        // call sites verify. Aliased (inherited) entries are skipped — the
+        // parent body already exists under its own name.
+        {
+            var stubs = std.ArrayList([]const u8).init(self.allocator);
+            defer stubs.deinit();
+            var sit = self.class_methods.keyIterator();
+            const sprefix = try std.fmt.allocPrint(self.allocator, "{s}.", .{class_name});
+            while (sit.next()) |k| {
+                if (std.mem.startsWith(u8, k.*, sprefix)) {
+                    try stubs.append(k.*);
+                }
+            }
+            for (stubs.items) |skey| {
+                if (self.method_emit_owner.contains(skey)) continue;
+                const sentry = self.class_methods.get(skey) orelse continue;
+                if (sentry.body_src != null) continue;
+                const smname = skey[sprefix.len..];
+                try self.lowerer.emit("@{s}_{s}(this: ptr", .{ class_name, smname });
+                if (sentry.params) |spp| {
+                    for (spp) |sp| {
+                        try self.lowerer.emit(", {s}: {s}", .{ sp.name, saTypeOf(sp.type_name) });
+                    }
+                }
+                const is_v = sentry.is_void;
+                const sret = sentry.ret;
+                if (!is_v) {
+                    if (sret) |rt| {
+                        if (!std.mem.eql(u8, rt, "void")) {
+                            try self.lowerer.emit(") -> {s}:\n", .{saTypeOf(rt)});
+                        } else {
+                            try self.lowerer.emit("):\n", .{});
+                        }
+                    } else {
+                        try self.lowerer.emit("):\n", .{});
+                    }
+                } else {
+                    try self.lowerer.emit("):\n", .{});
+                }
+                self.lowerer.beginFunction();
+                if (sentry.params) |spp| {
+                    var pi: usize = spp.len;
+                    while (pi > 0) {
+                        pi -= 1;
+                        try self.lowerer.emit("    !{s}\n", .{spp[pi].name});
+                    }
+                }
+                try self.lowerer.emit("    !this\n", .{});
+                try self.lowerer.emit("    panic(1)\n", .{});
+                try self.lowerer.finishFunction("return 0");
+            }
+        }
         // Layout was pre-registered by the field pre-scan so method bodies
         // could resolve `this`; only register here when absent.
         if (self.layout_table.find(class_name) == null) {
@@ -2252,6 +2391,48 @@ pub const Parser = struct {
                 .fields = fields,
             };
             try self.layout_table.register(class_name, layout);
+        }
+        // Synthesized default ctor: no declared ctor (and no inherited one
+        // via alias) but at least one replayable field init
+        // (`root = new TrieNode()`). Runs the inits; trivial (`{}`, numeric,
+        // boolean) inits stay zero-covered and never trigger this.
+        {
+            const ckey = try self.methodKey(class_name, "ctor");
+            if (self.class_methods.get(ckey) == null) {
+                if (self.layout_table.find(class_name)) |layout| {
+                    var need_ctor = false;
+                    for (layout.fields.items) |fld| {
+                        const fkey = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, fld.name });
+                        if (self.field_inits.get(fkey)) |src| {
+                            const trimmed = std.mem.trim(u8, src, " \t\r\n");
+                            if (trimmed.len == 0 or trimmed[0] == '{') continue;
+                            if (std.mem.eql(u8, trimmed, "true") or std.mem.eql(u8, trimmed, "false")) continue;
+                            const numeric = (trimmed[0] >= '0' and trimmed[0] <= '9') or
+                                ((trimmed[0] == '-' or trimmed[0] == '+') and trimmed.len > 1);
+                            if (!numeric) {
+                                need_ctor = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (need_ctor) {
+                        try self.lowerer.emit("@{s}_ctor(this: ptr):\n", .{class_name});
+                        self.lowerer.beginFunction();
+                        const saved_defer = self.scope_manager.defer_releases;
+                        self.scope_manager.defer_releases = true;
+                        defer self.scope_manager.defer_releases = saved_defer;
+                        try self.scope_manager.enterScope();
+                        try self.scope_manager.declareVar("this", class_name, "this", true);
+                        try self.replayFieldInits(class_name);
+                        if (!self.lowerer.isTerminated()) {
+                            try self.releaseLiveRegisters();
+                        }
+                        try self.scope_manager.exitScope(self.lowerer);
+                        try self.lowerer.finishFunction("return");
+                        try self.class_methods.put(ckey, .{ .is_void = true });
+                    }
+                }
+            }
         }
     }
 
@@ -3176,6 +3357,12 @@ pub const Parser = struct {
 
         _ = try self.emitBranchIfFalse(cond, else_label);
 
+        // Branch-arm flag isolation: releases on one arm (e.g. parameter
+        // cleanup on an early return) must not change emission decisions on
+        // sibling paths. The else arm always restarts from entry state; a
+        // terminated arm's flags revert (it never joins).
+        var entry_flags = try self.scope_manager.snapshotFlags(self.allocator);
+        defer self.scope_manager.freeSnap(&entry_flags);
         // Then branch
         self.branch_depth += 1;
         defer self.branch_depth -= 1;
@@ -3190,6 +3377,9 @@ pub const Parser = struct {
         } else {
             try self.parseStatement();
         }
+        if (self.lowerer.isTerminated()) {
+            self.scope_manager.restoreFlags(entry_flags);
+        }
 
         if (!self.lowerer.isTerminated()) {
             try self.lowerer.emitJumpTo(end_label);
@@ -3197,6 +3387,7 @@ pub const Parser = struct {
         try self.lowerer.emitLabel(else_label);
 
         if (self.current.tag == .keyword_else) {
+            self.scope_manager.restoreFlags(entry_flags);
             try self.advance();
             self.branch_depth += 1;
             defer self.branch_depth -= 1;
@@ -3212,6 +3403,9 @@ pub const Parser = struct {
                 try self.advance();
             } else {
                 try self.parseStatement();
+            }
+            if (self.lowerer.isTerminated()) {
+                self.scope_manager.restoreFlags(entry_flags);
             }
         }
 
@@ -4478,6 +4672,14 @@ pub const Parser = struct {
             try self.lowerer.emit("    {s} = call @sa_btree_map_len(&{s})\n", .{ t, left });
             return t;
         }
+        if (std.mem.eql(u8, member_name, "getSize")) {
+            // Talgo `Map` spelling of `size` (map_set `getSize()`).
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            const t = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_btree_map_len(&{s})\n", .{ t, left });
+            return t;
+        }
         if (std.mem.eql(u8, member_name, "keys")) {
             try self.expect(.l_paren);
             try self.expect(.r_paren);
@@ -4725,6 +4927,50 @@ pub const Parser = struct {
             }
         }
         return null;
+    }
+
+    /// Replay recorded field initializers (`= <src>`) as stores into a
+    /// fresh instance. Runs at the start of explicit ctors (before the
+    /// body, after property stores) and in synthesized default ctors.
+    /// `{...}` inits are skipped (Map/Record fields already hold fresh
+    /// btree handles from the `new` site); everything else re-parses from
+    /// the recorded source (arrow inits materialize through the fn-ptr
+    /// helper, like parameter defaults).
+    fn replayFieldInits(self: *Parser, class_name: []const u8) anyerror!void {
+        const layout = self.layout_table.find(class_name) orelse return;
+        for (layout.fields.items) |fld| {
+            const fkey = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ class_name, fld.name });
+            const src = self.field_inits.get(fkey) orelse continue;
+            const trimmed = std.mem.trim(u8, src, " \t\r\n");
+            if (trimmed.len == 0 or trimmed[0] == '{') continue;
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_peek = self.peek;
+            const saved_tpl = self.template_lexer_mode;
+            const saved_ctx = self.last_arrow_ctx;
+            self.last_arrow_ctx = null;
+            self.lexer = lexer_mod.Lexer{ .source = src };
+            self.current = self.lexer.next();
+            self.peek = self.lexer.next();
+            self.template_lexer_mode = false;
+            const v = try self.parseExpression();
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+            self.template_lexer_mode = saved_tpl;
+            if (std.mem.startsWith(u8, v, "@closure_callback_")) {
+                const fpreg = try self.fnPtrForCb(v);
+                if (self.last_arrow_ctx) |actx| {
+                    const borrow = if (actx.len > 0 and actx[0] == '^') actx[1..] else actx;
+                    try self.lowerer.emit("    !{s}\n", .{borrow});
+                }
+                self.last_arrow_ctx = saved_ctx;
+                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ "this", fld.offset, fpreg, saTypeOf(fld.type_name) });
+                continue;
+            }
+            self.last_arrow_ctx = saved_ctx;
+            try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ "this", fld.offset, v, saTypeOf(fld.type_name) });
+        }
     }
 
     fn lowerArrayPush(self: *Parser, arr: []const u8, val: []const u8) anyerror![]const u8 {
@@ -7074,6 +7320,8 @@ pub const Parser = struct {
         const labels = try self.joinLabels("tern");
         try self.lowerer.emitBranchTo(cond, labels[0], labels[1]);
         try self.lowerer.emitLabel(labels[0]);
+        var tern_flags = try self.scope_manager.snapshotFlags(self.allocator);
+        defer self.scope_manager.freeSnap(&tern_flags);
         try self.scope_manager.enterScope();
         const tv = try self.parseExpressionWithPrecedence(.lowest);
         try self.expect(.colon);
@@ -7087,6 +7335,8 @@ pub const Parser = struct {
         try self.exitScopeReleasingLocals();
         try self.lowerer.emitJumpTo(labels[2]);
         try self.lowerer.emitLabel(labels[1]);
+        // The else arm restarts from entry state (see parseIf).
+        self.scope_manager.restoreFlags(tern_flags);
         try self.scope_manager.enterScope();
         const fv = try self.parseExpressionWithPrecedence(.lowest);
         try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, fv });
@@ -7729,10 +7979,12 @@ pub const Parser = struct {
                     }
                 }
                 // Trait downgrade: `new C(args)` = alloc + zero-init + `@C_ctor`.
-                // No explicit ctor keeps the old zero-init behavior.
+                // No explicit ctor keeps the old zero-init behavior. An
+                // inherited (aliased) ctor dispatches to the owner's body.
                 const ctor_key = try self.methodKey(type_name, "ctor");
                 if (self.class_methods.contains(ctor_key)) {
-                    const ctor_emit = try std.fmt.allocPrint(self.allocator, "{s}_ctor", .{type_name});
+                    const ctor_owner = self.method_emit_owner.get(ctor_key) orelse type_name;
+                    const ctor_emit = try std.fmt.allocPrint(self.allocator, "{s}_ctor", .{ctor_owner});
                     try self.lowerer.emit("    call @{s}({s}", .{ ctor_emit, dest });
                     for (ctor_args.items) |a| {
                         try self.lowerer.emit(", {s}", .{a});

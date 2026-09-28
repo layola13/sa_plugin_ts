@@ -16,10 +16,10 @@
 | 6 | /tmp/talgo/data_structures/queue/array_queue.ts | /tmp/talgo_sweep/array_queue.nolink.ts → /tmp/talgo_sweep/array_queue.sai | PASS | — |
 | 7 | /tmp/talgo/data_structures/list/singly_linked_list.ts | /tmp/talgo_sweep/singly_linked_list.nolink.ts → /tmp/talgo_sweep/singly_linked_list.sai | PASS | — |
 | 8 | /tmp/talgo/data_structures/queue/linked_queue.ts | /tmp/talgo_sweep/linked_queue.nolink.ts → /tmp/talgo_sweep/linked_queue.sai | PASS | — |
-| 9 | /tmp/talgo/data_structures/list/doubly_linked_list.ts | /tmp/talgo_sweep/doubly_linked_list.nolink.ts → /tmp/talgo_sweep/doubly_linked_list.sai | CHECK-FAIL | `CapabilityMismatch` in `@DoublyLinkedList_push` |
-| 10 | /tmp/talgo/data_structures/set/map_set.ts | /tmp/talgo_sweep/map_set.nolink.ts → /tmp/talgo_sweep/map_set.sai | CHECK-FAIL | `UnknownRegister: callee is not declared` in `@MapSet_ctor` |
+| 9 | /tmp/talgo/data_structures/list/doubly_linked_list.ts | /tmp/talgo_sweep/doubly_linked_list.nolink.ts → /tmp/talgo_sweep/doubly_linked_list.sai | PASS | 构造器预扫描记录参数，前向`new`短参补齐 |
+| 10 | /tmp/talgo/data_structures/set/map_set.ts | /tmp/talgo_sweep/map_set.nolink.ts → /tmp/talgo_sweep/map_set.sai | PASS | 抽象方法`panic`桩+`Map.getSize` |
 | 11 | /tmp/talgo/data_structures/stack/stack.ts | /tmp/talgo_sweep/stack.nolink.ts → /tmp/talgo_sweep/stack.sai | PASS | prologue 改 emitMove 后通过 |
-| 12 | /tmp/talgo/data_structures/tries/tries.ts | /tmp/talgo_sweep/tries.nolink.ts → /tmp/talgo_sweep/tries.sai | CHECK-FAIL | `FallthroughForbidden` 在 `@export sa_btree_map_range`（extern 声明被当函数体 lower？） |
+| 12 | /tmp/talgo/data_structures/tries/tries.ts | /tmp/talgo_sweep/tries.nolink.ts → /tmp/talgo_sweep/tries.sai | PASS | 字段初始化回放（合成默认ctor）+分支臂标记隔离（实为宿主btree导入后的文件作用域发射问题，已修） |
 | 13 | /tmp/talgo/data_structures/tree/binary_search_tree.ts | /tmp/talgo_sweep/binary_search_tree.nolink.ts → /tmp/talgo_sweep/binary_search_tree.sai | PASS | 箭头参数 `[]` 后缀 + self_call 免释放 + 短调用补0 + panic(1) + while(true) + prologue move |
 | 14 | /tmp/talgo/data_structures/queue/circular_queue.ts | /tmp/talgo_sweep/circular_queue.nolink.ts → /tmp/talgo_sweep/circular_queue.sai | PASS | 动态 `new Array(size)` 经 mem_set 补齐 |
 | 15 | /tmp/talgo/data_structures/disjoint_set/disjoint_set.ts | /tmp/talgo_sweep/disjoint_set.nolink.ts → /tmp/talgo_sweep/disjoint_set.sai | PASS | `Array.from`/`fill`+`+=`/`[a,b]=[b,a]`补齐 |
@@ -28,7 +28,7 @@
 | 18 | /tmp/talgo/data_structures/stack/linked_list_stack.ts | /tmp/talgo_sweep/linked_list_stack.nolink.ts → /tmp/talgo_sweep/linked_list_stack.sai | LOWER-ERR | `new of unknown type 'SinglyLinkedList'`（跨文件 import 类）+ `26:10` 泛型 colon |
 | 19 | /tmp/talgo/data_structures/queue/stack_queue.ts | /tmp/talgo_sweep/stack_queue.nolink.ts → /tmp/talgo_sweep/stack_queue.sai | LOWER-ERR | `new of unknown type 'Stack'`（同上跨文件 new）+ `property access on undefined variable 'this'` |
 
-## PASS：13/19；lower 通过：16/19
+## PASS：16/19；lower 通过：16/19
 
 ## 修复优先级（JEV jev_rank，ROI）
 
