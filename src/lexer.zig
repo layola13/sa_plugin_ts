@@ -37,6 +37,17 @@ pub const Token = struct {
         keyword_throw,
         keyword_class,
         keyword_extends,
+        keyword_implements,
+        keyword_constructor,
+        keyword_this,
+        keyword_super,
+        keyword_private,
+        keyword_public,
+        keyword_protected,
+        keyword_readonly,
+        keyword_static,
+        keyword_override,
+        keyword_abstract,
         keyword_new,
         keyword_typeof,
         keyword_void,
@@ -57,6 +68,10 @@ pub const Token = struct {
         percent,
         amp_amp,
         pipe_pipe,
+        pipe,
+        less_less,
+        greater_greater,
+        greater_greater_greater,
         less,
         less_equal,
         greater,
@@ -150,6 +165,15 @@ pub const Lexer = struct {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;
                     self.col += 1;
+                    // Strict equality `===` folds to `==`: the subset has no
+                    // separate identity-vs-equality semantics, and without
+                    // this the trailing `=` surfaced as `unexpected token in
+                    // expression: equal` (the top failure across the corpus).
+                    if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.col += 1;
+                        return .{ .tag = .equal_equal, .start = start, .len = 3, .line = start_line, .col = start_col };
+                    }
                     return .{ .tag = .equal_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
                 return .{ .tag = .equal, .start = start, .len = 1, .line = start_line, .col = start_col };
@@ -158,6 +182,12 @@ pub const Lexer = struct {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;
                     self.col += 1;
+                    // Strict inequality `!==` folds to `!=`, mirroring `===`.
+                    if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                        self.pos += 1;
+                        self.col += 1;
+                        return .{ .tag = .bang_equal, .start = start, .len = 3, .line = start_line, .col = start_col };
+                    }
                     return .{ .tag = .bang_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
                 return .{ .tag = .bang, .start = start, .len = 1, .line = start_line, .col = start_col };
@@ -187,6 +217,11 @@ pub const Lexer = struct {
                     self.col += 1;
                     return .{ .tag = .less_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
+                if (self.pos < self.source.len and self.source[self.pos] == '<') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .less_less, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
                 return .{ .tag = .less, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
             '>' => {
@@ -194,6 +229,16 @@ pub const Lexer = struct {
                     self.pos += 1;
                     self.col += 1;
                     return .{ .tag = .greater_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                if (self.pos < self.source.len and self.source[self.pos] == '>') {
+                    self.pos += 1;
+                    self.col += 1;
+                    if (self.pos < self.source.len and self.source[self.pos] == '>') {
+                        self.pos += 1;
+                        self.col += 1;
+                        return .{ .tag = .greater_greater_greater, .start = start, .len = 3, .line = start_line, .col = start_col };
+                    }
+                    return .{ .tag = .greater_greater, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
                 return .{ .tag = .greater, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
@@ -203,7 +248,7 @@ pub const Lexer = struct {
                     self.col += 1;
                     return .{ .tag = .pipe_pipe, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
-                return .{ .tag = .invalid, .start = start, .len = 1, .line = start_line, .col = start_col };
+                return .{ .tag = .pipe, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
             '`' => {
                 // Template literal start
@@ -472,6 +517,17 @@ fn getKeywordTag(text: []const u8) Token.Tag {
     if (std.mem.eql(u8, text, "throw")) return .keyword_throw;
     if (std.mem.eql(u8, text, "class")) return .keyword_class;
     if (std.mem.eql(u8, text, "extends")) return .keyword_extends;
+    if (std.mem.eql(u8, text, "implements")) return .keyword_implements;
+    if (std.mem.eql(u8, text, "constructor")) return .keyword_constructor;
+    if (std.mem.eql(u8, text, "this")) return .keyword_this;
+    if (std.mem.eql(u8, text, "super")) return .keyword_super;
+    if (std.mem.eql(u8, text, "private")) return .keyword_private;
+    if (std.mem.eql(u8, text, "public")) return .keyword_public;
+    if (std.mem.eql(u8, text, "protected")) return .keyword_protected;
+    if (std.mem.eql(u8, text, "readonly")) return .keyword_readonly;
+    if (std.mem.eql(u8, text, "static")) return .keyword_static;
+    if (std.mem.eql(u8, text, "override")) return .keyword_override;
+    if (std.mem.eql(u8, text, "abstract")) return .keyword_abstract;
     if (std.mem.eql(u8, text, "new")) return .keyword_new;
     if (std.mem.eql(u8, text, "typeof")) return .keyword_typeof;
     if (std.mem.eql(u8, text, "void")) return .keyword_void;

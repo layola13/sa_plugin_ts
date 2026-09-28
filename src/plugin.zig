@@ -2890,3 +2890,87 @@ test "sa_plugin_ts runtime results match node-verified expectations" {
         try runRuntimeCase(allocator, sa_path, tc);
     }
 }
+
+test "sa_plugin_ts lowers class ctor/new/method calls via trait downgrade" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class Point {
+        \\  x: i32;
+        \\  y: i32;
+        \\  constructor(x: i32, y: i32) {
+        \\    this.x = x;
+        \\    this.y = y;
+        \\  }
+        \\  sum(): i32 {
+        \\    return this.x + this.y;
+        \\  }
+        \\}
+        \\function main(): i32 {
+        \\  let p = new Point(40, 2);
+        \\  return p.sum();
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+    try std.testing.expect(std.mem.indexOf(u8, result, "@Point_ctor(this: ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "@Point_sum(this: ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @Point_ctor(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @Point_sum(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "store this + 0, x as i32") != null);
+}
+
+test "sa_plugin_ts lowers native Map methods to sa_btree_map calls" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let m = new Map();
+        \\  m.set(1, 100);
+        \\  let v = m.get(1);
+        \\  let h = m.has(1);
+        \\  let s = m.size;
+        \\  m.delete(1);
+        \\  m.clear();
+        \\  return v + h + s;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_insert(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_get(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_contains_key(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_len(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_remove(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_clear(") != null);
+}

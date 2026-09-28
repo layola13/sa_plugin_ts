@@ -46,6 +46,12 @@ pub const Variable = struct {
     /// only itself. Releasing a register defined in a sibling branch, at a
     /// merge point, fails with "register is not declared in the current scope".
     def_block: u32 = 0,
+    /// The variable was declared with an array type (`T[]`) or initialized
+    /// with an array literal / `new Array(n)` / array-returning call, so it
+    /// holds a `{ptr, len}` slice header. Scalar `number` and `number[]`
+    /// share the same base type name (the suffix is stripped), so method
+    /// dispatch (`.push`, `.pop`, ...) keys off this flag, not the name.
+    is_array: bool = false,
 };
 
 pub const Scope = struct {
@@ -109,9 +115,10 @@ pub const ScopeManager = struct {
                 var i = scope.variables.items.len;
                 while (i > 0) {
                     i -= 1;
-                    const v = scope.variables.items[i];
-                    if (v.is_heap_allocated and !v.is_consumed) {
+                    const v = &scope.variables.items[i];
+                    if (v.is_heap_allocated and !v.is_consumed and !v.is_released) {
                         try lowerer.emit("    !{s}\n", .{v.reg});
+                        v.is_released = true;
                     }
                 }
             }
