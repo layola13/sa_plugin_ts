@@ -1398,8 +1398,9 @@ pub const Parser = struct {
             self.current = saved_current;
             self.peek = saved_peek;
             self.template_lexer_mode = saved_tpl;
-            try self.lowerer.emit("    {s} = {s}\n", .{ prm.name, dv });
-            self.markRebound(prm.name);
+            // Move semantics: the parameter is a live owned register on
+            // entry, so a raw rebind is RegisterRedefinition.
+            try self.emitMove(prm.name, dv);
             // A replayed arrow leaves its parent-side context allocated but
             // unreferenced (the value is the bare `@cb`): release it, and
             // require the arrow to be captureless (indirect `fn` calls pass a
@@ -2531,9 +2532,20 @@ pub const Parser = struct {
                         try self.expect(.identifier);
                         pt = self.tokenText(tt);
                         try self.skipGenericArgs();
+                        var arr_pairs: u32 = 0;
                         while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                             try self.advance(); // [
                             try self.advance(); // ]
+                            arr_pairs += 1;
+                        }
+                        if (arr_pairs > 0) {
+                            const buf = try self.allocator.alloc(u8, pt.len + arr_pairs * 2);
+                            @memcpy(buf[0..pt.len], pt);
+                            for (0..arr_pairs) |k| {
+                                buf[pt.len + k * 2] = '[';
+                                buf[pt.len + k * 2 + 1] = ']';
+                            }
+                            pt = buf;
                         }
                     }
                     try params.append(.{ .name = pn, .type_name = pt });
@@ -2954,7 +2966,16 @@ pub const Parser = struct {
         const cond = try self.parseExpression();
         try self.expect(.r_paren);
 
-        _ = try self.emitBranchIfFalse(cond, end_label);
+        // A literal condition is not a register (`br 1` is rejected with
+        // UnknownRegister): `while (true)` falls straight into the body,
+        // `while (false)` jumps to the end.
+        if (std.mem.eql(u8, cond, "1") or std.mem.eql(u8, cond, "true")) {
+            // Infinite loop: no branch emitted.
+        } else if (std.mem.eql(u8, cond, "0") or std.mem.eql(u8, cond, "false")) {
+            try self.lowerer.emitJumpTo(end_label);
+        } else {
+            _ = try self.emitBranchIfFalse(cond, end_label);
+        }
         try self.pushLoopTargets(end_label, loop_label);
 
         if (self.current.tag == .l_brace) {
@@ -3568,10 +3589,14 @@ pub const Parser = struct {
         try self.expect(.keyword_throw);
         const val = try self.parseExpression();
         _ = try self.accept(.semicolon);
-        // SA-ASM has no `throw`: its closest terminator is `panic`, which
-        // aborts. `try`/`catch` therefore cannot reproduce JS exception
-        // semantics and lower to a jump-based approximation.
-        try self.lowerer.emitTerm("    panic {s}\n", .{val});
+        // SA-ASM has no `throw`: its closest terminator is the `panic(code)`
+        // call form (mirroring sa_plugin_sla's `panic(1)`/`panic(87)`; the bare
+        // `panic reg` instruction shape is rejected with ForbiddenSyntax).
+        // `try`/`catch` therefore cannot reproduce JS exception semantics and
+        // lower to a jump-based approximation. `panic` aborts, so the dead
+        // `val` needs no release.
+        _ = val;
+        try self.lowerer.emitTerm("    panic(1)\n", .{});
     }
 
     // ==========================================
@@ -5760,7 +5785,12 @@ pub const Parser = struct {
                     self.last_arrow_ctx = null;
                 }
                 try self.lowerer.emit(")\n", .{});
-                try self.lowerer.emit("    !{s}\n", .{borrow_ctx});
+                // Self-recursion passes the callback's own `ctx`: the shared
+                // exit sequence owns its single release, so skip the trailing
+                // borrow release here (per ArrowAlias.self_call). Emitting it
+                // desyncs branch joins (`cond ? a : self(...)` leaves one arm
+                // Consumed and the other Active -> PhiStateConflict).
+                if (!alias.self_call) try self.lowerer.emit("    !{s}\n", .{borrow_ctx});
             } else {
                 try self.lowerer.emit("    call @{s}(", .{name});
                 // Arrow closure context travels immediately after the callback
@@ -6547,9 +6577,24 @@ pub const Parser = struct {
                                 // Same generic/`T[]` skip as the probe above;
                                 // the probe already validated the shape.
                                 try self.skipGenericArgs();
+                                var arr_pairs: u32 = 0;
                                 while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                                     try self.advance(); // [
                                     try self.advance(); // ]
+                                    arr_pairs += 1;
+                                }
+                                // Keep the `[]` suffixes: without them an
+                                // array param (`arr: number[]`) declares as a
+                                // scalar, so `arr.push()` inside the body
+                                // misses the Array path and desyncs the parse.
+                                if (arr_pairs > 0) {
+                                    const buf = try self.allocator.alloc(u8, pt.len + arr_pairs * 2);
+                                    @memcpy(buf[0..pt.len], pt);
+                                    for (0..arr_pairs) |k| {
+                                        buf[pt.len + k * 2] = '[';
+                                        buf[pt.len + k * 2 + 1] = ']';
+                                    }
+                                    pt = buf;
                                 }
                             }
                             var p_def: ?[]const u8 = null;
@@ -7503,7 +7548,9 @@ pub const Parser = struct {
                     self.last_arrow_ctx = null;
                 }
                 try self.lowerer.emit(")\n", .{});
-                try self.lowerer.emit("    !{s}\n", .{borrow_ctx_v});
+                // Same self-call rule as the statement path above: the
+                // callback's own `ctx` outlives the call.
+                if (!alias.self_call) try self.lowerer.emit("    !{s}\n", .{borrow_ctx_v});
             } else {
                 try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, left });
                 // Same convention as the statement-level call path: `^ctx`
