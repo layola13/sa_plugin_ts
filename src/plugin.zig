@@ -1889,6 +1889,42 @@ test "sa_plugin_ts lowers [a, b] = [b, a] swaps via frozen moves" {
     try std.testing.expect(std.mem.indexOf(u8, swp, "a = t_") != null);
 }
 
+test "sa_plugin_ts lowers this.compare() via call_indirect on the fn field" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class A {
+        \\  cmp: (a: i32, b: i32) => boolean
+        \\  constructor(c: (a: i32, b: i32) => boolean = (a, b) => a) {
+        \\    this.cmp = c
+        \\  }
+        \\  f(a: i32, b: i32): boolean {
+        \\    return this.cmp(a, b)
+        \\  }
+        \\  g(x: i32): i32 {
+        \\    return x
+        \\  }
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const ind = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Single-slot vtable materializes the code pointer ...
+    try std.testing.expect(std.mem.indexOf(u8, ind, "vtable { call = @") != null);
+    // ... loaded from the field and invoked indirectly.
+    try std.testing.expect(std.mem.indexOf(u8, ind, "call_indirect ") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

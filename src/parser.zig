@@ -829,14 +829,97 @@ pub const Parser = struct {
     /// Declaration form (`const [a, b] = ...`) stays with parseLet; here
     /// every LHS name must already exist. RHS expressions all evaluate
     /// into fresh temps first, so self-swaps read the old values.
+    /// Array destructuring assignment: `[a, b] = [x, y]` (swap idiom),
+    /// also with member/indexed targets (`[this.h[i], k] = [...]`).
+    /// Declaration form (`const [a, b] = ...`) stays with parseLet; plain
+    /// identifier targets must already exist. Addresses evaluate before
+    /// the RHS freezes, stores happen after (swap-safe).
     fn parseArrayDestructure(self: *Parser) anyerror!void {
+        const Target = union(enum) {
+            ident: []const u8,
+            member: struct { base: []const u8, off: u32, sa_ty: []const u8 },
+            indexed: struct { header: []const u8, sa_elem: []const u8, esz: u32, index: []const u8 },
+        };
         try self.expect(.l_bracket);
-        var names = std.ArrayList([]const u8).init(self.allocator);
-        defer names.deinit();
+        var targets = std.ArrayList(Target).init(self.allocator);
+        defer targets.deinit();
         while (true) {
-            const ntok = self.current;
-            try self.expect(.identifier);
-            try names.append(self.tokenText(ntok));
+            // Base: identifier or `this`.
+            var base: []const u8 = undefined;
+            if (self.current.tag == .keyword_this) {
+                base = "this";
+                try self.advance();
+            } else {
+                const ntok = self.current;
+                try self.expect(.identifier);
+                base = self.tokenText(ntok);
+            }
+            // Optional `.field` segments (one level: `this.heap`).
+            var seg: ?[]const u8 = null;
+            var fld_off: u32 = 0;
+            var fld_ty: []const u8 = "i32";
+            while (self.current.tag == .dot) {
+                try self.advance();
+                const stok = self.current;
+                try self.expect(.identifier);
+                if (seg != null) {
+                    _ = try self.refuseAt(
+                        "error: destructuring target nesting too deep",
+                        .{},
+                        error.DestructuringTooDeep,
+                    );
+                    return error.DestructuringTooDeep;
+                }
+                seg = self.tokenText(stok);
+                const lv = self.scope_manager.lookup(base) orelse {
+                    std.debug.print("error:{d}:{d}: property access on undefined variable '{s}'\n", .{ stok.line, stok.col, base });
+                    return error.UndefinedVariable;
+                };
+                const layout = self.layout_table.find(lv.type_name) orelse return error.TypeIsNotAnInterface;
+                var found = false;
+                for (layout.fields.items) |fld| {
+                    if (std.mem.eql(u8, fld.name, seg.?)) {
+                        fld_off = fld.offset;
+                        fld_ty = fld.type_name;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return error.UnknownField;
+                base = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ base, seg.? });
+            }
+            if (self.current.tag == .l_bracket) {
+                // Indexed target: `arr[i]` or `this.heap[i]`.
+                try self.advance();
+                const index = try self.parseExpression();
+                try self.expect(.r_bracket);
+                // Resolve the slice header register and element stride.
+                var header: []const u8 = undefined;
+                var elem: []const u8 = "i32";
+                if (seg) |_| {
+                    // Member base: load the header through the object.
+                    const dot = std.mem.indexOf(u8, base, ".") orelse return error.UndefinedVariable;
+                    const obj = base[0..dot];
+                    if (self.scope_manager.lookup(obj) == null) return error.UndefinedVariable;
+                    header = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + {d} as ptr\n", .{ header, obj, fld_off });
+                    elem = elementTypeOf(fld_ty);
+                } else {
+                    if (self.scope_manager.lookup(base)) |bv| elem = elementTypeOf(bv.type_name);
+                    header = base;
+                }
+                var esz: u32 = 4;
+                var eal: u32 = 4;
+                try getTypeSizeAndAlign(elem, &esz, &eal);
+                try targets.append(.{ .indexed = .{ .header = header, .sa_elem = saTypeOf(elem), .esz = esz, .index = index } });
+            } else if (seg) |_| {
+                // Plain member target: `this.x`.
+                const dot = std.mem.indexOf(u8, base, ".") orelse return error.UndefinedVariable;
+                const obj = base[0..dot];
+                try targets.append(.{ .member = .{ .base = obj, .off = fld_off, .sa_ty = saTypeOf(fld_ty) } });
+            } else {
+                try targets.append(.{ .ident = base });
+            }
             if (!(try self.accept(.comma))) break;
             if (self.current.tag == .r_bracket) break;
         }
@@ -860,20 +943,36 @@ pub const Parser = struct {
         }
         try self.expect(.r_bracket);
         _ = try self.accept(.semicolon);
-        if (names.items.len != tmps.items.len) {
-            std.debug.print("error:{d}:{d}: destructuring arity mismatch: {d} names but {d} values\n", .{
-                self.current.line, self.current.col, names.items.len, tmps.items.len,
+        if (targets.items.len != tmps.items.len) {
+            std.debug.print("error:{d}:{d}: destructuring arity mismatch: {d} targets but {d} values\n", .{
+                self.current.line, self.current.col, targets.items.len, tmps.items.len,
             });
             return error.DestructuringArityMismatch;
         }
-        for (names.items, tmps.items) |n, t| {
-            if (self.scope_manager.lookup(n) == null) {
-                std.debug.print("error:{d}:{d}: assignment to undefined variable '{s}'\n", .{
-                    self.current.line, self.current.col, n,
-                });
-                return error.UndefinedVariable;
+        for (targets.items, tmps.items) |tg, t| {
+            switch (tg) {
+                .ident => |n| {
+                    if (self.scope_manager.lookup(n) == null) {
+                        std.debug.print("error:{d}:{d}: assignment to undefined variable '{s}'\n", .{
+                            self.current.line, self.current.col, n,
+                        });
+                        return error.UndefinedVariable;
+                    }
+                    try self.emitMove(n, t);
+                },
+                .member => |m| {
+                    try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ m.base, m.off, t, m.sa_ty });
+                },
+                .indexed => |ix| {
+                    const data = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, ix.header });
+                    const off = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off, ix.index, ix.esz });
+                    const addr = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr, data, off });
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr, t, ix.sa_elem });
+                },
             }
-            try self.emitMove(n, t);
         }
     }
 
@@ -1418,6 +1517,27 @@ pub const Parser = struct {
         return try self.allocator.dupe(u8, src[start..clamped]);
     }
 
+    /// Materialize a captureless callback as an `fn` value: a file-scope
+    /// single-slot vtable plus a register holding the loaded code pointer.
+    /// Callers pass/store the register and invoke via `call_indirect`
+    /// with a fresh empty context. Capturing callbacks are loud errors
+    /// (their context box cannot travel in a bare code pointer).
+    fn fnPtrForCb(self: *Parser, cb_name: []const u8) anyerror![]const u8 {
+        if (!self.captureless_cb.contains(cb_name)) {
+            _ = try self.refuseAt(
+                "error: capturing arrow as `fn` value: only captureless arrows lower as `fn` values",
+                .{},
+                error.CapturingArrowAsFnValue,
+            );
+            return error.CapturingArrowAsFnValue;
+        }
+        const vt_name = try std.fmt.allocPrint(self.allocator, "VT_{s}", .{cb_name[1..]});
+        try self.lowerer.emitVTableFn(vt_name, cb_name);
+        const fpreg = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s}+0 as ptr\n", .{ fpreg, vt_name });
+        return fpreg;
+    }
+
     /// Replay saved `= default` slices in the callee prologue: a parameter
     /// holding `0` (padded by a short call) is reassigned the default value.
     /// Runs after `this`/params are declared, so defaults may reference them
@@ -1451,24 +1571,22 @@ pub const Parser = struct {
             self.current = saved_current;
             self.peek = saved_peek;
             self.template_lexer_mode = saved_tpl;
+            // A replayed arrow is an `fn` value (bare `@cb` is not a valid
+            // operand): materialize the code pointer first, then move it
+            // into the parameter. The parent-side context box is released
+            // below; captureless-only, since indirect `fn` calls pass a
+            // fresh empty context.
+            var dv_val: []const u8 = dv;
+            var dv_fpreg: ?[]const u8 = null;
+            if (std.mem.startsWith(u8, dv, "@closure_callback_")) {
+                dv_fpreg = try self.fnPtrForCb(dv);
+                dv_val = dv_fpreg.?;
+            }
             // Move semantics: the parameter is a live owned register on
             // entry, so a raw rebind is RegisterRedefinition.
-            try self.emitMove(prm.name, dv);
-            // A replayed arrow leaves its parent-side context allocated but
-            // unreferenced (the value is the bare `@cb`): release it, and
-            // require the arrow to be captureless (indirect `fn` calls pass a
-            // fresh empty context, which only captureless callbacks tolerate).
-            if (std.mem.startsWith(u8, dv, "@closure_callback_")) {
+            try self.emitMove(prm.name, dv_val);
+            if (dv_fpreg != null) {
                 if (self.last_arrow_ctx) |actx| {
-                    if (!self.captureless_cb.contains(dv)) {
-                        self.last_arrow_ctx = saved_ctx;
-                        _ = try self.refuseAt(
-                            "error: capturing arrow as parameter default: only captureless arrows lower as `fn` values",
-                            .{},
-                            error.CapturingArrowAsFnValue,
-                        );
-                        return error.CapturingArrowAsFnValue;
-                    }
                     const borrow = if (actx.len > 0 and actx[0] == '^') actx[1..] else actx;
                     try self.lowerer.emit("    !{s}\n", .{borrow});
                 }
@@ -4435,6 +4553,53 @@ pub const Parser = struct {
         return dest;
     }
 
+    /// Indirect call through an `fn`-typed field (`this.compare(a, b)`):
+    /// the field holds a code pointer (vtable-materialized at the arrow
+    /// decay site). A fresh empty context is passed, so only captureless
+    /// callbacks are valid callees (enforced where the pointer is made).
+    /// Returns a temp holding the `i32` result.
+    fn lowerFnFieldCall(self: *Parser, left: []const u8, off: u32) anyerror![]const u8 {
+        try self.expect(.l_paren);
+        var args = std.ArrayList([]const u8).init(self.allocator);
+        defer args.deinit();
+        while (self.current.tag != .r_paren and self.current.tag != .eof) {
+            const a = try self.parseExpression();
+            try args.append(try self.argReg(a));
+            _ = try self.accept(.comma);
+        }
+        try self.expect(.r_paren);
+        const f = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + {d} as ptr\n", .{ f, left, off });
+        const ctx = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 8\n", .{ctx});
+        const v = try self.newTemp();
+        try self.lowerer.emit("    {s} = call_indirect {s}(", .{ v, f });
+        for (args.items) |a| {
+            try self.lowerer.emit("{s}, ", .{a});
+        }
+        try self.lowerer.emit("{s})\n", .{ctx});
+        // No explicit context release: unlike direct calls (borrow), an
+        // indirect call moves its operands, so the fresh box is consumed
+        // by the call itself (a `!ctx` here is UseAfterMove).
+        return v;
+    }
+
+    /// Offset of `member` in `left`'s layout when it is an `fn`-typed
+    /// field (type text contains `=>`), else null (normal paths apply).
+    fn fnFieldOffset(self: *Parser, left: []const u8, member: []const u8) ?u32 {
+        const lv = self.scope_manager.lookup(left) orelse return null;
+        const layout = self.layout_table.find(lv.type_name) orelse return null;
+        for (layout.fields.items) |fld| {
+            if (std.mem.eql(u8, fld.name, member)) {
+                // `fn`-typed fields (layout pre-scan normalizes arrow
+                // types to the literal `"fn"`) hold code pointers.
+                if (std.mem.eql(u8, fld.type_name, "fn") or std.mem.indexOf(u8, fld.type_name, "=>") != null) return fld.offset;
+                return null;
+            }
+        }
+        return null;
+    }
+
     fn lowerArrayPush(self: *Parser, arr: []const u8, val: []const u8) anyerror![]const u8 {
         var elem_type: []const u8 = "i32";
         if (self.scope_manager.lookup(arr)) |av| {
@@ -5652,6 +5817,11 @@ pub const Parser = struct {
                 }
                 self.last_arrow_required = req_count;
             }
+            // Captureless callbacks lower as `fn` values (vtable + indirect
+            // call); record for the default-replay and decay sites.
+            if (captures.items.len == 0) {
+                try self.captureless_cb.put(cb_name, {});
+            }
             return cb_name;
         }
         try self.scope_manager.exitScope(self.lowerer);
@@ -5706,6 +5876,9 @@ pub const Parser = struct {
                 if (!pp.optional) req_count += 1;
             }
             self.last_arrow_required = req_count;
+        }
+        if (captures.items.len == 0) {
+            try self.captureless_cb.put(cb_name, {});
         }
 
         return cb_name;
@@ -7581,6 +7754,15 @@ pub const Parser = struct {
                     // helper, not a slice method. A user-declared `Array`
                     // keeps the normal method path.
                     return try self.lowerArrayFrom();
+                } else if (std.mem.eql(u8, left, "Math") and self.scope_manager.lookup(left) == null) {
+                    // `Math.*` silently miscompiled to empty output (member
+                    // recovery swallowed it): refuse loudly instead.
+                    _ = try self.refuseAt(
+                        "error: Math.{s} is not supported",
+                        .{member_name},
+                        error.MathNotSupported,
+                    );
+                    return error.MathNotSupported;
                 } else if (std.mem.eql(u8, member_name, "charCodeAt")) {
                     // `s.charCodeAt(i)`: byte load from the string slice.
                     try self.expect(.l_paren);
@@ -7589,6 +7771,11 @@ pub const Parser = struct {
                     return try self.lowerStringCharCodeAt(left, idx);
                 } else if (self.isArrayVar(left)) {
                     return try self.lowerArrayMethodCall(left, member_name);
+                } else if (self.fnFieldOffset(left, member_name)) |off| {
+                    // `this.compare(a, b)`: indirect call through a stored
+                    // code pointer (placed before the class-method lookup so
+                    // a field does not fall into UnknownMethod recovery).
+                    return try self.lowerFnFieldCall(left, off);
                 } else if (self.scope_manager.lookup(left)) |lv| blk: {
                     const key = try self.methodKey(lv.type_name, member_name);
                     if (!self.class_methods.contains(key)) break :blk;

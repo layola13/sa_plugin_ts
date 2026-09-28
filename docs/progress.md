@@ -24,7 +24,7 @@
 | 14 | /tmp/talgo/data_structures/queue/circular_queue.ts | /tmp/talgo_sweep/circular_queue.nolink.ts → /tmp/talgo_sweep/circular_queue.sai | PASS | 动态 `new Array(size)` 经 mem_set 补齐 |
 | 15 | /tmp/talgo/data_structures/disjoint_set/disjoint_set.ts | /tmp/talgo_sweep/disjoint_set.nolink.ts → /tmp/talgo_sweep/disjoint_set.sai | PASS | `Array.from`/`fill`+`+=`/`[a,b]=[b,a]`补齐 |
 | 16 | /tmp/talgo/data_structures/set/hash_map_set.ts | /tmp/talgo_sweep/hash_map_set.nolink.ts → /tmp/talgo_sweep/hash_map_set.sai | LOWER-ERR | `class extends is not supported yet`（`extends MapSet` 跨文件父类 + `protected` + 抽象 `initMap`） |
-| 17 | /tmp/talgo/data_structures/heap/heap.ts | /tmp/talgo_sweep/heap.nolink.ts → /tmp/talgo_sweep/heap.sai | LOWER-ERR | `class extends is not supported yet` ×3（Min/MaxHeap/PriorityQueue + `super()`/`super.m()` + fn 字段 `this.compare` 间接调用） |
+| 17 | /tmp/talgo/data_structures/heap/heap.ts | /tmp/talgo_sweep/heap.nolink.ts → /tmp/talgo_sweep/heap.sai | LOWER-ERR | `class extends` ×3（Min/MaxHeap/PriorityQueue + `super()`/`super.m()` + 方法覆写）+ sinkDown/getChild等方法头 colon（`this.compare`间接调用与索引解构已通；`Math.*`改明确拒绝） |
 | 18 | /tmp/talgo/data_structures/stack/linked_list_stack.ts | /tmp/talgo_sweep/linked_list_stack.nolink.ts → /tmp/talgo_sweep/linked_list_stack.sai | LOWER-ERR | `new of unknown type 'SinglyLinkedList'`（跨文件 import 类）+ `26:10` 泛型 colon |
 | 19 | /tmp/talgo/data_structures/queue/stack_queue.ts | /tmp/talgo_sweep/stack_queue.nolink.ts → /tmp/talgo_sweep/stack_queue.sai | LOWER-ERR | `new of unknown type 'Stack'`（同上跨文件 new）+ `property access on undefined variable 'this'` |
 

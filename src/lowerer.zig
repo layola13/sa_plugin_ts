@@ -17,6 +17,10 @@ pub const Lowerer = struct {
     /// Arity-matched `@extern` names already declared in the header.
     externs: std.StringHashMapUnmanaged(void) = .{},
 
+    /// Single-slot `@const ... = vtable { call = @cb }` names already
+    /// declared in the header (fn-pointer materialization).
+    vtables: std.StringHashMapUnmanaged(void) = .{},
+
     /// Out-of-line arrow closure callbacks. Arrows are parsed mid-function but
     /// SA-ASM has no nested functions: emitting the callback inline splits the
     /// parent's basic block (FallthroughForbidden). Callbacks are buffered here
@@ -89,6 +93,7 @@ pub const Lowerer = struct {
         self.imports.deinit();
         self.callbacks.deinit();
         self.externs.deinit(self.allocator);
+        self.vtables.deinit(self.allocator);
         self.label_refs.deinit(self.allocator);
         for (self.succ_names.items) |*l| l.deinit(self.allocator);
         self.succ_names.deinit(self.allocator);
@@ -150,6 +155,16 @@ pub const Lowerer = struct {
             try self.header.writer().print("a{d}: i32", .{i});
         }
         try self.header.appendSlice(") -> i32\n");
+    }
+
+    /// Declare a file-scope single-slot vtable holding one callback, for
+    /// fn-pointer materialization (`f = load VT+0 as ptr`, then
+    /// `call_indirect`). Deduplicated by table name. Position-independent
+    /// like `@extern`: the header precedes the out-of-line callbacks.
+    pub fn emitVTableFn(self: *Lowerer, name: []const u8, cb: []const u8) !void {
+        if (self.vtables.contains(name)) return;
+        try self.vtables.put(self.allocator, name, {});
+        try self.header.writer().print("@const {s} = vtable {{ call = {s} }}\n", .{ name, cb });
     }
 
     /// Mark `name` as needing emission before any branch to it is seen.
