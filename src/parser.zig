@@ -96,6 +96,19 @@ pub const ArrowParam = struct {
 pub const MethodParam = struct {
     name: []const u8,
     type_name: []const u8,
+    /// `constructor(public x: T)`: the parameter declares a field that the
+    /// pre-scan registers in the layout and the ctor body stores.
+    is_property: bool = false,
+    /// `?` marker or `= default`: missing args pad with `0` at `new`.
+    optional: bool = false,
+};
+
+/// Stored constructor/method parameter for call padding and `extends`
+/// forwarder emission.
+pub const StoredParam = struct {
+    name: []const u8,
+    type_name: []const u8,
+    optional: bool = false,
 };
 
 /// Trait-downgrade method signature: emit name is `Class_method`, and void
@@ -106,6 +119,9 @@ pub const MethodParam = struct {
 pub const MethodSig = struct {
     is_void: bool = false,
     ret: ?[]const u8 = null,
+    /// Positional parameter types for forwarder emission and `new` arity
+    /// padding (`new TreeNode(data)` vs a 3-param ctor with 2 optional).
+    params: ?[]StoredParam = null,
 };
 
 pub const ArrowAlias = struct {
@@ -476,6 +492,18 @@ pub const Parser = struct {
         } else if (std.mem.eql(u8, type_name, "ptr")) {
             size.* = 8;
             align_val.* = 8;
+        } else if (std.mem.eql(u8, type_name, "u8") or std.mem.eql(u8, type_name, "i8")) {
+            // `for (const ch of str)` binds bytes: 1-byte stride keeps
+            // string iteration packed (the 8-byte fallback read 8 chars
+            // per step and skipped most of the input).
+            size.* = 1;
+            align_val.* = 1;
+        } else if (std.mem.eql(u8, type_name, "u16") or std.mem.eql(u8, type_name, "i16")) {
+            size.* = 2;
+            align_val.* = 2;
+        } else if (std.mem.eql(u8, type_name, "i64") or std.mem.eql(u8, type_name, "u64")) {
+            size.* = 8;
+            align_val.* = 8;
         } else {
             size.* = 8;
             align_val.* = 8;
@@ -707,6 +735,8 @@ pub const Parser = struct {
                     };
                 } else if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "export")) {
                     try self.advance();
+                    // `export abstract class`: the modifier sits between.
+                    while (self.current.tag == .keyword_abstract) try self.advance();
                     if (self.current.tag == .keyword_class) {
                         self.parseClass() catch {
                             self.skipToSync();
@@ -831,6 +861,8 @@ pub const Parser = struct {
                 // Check for export keyword
                 if (std.mem.eql(u8, self.currentText(), "export")) {
                     try self.advance(); // skip export
+                    // `export abstract class`: the modifier sits between.
+                    while (self.current.tag == .keyword_abstract) try self.advance();
                     // Parse the exported declaration
                     if (self.current.tag == .keyword_function) {
                         try self.parseFunction();
@@ -868,6 +900,34 @@ pub const Parser = struct {
         // Accept keyword type atoms (`void`/`null`/`undefined`) as well as
         // identifiers (`number`, `string`, `K`, ...).
         var type_name: []const u8 = "i32";
+        // Function type (`(a: T, b: T) => boolean`, incl. parenthesized
+        // callback params): parameters lower as their own registers, so only
+        // the marker survives (ptr-sized slot, like an arrow alias).
+        if (self.current.tag == .l_paren) {
+            try self.advance();
+            var fdepth: usize = 1;
+            while (fdepth > 0 and self.current.tag != .eof) {
+                switch (self.current.tag) {
+                    .l_paren, .l_bracket, .l_brace => fdepth += 1,
+                    .r_paren, .r_bracket, .r_brace => fdepth -= 1,
+                    else => {},
+                }
+                try self.advance();
+            }
+            _ = try self.accept(.arrow);
+            if (self.current.tag == .l_paren) {
+                _ = try self.parseTypeName();
+            } else if (self.current.tag == .identifier or self.current.tag == .keyword_void) {
+                try self.advance();
+            }
+            return "fn";
+        }
+        // `add(word: string): this`: the receiver's own class.
+        if (self.current.tag == .keyword_this) {
+            try self.advance();
+            if (self.current_class) |cc| return cc;
+            return "ptr";
+        }
         switch (self.current.tag) {
             .identifier => {
                 const name_tok = self.current;
@@ -1142,11 +1202,18 @@ pub const Parser = struct {
     }
 
     /// Skip TS member modifiers (`private/public/protected/readonly/static/override/abstract`).
-    fn skipModifiers(self: *Parser) anyerror!void {
+    /// Returns true when at least one modifier was consumed: in a
+    /// constructor parameter list that marks a parameter property
+    /// (`constructor(public x: T)`), which declares a real layout field.
+    fn skipModifiers(self: *Parser) anyerror!bool {
+        var seen = false;
         while (true) {
             switch (self.current.tag) {
-                .keyword_private, .keyword_public, .keyword_protected, .keyword_readonly, .keyword_static, .keyword_override, .keyword_abstract => try self.advance(),
-                else => return,
+                .keyword_private, .keyword_public, .keyword_protected, .keyword_readonly, .keyword_static, .keyword_override, .keyword_abstract => {
+                    try self.advance();
+                    seen = true;
+                },
+                else => return seen,
             }
         }
     }
@@ -1162,11 +1229,11 @@ pub const Parser = struct {
         var params = std.ArrayList(MethodParam).init(self.allocator);
         try self.expect(.l_paren);
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
-            try self.skipModifiers();
+            const had_mod = try self.skipModifiers();
             const p_tok = self.current;
             try self.expect(.identifier);
             const p_name = self.tokenText(p_tok);
-            _ = try self.accept(.question);
+            var p_optional = try self.accept(.question);
             var p_type: []const u8 = "i32";
             if (try self.accept(.colon)) {
                 if (self.current.tag == .keyword_void) {
@@ -1177,13 +1244,55 @@ pub const Parser = struct {
                 }
             }
             if (try self.accept(.equal)) {
+                p_optional = true;
                 _ = try self.parseExpression();
             }
-            try params.append(.{ .name = p_name, .type_name = p_type });
+            try params.append(.{ .name = p_name, .type_name = p_type, .is_property = had_mod, .optional = p_optional });
             _ = try self.accept(.comma);
         }
         try self.expect(.r_paren);
         return params;
+    }
+
+    /// Skip `<...>` generic args at a type position (arrow/callback params,
+    /// `as` casts, return annotations). Call only where `<` unambiguously
+    /// opens generics (right after a type name), never in value position
+    /// where `<` could be a comparison.
+    fn skipGenericArgs(self: *Parser) anyerror!void {
+        if (self.current.tag != .less) return;
+        try self.advance();
+        var depth: usize = 1;
+        while (depth > 0 and self.current.tag != .eof) {
+            if (self.current.tag == .less) depth += 1;
+            if (self.current.tag == .greater) depth -= 1;
+            try self.advance();
+        }
+    }
+
+    /// Skip a parameter default value structurally without emitting code.
+    /// The class pre-scan runs before any function body exists, so a real
+    /// `parseExpression` there would emit stray top-level instructions
+    /// (and arrow defaults would register callbacks twice).
+    fn skipBalancedDefault(self: *Parser) anyerror!void {
+        var depth: usize = 0;
+        while (self.current.tag != .eof) {
+            switch (self.current.tag) {
+                .l_paren, .l_bracket, .l_brace => {
+                    depth += 1;
+                    try self.advance();
+                },
+                .r_paren, .r_bracket, .r_brace => {
+                    if (depth == 0) return;
+                    depth -= 1;
+                    try self.advance();
+                },
+                .comma => {
+                    if (depth == 0) return;
+                    try self.advance();
+                },
+                else => try self.advance(),
+            }
+        }
     }
 
     /// Emit a class method or constructor body as `@C_name(this: ptr, ...)` /
@@ -1211,7 +1320,19 @@ pub const Parser = struct {
         const key = try self.methodKey(class_name, method_name);
         const is_void = is_ctor or (ret != null and std.mem.eql(u8, ret.?, "void"));
         const ret_owned: ?[]const u8 = if (ret) |rt| try self.allocator.dupe(u8, rt) else null;
-        try self.class_methods.put(key, .{ .is_void = is_void, .ret = ret_owned });
+        var stored: ?[]StoredParam = null;
+        if (params.items.len > 0) {
+            const arr = try self.allocator.alloc(StoredParam, params.items.len);
+            for (params.items, 0..) |p, idx| {
+                arr[idx] = .{
+                    .name = try self.allocator.dupe(u8, p.name),
+                    .type_name = try self.allocator.dupe(u8, p.type_name),
+                    .optional = p.optional,
+                };
+            }
+            stored = arr;
+        }
+        try self.class_methods.put(key, .{ .is_void = is_void, .ret = ret_owned, .params = stored });
         try self.lowerer.emit("@{s}(this: ptr", .{emit_name});
         for (params.items) |p| {
             try self.lowerer.emit(", {s}: {s}", .{ p.name, saTypeOf(p.type_name) });
@@ -1240,6 +1361,22 @@ pub const Parser = struct {
         }
         try self.advance(); // {
         try self.scope_manager.enterScope();
+        if (is_ctor) {
+            // Constructor parameter properties (`constructor(public x: T)`):
+            // the layout already holds the fields (pre-scan); bind them here
+            // so `new C(v)` stores `v` instead of leaving zeroes.
+            for (params.items) |p| {
+                if (!p.is_property) continue;
+                if (self.layout_table.find(class_name)) |layout| {
+                    for (layout.fields.items) |f| {
+                        if (std.mem.eql(u8, f.name, p.name)) {
+                            try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ "this", f.offset, p.name, saTypeOf(f.type_name) });
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
             try self.parseStatement();
         }
@@ -1313,14 +1450,15 @@ pub const Parser = struct {
             var pre_fields = std.ArrayList(Field).init(self.allocator);
             var pre_offset: u32 = 0;
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
-                try self.skipModifiers();
+                _ = try self.skipModifiers();
                 if (self.current.tag == .keyword_constructor or
                     (self.current.tag == .identifier and self.peek.tag == .l_paren))
                 {
                     // Forward-declare the method so bodies parsed later in
                     // this class (e.g. a ctor calling `this.clear()`) resolve
                     // static dispatch regardless of member order.
-                    const pre_name: []const u8 = if (self.current.tag == .keyword_constructor) "ctor" else self.tokenText(self.current);
+                    const is_ctor_pre = self.current.tag == .keyword_constructor;
+                    const pre_name: []const u8 = if (is_ctor_pre) "ctor" else self.tokenText(self.current);
                     const pre_key = try self.methodKey(class_name, pre_name);
                     if (!self.class_methods.contains(pre_key)) {
                         try self.class_methods.put(pre_key, .{});
@@ -1335,8 +1473,48 @@ pub const Parser = struct {
                             try self.advance();
                         }
                     }
+                    if (is_ctor_pre and self.current.tag == .l_paren) {
+                        // Constructor parameter properties (`public x: T`) are
+                        // real fields: collect them into the layout in member
+                        // order so `this.x` resolves in every method body.
+                        // Defaults skip structurally (no emission pre-body).
+                        try self.expect(.l_paren);
+                        while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                            const pp_had_mod = try self.skipModifiers();
+                            const pp_tok = self.current;
+                            try self.expect(.identifier);
+                            const pp_name = self.tokenText(pp_tok);
+                            _ = try self.accept(.question);
+                            var pp_type: []const u8 = "i32";
+                            if (try self.accept(.colon)) {
+                                if (self.current.tag == .keyword_void) {
+                                    try self.advance();
+                                    pp_type = "void";
+                                } else {
+                                    pp_type = try self.parseTypeName();
+                                }
+                            }
+                            if (try self.accept(.equal)) {
+                                try self.skipBalancedDefault();
+                            }
+                            if (pp_had_mod) {
+                                var pp_size: u32 = 8;
+                                var pp_align: u32 = 8;
+                                try getTypeSizeAndAlign(pp_type, &pp_size, &pp_align);
+                                pre_offset = alignTo(pre_offset, pp_align);
+                                try pre_fields.append(.{
+                                    .name = try self.allocator.dupe(u8, pp_name),
+                                    .offset = pre_offset,
+                                    .type_name = try self.allocator.dupe(u8, pp_type),
+                                });
+                                pre_offset += pp_size;
+                            }
+                            _ = try self.accept(.comma);
+                        }
+                        try self.expect(.r_paren);
+                        // Skip return annotation up to `{` or `;`, then the body.
+                    } else if (self.current.tag == .l_paren) {
                     // Skip `(params)` with nesting (defaults may nest brackets).
-                    if (self.current.tag == .l_paren) {
                         try self.advance();
                         var pd: usize = 1;
                         while (pd > 0 and self.current.tag != .eof) {
@@ -1521,7 +1699,7 @@ pub const Parser = struct {
         var fields = std.ArrayList(Field).init(self.allocator);
         var offset: u32 = 0;
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
-            try self.skipModifiers();
+            _ = try self.skipModifiers();
             if (self.current.tag == .keyword_constructor) {
                 try self.advance();
                 try self.emitClassMethod(class_name, "ctor", true);
@@ -1764,16 +1942,59 @@ pub const Parser = struct {
 
         try self.expect(.equal);
 
-        if (try self.accept(.l_brace)) {
+        // `{...}` initializers dispatch on the annotation: a known struct
+        // layout builds inline, Map/Record constructs a btree, otherwise
+        // (unannotated, e.g. `{ value: item } as Node<T>`) the generic
+        // expression path below handles it. Peek only here; each path
+        // consumes the brace itself.
+        var obj_struct = false;
+        var obj_map = false;
+        if (self.current.tag == .l_brace) {
+            if (type_name) |t_name| {
+                if (std.mem.eql(u8, t_name, "Map") or std.mem.eql(u8, t_name, "Record")) {
+                    obj_map = true;
+                } else if (self.layout_table.find(t_name) != null) {
+                    obj_struct = true;
+                }
+            }
+        }
+        if (obj_struct) {
+            try self.advance(); // {
             // Object literal initialization
-            const t_name = type_name orelse return error.TypeAnnotationRequiredForObjectLiteral;
-            const layout = self.layout_table.find(t_name) orelse return error.UnknownInterface;
+            const t_name = type_name.?;
+            const layout = self.layout_table.find(t_name).?;
 
             try self.scope_manager.declareVar(var_name, t_name, var_name, true);
 
             try self.lowerer.emit("    {s} = alloc {d}\n", .{ var_name, layout.size });
 
             try self.parseStructLiteralFields(var_name, layout);
+        } else if (obj_map) {
+            try self.advance(); // {
+            // Map/Record literal: fresh btree, then one insert per entry.
+            // (`children = {}` is the empty case; entries work the same.)
+            try self.lowerer.emitImport("sa_std/btree_map.sa");
+            try self.scope_manager.declareVar(var_name, "Map", var_name, true);
+            try self.lowerer.emit("    {s} = call @sa_btree_map_new()\n", .{var_name});
+            while (self.current.tag != .r_brace and self.current.tag != .eof) {
+                var ks: []const u8 = "";
+                if (self.current.tag == .identifier and self.peek.tag == .colon) {
+                    // Bare name keys (`{length: n}`) denote strings, not
+                    // variables: materialize the text directly.
+                    const ktok = self.current;
+                    try self.advance();
+                    ks = try self.materializeStringChunk(self.tokenText(ktok));
+                } else {
+                    const kexpr = try self.parseExpression();
+                    ks = try self.mapKeySlice(kexpr);
+                }
+                try self.expect(.colon);
+                const kval = try self.parseExpression();
+                try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ var_name, ks, kval });
+                _ = try self.accept(.comma);
+                _ = try self.accept(.semicolon);
+            }
+            try self.expect(.r_brace);
         } else if (try self.accept(.l_bracket)) {
             // Array literal initialization: let arr = [1, 2, 3]
             // `parseTypeName` keeps `[]` suffixes; the literal's element type
@@ -1975,6 +2196,7 @@ pub const Parser = struct {
                 if (try self.accept(.colon)) {
                     if (self.current.tag != .identifier) return false;
                     try self.advance(); // base type name
+                    try self.skipGenericArgs();
                     while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                         try self.advance(); // [
                         try self.advance(); // ]
@@ -1991,6 +2213,7 @@ pub const Parser = struct {
             try self.advance(); // :
             if (self.current.tag != .identifier and self.current.tag != .keyword_void) return false;
             try self.advance(); // return type name
+            try self.skipGenericArgs();
             while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                 try self.advance(); // [
                 try self.advance(); // ]
@@ -2030,6 +2253,7 @@ pub const Parser = struct {
                         const tt = self.current;
                         try self.expect(.identifier);
                         pt = self.tokenText(tt);
+                        try self.skipGenericArgs();
                         while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                             try self.advance(); // [
                             try self.advance(); // ]
@@ -2054,6 +2278,7 @@ pub const Parser = struct {
                 try self.expect(.identifier);
                 ret_ann = self.tokenText(rt_tok);
                 if (std.mem.eql(u8, ret_ann.?, "string")) ret_is_slice = true;
+                try self.skipGenericArgs();
                 while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                     try self.advance(); // [
                     try self.advance(); // ]
@@ -2659,7 +2884,14 @@ pub const Parser = struct {
                 // Load element: iterable[idx]
                 var fo_elem: []const u8 = "i32";
                 if (self.scope_manager.lookup(iterable)) |iv2| {
-                    fo_elem = elementTypeOf(iv2.type_name);
+                    // Strings iterate bytes (`for (const ch of word)` in the
+                    // Trie): element type `u8` for a 1-byte stride. Slices
+                    // strip one level as before.
+                    if (std.mem.eql(u8, iv2.type_name, "string")) {
+                        fo_elem = "u8";
+                    } else {
+                        fo_elem = elementTypeOf(iv2.type_name);
+                    }
                 }
                 var fo_size: u32 = 4;
                 var fo_align: u32 = 4;
@@ -3214,11 +3446,11 @@ pub const Parser = struct {
                 if (err == error.FileNotFound) {
                     const msg = try std.fmt.allocPrint(
                         self.allocator,
-                        "error: cannot resolve relative import \"{s}\" from \"{s}\"",
+                        "warning: cannot resolve relative import \"{s}\" from \"{s}\": skipped (upstream import; uses stay loud)",
                         .{ path, self.base_dir },
                     );
                     try self.errors.append(.{ .line = path_tok.line, .col = path_tok.col, .message = msg });
-                    std.debug.print("error:{d}:{d}: {s}\n", .{ path_tok.line, path_tok.col, msg });
+                    std.debug.print("warning:{d}:{d}: {s}\n", .{ path_tok.line, path_tok.col, msg });
                     return;
                 }
                 return err;
@@ -3314,6 +3546,8 @@ pub const Parser = struct {
                 };
             } else if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "export")) {
                 try self.advance();
+                // `export abstract class`: the modifier sits between.
+                while (self.current.tag == .keyword_abstract) try self.advance();
                 if (self.current.tag == .keyword_class) {
                     self.parseClass() catch {
                         self.skipToSync();
@@ -3530,7 +3764,9 @@ pub const Parser = struct {
     /// Whether `name` holds a native `Map` (lowered to sa_std/btree_map).
     fn isMapVar(self: *Parser, name: []const u8) bool {
         if (self.scope_manager.lookup(name)) |v| {
-            return std.mem.eql(u8, v.type_name, "Map");
+            // `Record<K, V>` parses to the base name `Record` (generics are
+            // stripped for layout); both spellings hold btree handles.
+            return std.mem.eql(u8, v.type_name, "Map") or std.mem.eql(u8, v.type_name, "Record");
         }
         return false;
     }
@@ -3549,6 +3785,20 @@ pub const Parser = struct {
         }
         if (self.scope_manager.lookup(key)) |v| {
             if (std.mem.eql(u8, v.type_name, "string")) return key;
+        }
+        // Single bytes (`for (const ch of str)` binds `u8`): a 1-byte key
+        // slice, so byte-iteration keys match each other on lookup.
+        if (self.scope_manager.lookup(key)) |v| {
+            if (std.mem.eql(u8, v.type_name, "u8")) {
+                const bytes = try self.newTemp();
+                try self.lowerer.emit("    {s} = alloc 8\n", .{bytes});
+                try self.lowerer.emit("    store {s} + 0, {s} as u8\n", .{ bytes, key });
+                const slice = try self.newTemp();
+                try self.lowerer.emit("    {s} = alloc 16\n", .{slice});
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slice, bytes });
+                try self.lowerer.emit("    store {s} + 8, 1 as u64\n", .{slice});
+                return slice;
+            }
         }
         const bytes = try self.newTemp();
         try self.lowerer.emit("    {s} = alloc 8\n", .{bytes});
@@ -3891,6 +4141,109 @@ pub const Parser = struct {
             try self.lowerer.emitLabel(l_end);
             try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ left, new_len });
             return "0";
+        }
+        if (std.mem.eql(u8, member_name, "shift")) {
+            // `arr.shift()`: drop index 0, slide the rest down, return the
+            // removed element (Talgo `ArrayQueue.dequeue` returns it).
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            var elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
+            const data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, left });
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ out, data, sa_elem });
+            try self.retagTemp(out, elem_type);
+            const new_len = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ new_len, len });
+            const id = self.nextLabelId();
+            const l_top = try std.fmt.allocPrint(self.allocator, "L_sh_top_{d}", .{id});
+            const l_body = try std.fmt.allocPrint(self.allocator, "L_sh_body_{d}", .{id});
+            const l_end = try std.fmt.allocPrint(self.allocator, "L_sh_end_{d}", .{id});
+            try self.lowerer.reserveLabel(l_top);
+            try self.lowerer.reserveLabel(l_body);
+            try self.lowerer.reserveLabel(l_end);
+            const i = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{i});
+            try self.lowerer.emitLabel(l_top);
+            const c = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, new_len });
+            try self.lowerer.emitBranchTo(c, l_body, l_end);
+            try self.lowerer.emitLabel(l_body);
+            const src = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ src, i });
+            const s_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ s_off, src, esz });
+            const s_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ s_addr, data, s_off });
+            const tmp = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ tmp, s_addr, sa_elem });
+            const d_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ d_off, i, esz });
+            const d_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ d_addr, data, d_off });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ d_addr, tmp, sa_elem });
+            const inext = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+            try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
+            self.scope_manager.markConsumed(inext);
+            try self.lowerer.emitJumpTo(l_top);
+            try self.lowerer.emitLabel(l_end);
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ left, new_len });
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "fill")) {
+            // `arr.fill(v)`: store `v` into every slot (`Array(n).fill(1)`).
+            // Returns the array itself, like JS.
+            try self.expect(.l_paren);
+            const fval = try self.parseExpression();
+            try self.expect(.r_paren);
+            var elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
+            const data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, left });
+            const id = self.nextLabelId();
+            const l_top = try std.fmt.allocPrint(self.allocator, "L_fill_top_{d}", .{id});
+            const l_body = try std.fmt.allocPrint(self.allocator, "L_fill_body_{d}", .{id});
+            const l_end = try std.fmt.allocPrint(self.allocator, "L_fill_end_{d}", .{id});
+            try self.lowerer.reserveLabel(l_top);
+            try self.lowerer.reserveLabel(l_body);
+            try self.lowerer.reserveLabel(l_end);
+            const i = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{i});
+            try self.lowerer.emitLabel(l_top);
+            const c = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, len });
+            try self.lowerer.emitBranchTo(c, l_body, l_end);
+            try self.lowerer.emitLabel(l_body);
+            const f_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ f_off, i, esz });
+            const f_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ f_addr, data, f_off });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ f_addr, fval, sa_elem });
+            const inext = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+            try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
+            self.scope_manager.markConsumed(inext);
+            try self.lowerer.emitJumpTo(l_top);
+            try self.lowerer.emitLabel(l_end);
+            return left;
         }
         return error.UnknownMethod;
     }
@@ -4952,6 +5305,10 @@ pub const Parser = struct {
             name = self.tokenText(name_tok);
         }
 
+        // Postfix assertion on a bare name (`currentNode!.next = ...`):
+        // no-op, so the dot/call/index/assign dispatches below see through it.
+        while (self.current.tag == .bang) try self.advance();
+
         if (std.mem.eql(u8, name, "store") and self.current.tag == .identifier) {            // Statement-level intrinsic: `store reg + off, val as Type;`
             // mirrors the SA-ASM instruction (which requires an explicit
             // byte offset) so low-level initialisation can be written inline.
@@ -5157,6 +5514,9 @@ pub const Parser = struct {
             var chain_len: u32 = 0;
             while (self.current.tag == .dot) {
                 try self.advance();
+                // Postfix non-null assertion mid-chain (`this.tail!.next`):
+                // no-op, same as the expression-level `!` skip.
+                while (self.current.tag == .bang) try self.advance();
                 const member_tok = self.current;
                 try self.expect(.identifier);
                 const member_name = self.tokenText(member_tok);
@@ -5209,9 +5569,9 @@ pub const Parser = struct {
                 const field = found_field orelse return error.UnknownField;
 
                 if (self.current.tag == .equal) {
-                    // store obj.field = expr
+                    // store obj.field = expr (chains fold right: `a.b = c.d = v`)
                     try self.advance();
-                    const val = try self.parseExpression();
+                    const val = try self.parseAssignRhs();
                     _ = try self.accept(.semicolon);
                     try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ left_name, field.offset, val, saTypeOf(field.type_name) });
                     return;
@@ -5234,6 +5594,9 @@ pub const Parser = struct {
                     chain_ty = field.type_name;
                     chain_len += 1;
                     left_name = temp_name;
+                    // Postfix assertion after a member (`x.next!.prev`):
+                    // skip it before the next loop-head check.
+                    while (self.current.tag == .bang) try self.advance();
                 }
             }
             // Single-segment member update: `obj.f++` / `this.size--`.
@@ -5254,6 +5617,53 @@ pub const Parser = struct {
                 self.scope_manager.markConsumed(nxt);
                 return;
             }
+            // Trailing non-null assertion (`this.tail! = node`): no-op.
+            while (self.current.tag == .bang) try self.advance();
+            // Index into a chained base: `this.queue[i] = v` (slice store)
+            // or `node.children[k] = v` (Map insert) / `m[k]` (Map get).
+            // The direct-`name[i]` path below only fires without a dot chain.
+            if (self.current.tag == .l_bracket) {
+                try self.advance();
+                const chain_index = try self.parseExpression();
+                try self.expect(.r_bracket);
+                if (self.isMapVar(left_name)) {
+                    const cks = try self.mapKeySlice(chain_index);
+                    if (try self.accept(.equal)) {
+                        const cval = try self.parseExpression();
+                        _ = try self.accept(.semicolon);
+                        try self.lowerer.emitImport("sa_std/btree_map.sa");
+                        try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ left_name, cks, cval });
+                        return;
+                    }
+                    const cget = try self.newTemp();
+                    try self.lowerer.emitImport("sa_std/btree_map.sa");
+                    try self.lowerer.emit("    {s} = call @sa_btree_map_get(&{s}, &{s})\n", .{ cget, left_name, cks });
+                    _ = try self.accept(.semicolon);
+                    return;
+                }
+                if (self.current.tag == .equal) {
+                    try self.advance();
+                    const chain_val = try self.parseExpression();
+                    _ = try self.accept(.semicolon);
+                    // `left_name` is the slice header temp: address elements
+                    // through its data pointer, like the direct path below.
+                    var ch_elem: []const u8 = "i32";
+                    if (self.scope_manager.lookup(left_name)) |clv| {
+                        ch_elem = elementTypeOf(clv.type_name);
+                    }
+                    var ch_size: u32 = 4;
+                    var ch_align: u32 = 4;
+                    try getTypeSizeAndAlign(ch_elem, &ch_size, &ch_align);
+                    const ch_base = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ch_base, left_name });
+                    const ch_off = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ ch_off, chain_index, ch_size });
+                    const ch_addr = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ch_addr, ch_base, ch_off });
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ch_addr, chain_val, saTypeOf(ch_elem) });
+                    return;
+                }
+            }
         } else if (self.current.tag == .l_bracket) {
             // Array indexing: arr[i] = val or arr[i]
             try self.advance();
@@ -5264,6 +5674,14 @@ pub const Parser = struct {
                 try self.advance();
                 const val = try self.parseExpression();
                 _ = try self.accept(.semicolon);
+                // A Map-typed base stores through the btree, not the slice
+                // header (`m[k] = v` sugar for `m.set(k, v)`).
+                if (self.isMapVar(name)) {
+                    const mks = try self.mapKeySlice(index);
+                    try self.lowerer.emitImport("sa_std/btree_map.sa");
+                    try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ name, mks, val });
+                    return;
+                }
                 // `name` is a slice, so the element address comes from the
                 // header's data pointer at +0, not from the header itself.
                 var st_elem: []const u8 = "i32";
@@ -5310,7 +5728,8 @@ pub const Parser = struct {
                 _ = try self.accept(.semicolon);
                 return;
             }
-            const val = try self.parseExpression();
+            // Chains fold right (`a = b = v` parses `b = v` first).
+            const val = try self.parseAssignRhs();
             _ = try self.accept(.semicolon);
 
             // Assigning a future handle into a non-future variable would
@@ -5392,12 +5811,301 @@ pub const Parser = struct {
         var left = try self.parsePrefix();
 
         while (true) {
+            // Postfix non-null assertion (`this.head!`, `x!.y`): a no-op at
+            // runtime, the value is already its lowered form. `!=`/`!==` lex
+            // as one token, so a bare `!` here is always the assertion.
+            if (self.current.tag == .bang) {
+                try self.advance();
+                continue;
+            }
+            // `?.` / `??` / ternary `?:`: the lexer emits single `?`
+            // tokens, so dispatch on the peek. Ternary binds loosest and is
+            // decided purely by exclusion (`?` not followed by `.`/`?`).
+            if (self.current.tag == .question) {
+                if (self.peek.tag == .dot) {
+                    if (try self.optionalIsCall()) {
+                        // `a?.m(...)`: degrade to the plain dot dispatch
+                        // (documented; Talgo only chains properties).
+                        try self.advance(); // ?
+                        left = try self.parseInfix(left, .call);
+                    } else {
+                        try self.advance(); // ?
+                        left = try self.parseOptionalProperty(left);
+                    }
+                    continue;
+                } else if (self.peek.tag == .question) {
+                    try self.advance(); // ?
+                    try self.advance(); // ?
+                    left = try self.parseNullishCoalesce(left);
+                    continue;
+                } else {
+                    try self.advance(); // ?
+                    left = try self.parseTernary(left);
+                    continue;
+                }
+            }
             const prec = getPrecedence(self.current.tag);
             if (@intFromEnum(prec) <= @intFromEnum(min_prec)) break;
             left = try self.parseInfix(left, prec);
         }
 
         return left;
+    }
+
+    /// Speculative shape check for `?.`: true when `?.name(` follows (up to
+    /// the `(`), i.e. an optional method call rather than a property.
+    /// Restores all lexer state; safe before the real parse.
+    fn optionalIsCall(self: *Parser) anyerror!bool {
+        const saved_lexer = self.lexer;
+        const saved_current = self.current;
+        const saved_peek = self.peek;
+        defer {
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+        }
+        // current == `?`, peek == `.`
+        try self.advance(); // ?
+        if (self.current.tag != .dot) return false;
+        try self.advance(); // .
+        if (self.current.tag != .identifier) return false;
+        try self.advance(); // member
+        return self.current.tag == .l_paren;
+    }
+
+    /// Allocate an 8-byte join slot for value branches (`?.`, `??`, `?:`):
+    /// each arm stores, the merge loads into a fresh temp.
+    fn joinSlot(self: *Parser) anyerror![]const u8 {
+        const slot = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 8\n", .{slot});
+        return slot;
+    }
+
+    /// Reserve a true/false/end label triple for a value join.
+    fn joinLabels(self: *Parser, prefix: []const u8) anyerror![3][]const u8 {
+        const id = self.nextLabelId();
+        const l_true = try std.fmt.allocPrint(self.allocator, "L_{s}_t_{d}", .{ prefix, id });
+        const l_false = try std.fmt.allocPrint(self.allocator, "L_{s}_f_{d}", .{ prefix, id });
+        const l_end = try std.fmt.allocPrint(self.allocator, "L_{s}_end_{d}", .{ prefix, id });
+        try self.lowerer.reserveLabel(l_true);
+        try self.lowerer.reserveLabel(l_false);
+        try self.lowerer.reserveLabel(l_end);
+        return .{ l_true, l_false, l_end };
+    }
+
+    /// `a?.field` (cursor on `.`): null-guarded property access. A null
+    /// receiver stores zero without touching memory; otherwise the same
+    /// load the plain `.` path emits runs. Arms join through a slot.
+    fn parseOptionalProperty(self: *Parser, left: []const u8) anyerror![]const u8 {
+        try self.expect(.dot);
+        const member_tok = self.current;
+        try self.expect(.identifier);
+        const member_name = self.tokenText(member_tok);
+        const v = self.scope_manager.lookup(left) orelse {
+            std.debug.print("error:{d}:{d}: property access on undefined variable '{s}'\n", .{
+                member_tok.line, member_tok.col, left,
+            });
+            return error.UndefinedVariable;
+        };
+        // Length/size aliases lower inline (receivers are non-null slices
+        // and maps by construction); only struct fields need the guard.
+        if (std.mem.eql(u8, v.type_name, "string") and std.mem.eql(u8, member_name, "length")) {
+            const temp_name = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u32\n", .{ temp_name, left });
+            return temp_name;
+        }
+        if (std.mem.eql(u8, member_name, "length") and self.layout_table.find(v.type_name) == null) {
+            const temp_name = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ temp_name, left });
+            return temp_name;
+        }
+        if (self.isMapVar(left) and std.mem.eql(u8, member_name, "size")) {
+            try self.lowerer.emitImport("sa_std/btree_map.sa");
+            const temp_name = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_btree_map_len(&{s})\n", .{ temp_name, left });
+            return temp_name;
+        }
+        const layout = self.layout_table.find(v.type_name) orelse return error.TypeIsNotAnInterface;
+        var found_field: ?Field = null;
+        for (layout.fields.items) |f| {
+            if (std.mem.eql(u8, f.name, member_name)) {
+                found_field = f;
+                break;
+            }
+        }
+        const field = found_field orelse return error.UnknownField;
+        const slot = try self.joinSlot();
+        const labels = try self.joinLabels("opt");
+        const isnull = try self.newTemp();
+        try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ isnull, left });
+        try self.lowerer.emitBranchTo(isnull, labels[1], labels[0]);
+        try self.lowerer.emitLabel(labels[1]);
+        try self.lowerer.emit("    store {s} + 0, 0 as ptr\n", .{slot});
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[0]);
+        try self.scope_manager.enterScope();
+        const av = try self.newTemp();
+        const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
+            field.type_name
+        else
+            "ptr";
+        try self.lowerer.emit("    {s} = load {s} + {d} as {s}\n", .{ av, left, field.offset, sa_type });
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, av });
+        try self.exitScopeReleasingLocals();
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[2]);
+        const res = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ res, slot, sa_type });
+        try self.retagTemp(res, field.type_name);
+        return res;
+    }
+
+    /// `a ?? b`: `a` when non-null, else `b`. Arms join through a slot;
+    /// the result carries the left arm's type when known.
+    fn parseNullishCoalesce(self: *Parser, left: []const u8) anyerror![]const u8 {
+        const slot = try self.joinSlot();
+        const labels = try self.joinLabels("nullish");
+        const isnull = try self.newTemp();
+        try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ isnull, left });
+        try self.lowerer.emitBranchTo(isnull, labels[0], labels[1]);
+        // Right arm first (branch-target order): evaluate `b`.
+        try self.lowerer.emitLabel(labels[0]);
+        try self.scope_manager.enterScope();
+        const rv = try self.parseExpressionWithPrecedence(.lowest);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, rv });
+        try self.exitScopeReleasingLocals();
+        try self.lowerer.emitJumpTo(labels[2]);
+        // Left arm: keep `a` (a store never moves its source).
+        try self.lowerer.emitLabel(labels[1]);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, left });
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[2]);
+        const res = try self.newTemp();
+        var sa_t: []const u8 = "ptr";
+        if (self.scope_manager.lookup(left)) |lv| {
+            sa_t = saTypeOf(lv.type_name);
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ res, slot, sa_t });
+            try self.retagTemp(res, lv.type_name);
+        } else {
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ res, slot });
+        }
+        return res;
+    }
+
+    /// Parse an assignment right-hand side, folding chained stores
+    /// (`this.head = this.tail = undefined`, `a = b = v`): when the rhs
+    /// opens with a plain-var or single-dot-field target followed by `=`,
+    /// consume the target, recurse for the value, store into the target.
+    /// A var target moves the value and re-reads from the target; a field
+    /// target stores without moving (a `store` never moves its source).
+    fn parseAssignRhs(self: *Parser) anyerror![]const u8 {
+        if (self.current.tag == .identifier or self.current.tag == .keyword_this) {
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_peek = self.peek;
+            try self.advance();
+            var dots: usize = 0;
+            var shape_ok = true;
+            while (self.current.tag == .dot) {
+                try self.advance();
+                if (self.current.tag == .identifier) {
+                    try self.advance();
+                    dots += 1;
+                } else {
+                    shape_ok = false;
+                    break;
+                }
+            }
+            // Postfix `!` may sit between target and `=` (`this.t! = v`).
+            while (self.current.tag == .bang) try self.advance();
+            const is_chained = shape_ok and self.current.tag == .equal and dots <= 1;
+            const was_this = saved_current.tag == .keyword_this;
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+            if (is_chained) {
+                if (dots == 0 and !was_this) {
+                    const t_tok = self.current;
+                    try self.advance();
+                    const tname = self.tokenText(t_tok);
+                    try self.expect(.equal);
+                    const v = try self.parseAssignRhs();
+                    try self.emitMove(tname, v);
+                    // Re-read from the target: `v` just moved into it.
+                    return tname;
+                } else if (dots == 1) {
+                    var base_is_this = false;
+                    var base_name: []const u8 = "";
+                    if (self.current.tag == .keyword_this) {
+                        try self.advance();
+                        base_is_this = true;
+                    } else {
+                        const bt = self.current;
+                        try self.expect(.identifier);
+                        base_name = self.tokenText(bt);
+                    }
+                    try self.expect(.dot);
+                    while (self.current.tag == .bang) try self.advance();
+                    const ft = self.current;
+                    try self.expect(.identifier);
+                    const fname = self.tokenText(ft);
+                    while (self.current.tag == .bang) try self.advance();
+                    try self.expect(.equal);
+                    const v = try self.parseAssignRhs();
+                    const base_reg = if (base_is_this) "this" else base_name;
+                    if (self.scope_manager.lookup(base_reg)) |bv| {
+                        if (self.layout_table.find(bv.type_name)) |layout| {
+                            for (layout.fields.items) |f| {
+                                if (std.mem.eql(u8, f.name, fname)) {
+                                    try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ base_reg, f.offset, v, saTypeOf(f.type_name) });
+                                    return v;
+                                }
+                            }
+                        }
+                    }
+                    return v;
+                }
+            }
+        }
+        return self.parseExpression();
+    }
+
+    /// `c ? a : b`: branch + slot join. The result carries the true arm's
+    /// type when known (8-byte slot stores preserve int bit patterns, so a
+    /// later narrow load reads the same value).
+    fn parseTernary(self: *Parser, cond: []const u8) anyerror![]const u8 {
+        const slot = try self.joinSlot();
+        const labels = try self.joinLabels("tern");
+        try self.lowerer.emitBranchTo(cond, labels[0], labels[1]);
+        try self.lowerer.emitLabel(labels[0]);
+        try self.scope_manager.enterScope();
+        const tv = try self.parseExpressionWithPrecedence(.lowest);
+        try self.expect(.colon);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, tv });
+        // The arm scope pops below (freeing its variable records), so copy
+        // the arm type for the merge load before it dangles.
+        var tv_type: ?[]const u8 = null;
+        if (self.scope_manager.lookup(tv)) |tvar| {
+            tv_type = try self.allocator.dupe(u8, tvar.type_name);
+        }
+        try self.exitScopeReleasingLocals();
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[1]);
+        try self.scope_manager.enterScope();
+        const fv = try self.parseExpressionWithPrecedence(.lowest);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, fv });
+        try self.exitScopeReleasingLocals();
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[2]);
+        const res = try self.newTemp();
+        if (tv_type) |tt| {
+            const sa_t = saTypeOf(tt);
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ res, slot, sa_t });
+            try self.retagTemp(res, tt);
+        } else {
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ res, slot });
+        }
+        return res;
     }
 
     fn parsePrefix(self: *Parser) anyerror![]const u8 {
@@ -5481,8 +6189,10 @@ pub const Parser = struct {
                             if (self.current.tag == .identifier) {
                                 try self.advance();
                                 pt = self.tokenText(tt);
-                                // Array suffix `T[]`: skip bracket pairs so
-                                // `(arr: number[]) =>` still scans as an arrow.
+                                // Generic args (`TreeNode<T>`) then array
+                                // suffix `T[]`, so typed callbacks still scan
+                                // as arrows.
+                                try self.skipGenericArgs();
                                 while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                                     try self.advance(); // [
                                     try self.advance(); // ]
@@ -5508,6 +6218,7 @@ pub const Parser = struct {
                         try self.advance(); // :
                         if (self.current.tag == .identifier) {
                             try self.advance(); // base type name
+                            try self.skipGenericArgs();
                             while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                                 try self.advance(); // [
                                 try self.advance(); // ]
@@ -5536,8 +6247,9 @@ pub const Parser = struct {
                                 const tt = self.current;
                                 try self.advance();
                                 pt = self.tokenText(tt);
-                                // Same `T[]` skip as the probe above; the probe
-                                // already validated the shape.
+                                // Same generic/`T[]` skip as the probe above;
+                                // the probe already validated the shape.
+                                try self.skipGenericArgs();
                                 while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                                     try self.advance(); // [
                                     try self.advance(); // ]
@@ -5554,6 +6266,7 @@ pub const Parser = struct {
                         if (try self.accept(.colon)) {
                             const rt_tok = self.current;
                             try self.advance();
+                            try self.skipGenericArgs();
                             if (std.mem.eql(u8, self.tokenText(rt_tok), "string")) ret_is_slice = true;
                             while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                                 try self.advance(); // [
@@ -5897,6 +6610,28 @@ pub const Parser = struct {
                     for (ctor_args.items) |a| {
                         try self.lowerer.emit(", {s}", .{a});
                     }
+                    // `new TreeNode(data)` vs `(data, left?, right?)`: pad
+                    // missing trailing optional params with `0` (undefined).
+                    // SA-ASM callees have fixed arity, so the padding keeps the
+                    // call well-formed; the ctor stores zeroes for them.
+                    if (self.class_methods.get(ctor_key)) |csig| {
+                        if (csig.params) |cparams| {
+                            if (ctor_args.items.len <= cparams.len) {
+                                var pad_ok = true;
+                                for (cparams[ctor_args.items.len..]) |mp| {
+                                    if (!mp.optional) {
+                                        pad_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (pad_ok) {
+                                    for (cparams[ctor_args.items.len..]) |_| {
+                                        try self.lowerer.emit(", 0", .{});
+                                    }
+                                }
+                            }
+                        }
+                    }
                     try self.lowerer.emit(")\n", .{});
                 } else if (ctor_args.items.len > 0) {
                     std.debug.print("error:{d}:{d}: new '{s}' with arguments: no constructor declared\n", .{
@@ -5905,6 +6640,61 @@ pub const Parser = struct {
                         type_name,
                     });
                     return error.ConstructorsNotSupported;
+                }
+                return dest;
+            },
+            .l_brace => {
+                // Object literal in expression position (`{ value: item } as
+                // Node<T>`): collect `name: expr` entries, then require an
+                // `as T` annotation carrying the struct layout and build it.
+                // A missing annotation stays loud (there is no contextual
+                // type inside expressions).
+                const brace_tok = self.current;
+                try self.advance();
+                const Entry = struct { name: []const u8, val: []const u8 };
+                var entries = std.ArrayList(Entry).init(self.allocator);
+                defer entries.deinit();
+                while (self.current.tag != .r_brace and self.current.tag != .eof) {
+                    const fn_tok = self.current;
+                    try self.expect(.identifier);
+                    const fname = self.tokenText(fn_tok);
+                    try self.expect(.colon);
+                    const fval = try self.parseExpression();
+                    try entries.append(.{ .name = fname, .val = fval });
+                    _ = try self.accept(.comma);
+                    _ = try self.accept(.semicolon);
+                }
+                try self.expect(.r_brace);
+                if (self.current.tag != .keyword_as) {
+                    std.debug.print("error:{d}:{d}: object literal needs `as T` in expression position (maps/structs need a layout)\n", .{
+                        brace_tok.line, brace_tok.col,
+                    });
+                    return error.TypeAnnotationRequiredForObjectLiteral;
+                }
+                try self.advance(); // as
+                const lit_type = try self.parseTypeName();
+                const layout = self.layout_table.find(lit_type) orelse {
+                    std.debug.print("error:{d}:{d}: struct literal of unknown interface '{s}'\n", .{
+                        brace_tok.line, brace_tok.col, lit_type,
+                    });
+                    return error.UnknownInterface;
+                };
+                const dest = try self.newTemp();
+                if (self.scope_manager.lookup(dest)) |tv| {
+                    self.allocator.free(tv.type_name);
+                    tv.type_name = try self.allocator.dupe(u8, lit_type);
+                }
+                try self.lowerer.emit("    {s} = alloc {d}\n", .{ dest, layout.size });
+                for (layout.fields.items) |f| {
+                    try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ dest, f.offset, saTypeOf(f.type_name) });
+                }
+                for (entries.items) |e| {
+                    for (layout.fields.items) |f| {
+                        if (std.mem.eql(u8, f.name, e.name)) {
+                            try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ dest, f.offset, e.val, saTypeOf(f.type_name) });
+                            break;
+                        }
+                    }
                 }
                 return dest;
             },
@@ -6177,6 +6967,15 @@ pub const Parser = struct {
             const index = try self.parseExpression();
             try self.expect(.r_bracket);
 
+            // `m[k]` on a Map-typed base reads through the btree
+            // (`if (!node.children[char])`, `node = node.children[char]`).
+            if (self.isMapVar(left)) {
+                const mks = try self.mapKeySlice(index);
+                const mget = try self.newTemp();
+                try self.lowerer.emitImport("sa_std/btree_map.sa");
+                try self.lowerer.emit("    {s} = call @sa_btree_map_get(&{s}, &{s})\n", .{ mget, left, mks });
+                return mget;
+            }
             // `left` is a slice, so the element base is the data pointer stored
             // in the header at +0, not the header itself.
             // Element-aware stride: slices of structs/pointers step 8 bytes
