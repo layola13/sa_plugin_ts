@@ -1535,6 +1535,64 @@ test "sa_plugin_ts compiles array literals and indexing" {
     try std.testing.expect(std.mem.indexOf(u8, result, "load arr + 0 as ptr") != null);
 }
 
+test "sa_plugin_ts lowers new Map to sa_btree_map_new" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  const m: Map<string, i32> = new Map();
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+    try std.testing.expect(std.mem.indexOf(u8, result, "@import \"sa_std/btree_map.sa\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_btree_map_new()") != null);
+}
+
+test "sa_plugin_ts lowers new Array(n) to a zeroed slice" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  const a = new Array(3);
+        \\  a[0] = 7;
+        \\  return a[0];
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+    try std.testing.expect(std.mem.indexOf(u8, result, "= alloc 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "store ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "+ 8, 3 as u64") != null);
+}
+
 test "sa_plugin_ts compiles return statements" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

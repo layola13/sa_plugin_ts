@@ -3614,15 +3614,110 @@ pub const Parser = struct {
                 return operand;
             },
             .keyword_new => {
-                // Default-construct a declared interface: allocate the layout
-                // and zero every field. Arguments are refused loudly: without
-                // classes there are no constructors to call. Unknown types
-                // (e.g. `new Map()`) are refused the same way.
+                // `new Map()` / `new Array(n)` plus default-constructed
+                // declared interfaces. `Map` lowers to the real
+                // `sa_std/btree_map.sa` backend (`call @sa_btree_map_new()`);
+                // `Array` lowers to the 16-byte `{ptr,len}` slice header plus
+                // a zeroed element buffer (same layout as array literals, and
+                // what `sa_std` slice helpers expect). Other types fall back
+                // to interface default-construction; unknown types and
+                // non-literal Array lengths are refused loudly.
                 const new_tok = self.current;
                 try self.advance();
                 const type_tok = self.current;
                 try self.expect(.identifier);
                 const type_name = self.tokenText(type_tok);
+                if (std.mem.eql(u8, type_name, "Map")) {
+                    // Skip optional `Map<K, V>` type args at the expression site.
+                    if (self.current.tag == .less) {
+                        try self.advance();
+                        var depth: usize = 1;
+                        while (depth > 0 and self.current.tag != .eof) {
+                            if (self.current.tag == .less) depth += 1;
+                            if (self.current.tag == .greater) depth -= 1;
+                            try self.advance();
+                        }
+                    }
+                    try self.expect(.l_paren);
+                    if (self.current.tag != .r_paren) {
+                        return self.refuseAt(
+                            "error: new 'Map' with arguments: Map() takes no arguments",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                    }
+                    try self.expect(.r_paren);
+                    try self.lowerer.emitImport("sa_std/btree_map.sa");
+                    const dest = try self.newTemp();
+                    try self.retagTemp(dest, "Map");
+                    try self.lowerer.emit("    {s} = call @sa_btree_map_new()\n", .{dest});
+                    return dest;
+                }
+                if (std.mem.eql(u8, type_name, "Array")) {
+                    var elem_type: []const u8 = "i32";
+                    if (self.current.tag == .less) {
+                        try self.advance();
+                        const elem_tok = self.current;
+                        try self.expect(.identifier);
+                        elem_type = self.tokenText(elem_tok);
+                        while (try self.accept(.comma)) {
+                            const skip_tok = self.current;
+                            try self.expect(.identifier);
+                            _ = self.tokenText(skip_tok);
+                        }
+                        try self.expect(.greater);
+                    }
+                    try self.expect(.l_paren);
+                    if (self.current.tag != .number) {
+                        return self.refuseAt(
+                            "error: new 'Array' length must be an integer literal",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                    }
+                    const len_tok = self.current;
+                    try self.advance();
+                    const len_text = self.tokenText(len_tok);
+                    const len_val = std.fmt.parseInt(i64, len_text, 10) catch {
+                        return self.refuseAt(
+                            "error: new 'Array' length must be an integer literal",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                    };
+                    if (len_val < 0) {
+                        return self.refuseAt(
+                            "error: new 'Array' length must be non-negative",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                    }
+                    if (self.current.tag != .r_paren) {
+                        return self.refuseAt(
+                            "error: new 'Array' takes a single length argument",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                    }
+                    try self.expect(.r_paren);
+                    var elem_size: u32 = 4;
+                    var elem_align: u32 = 4;
+                    try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
+                    const count = @as(u32, @intCast(len_val));
+                    const dest = try self.newTemp();
+                    try self.retagTemp(dest, elem_type);
+                    try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+                    const data_reg = try self.newTemp();
+                    try self.lowerer.emit("    {s} = alloc {d}\n", .{ data_reg, @max(count * elem_size, 4) });
+                    var idx: u32 = 0;
+                    while (idx < count) : (idx += 1) {
+                        const off = idx * elem_size;
+                        try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ data_reg, off, saTypeOf(elem_type) });
+                    }
+                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
+                    try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ dest, count });
+                    return dest;
+                }
                 const layout = self.layout_table.find(type_name) orelse {
                     std.debug.print("error:{d}:{d}: new of unknown type '{s}': only declared interfaces can be default-constructed\n", .{
                         new_tok.line,

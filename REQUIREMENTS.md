@@ -76,8 +76,12 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] SA-ASM validity regression tests, plus an end-to-end check that runs `sa build` on lowered output
 - [x] TypeScript demo corpus: 260 demos under `demos/`, verified by
       `tools/verify_demos.sh` (each demo is lowered and then assembled with the
-      real `sa build`). Currently 259 verified against Node, 1 is refused with a
-      located diagnostic (`155_generic_map`, a `new` expression), and 0 fail.
+      real `sa build`). Currently 260 verified against Node, 0 refused, 0 fail.
+- [x] `new` expressions (minimal): `new Map()` lowers to the real
+  `sa_std/btree_map.sa` backend (`call @sa_btree_map_new()`); `new Array(n)` /
+  `new Array<T>(n)` with an integer-literal length lowers to the 16-byte
+  `{ptr,len}` slice header plus a zeroed element buffer (JEV scope decision:
+  split new/async/try-catch, new first)
       `demos/251_kitchen_sink` exercises the whole verified subset in one program.
       `demos/262_float_arith` covers the type-directed float ops (`fdiv`/`fadd`/
       `fmul`/`fsub`/`fcmp_eq`).
@@ -164,13 +168,16 @@ mistake is not repeated.
   used as statements lower inline (same instruction as the expression form).
 - **`var`** — lowers exactly like `let` (function-level lowering with lexical
   scopes, so hoisting differences do not apply).
-- **`new` as an expression** — refused loudly with a located diagnostic
-  (`155_generic_map`); `alloc(n)` itself does lower. Refusing loudly is the
-  intended behaviour, not a silent miscompile.
+- **`new` as an expression** — `new Map()` lowers to the real
+  `sa_std/btree_map.sa` backend (`call @sa_btree_map_new()`); `new Array(n)`
+  (plus `new Array<T>(n)`) lowers to the 16-byte `{ptr,len}` slice header plus
+  a zeroed element buffer for integer-literal `n`. Other `new` forms (unknown
+  types, `new Map` with arguments, non-literal `new Array` lengths) are still
+  refused loudly with a located diagnostic instead of miscompiled.
 
 ### Found by the demo corpus, still open
 
-Verified counts from `tools/verify_demos.sh`: 259 assemble and match Node, 1 is
+Verified counts from `tools/verify_demos.sh`: 260 assemble and match Node, 0 are
 refused with a located diagnostic, and **0 fail**. Every demo now lands in a good
 bucket, so no unresolved defect is left in the corpus.
 
@@ -181,9 +188,11 @@ bucket, so no unresolved defect is left in the corpus.
   (`parseNewStructLiteral` / `parseStructLiteralFields`), struct reassignment
   through the declared type's allocation, and chained property loads retagged
   with the field type now lower all four; they assemble and match Node.
-- **`new` as an expression (1)** — `155_generic_map` is refused with `unexpected
-  token in expression: keyword_new`; `alloc(n)` itself does lower. Refusing
-  loudly is the intended behaviour, not a silent miscompile.
+- **`new` as an expression (fixed)** — `155_generic_map` (`new Map()`) now
+  lowers to `call @sa_btree_map_new()` with `@import "sa_std/btree_map.sa"`
+  and verifies; `alloc(n)` itself also lowers. Remaining unknown-type and
+  argument-shape `new` forms still refuse loudly, which is the intended
+  behaviour, not a silent miscompile.
 - **Property access on an undefined name (fixed)** — `218_release_bundle` was
   refused with `property access on undefined variable 'b'`; the chained-load
   retag plus the C-for increment fix (`i = i ± N` in `parseForIncrement`,
