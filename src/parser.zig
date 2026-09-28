@@ -196,6 +196,12 @@ pub const Parser = struct {
     wit_syms: std.StringHashMap(void) = undefined,
     /// Names with an explicit `declare function` signature on file.
     declared_externs: std.StringHashMap(void) = undefined,
+    /// Directory of the entry file: relative TS imports (`./x`, `../y`)
+    /// resolve against it, SLA whole-program style. Set by the host from
+    /// the input path; tests leave the default (cwd).
+    base_dir: []const u8 = ".",
+    /// Resolved import paths already parsed (cycle/diamond guard).
+    imported_files: std.StringHashMap(void) = undefined,
     /// Depth inside `async function` bodies, with the innermost Tokio-style
     /// ready-future value type. An `async function f(): T` returns a
     /// `future<T>` handle (a 16-byte `{state, value}` heap struct mirroring
@@ -263,6 +269,7 @@ pub const Parser = struct {
         parser_inst.declared_externs = std.StringHashMap(void).init(allocator);
         parser_inst.class_methods = std.StringHashMap(MethodSig).init(allocator);
         parser_inst.class_traits = std.StringHashMap(void).init(allocator);
+        parser_inst.imported_files = std.StringHashMap(void).init(allocator);
 
         // Pre-register `async function` signatures (name -> inner value
         // type) so forward calls still tag future-typed results: demos put
@@ -356,6 +363,11 @@ pub const Parser = struct {
             self.allocator.free(e.key_ptr.*);
         }
         self.wit_syms.deinit();
+        var imit = self.imported_files.iterator();
+        while (imit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.imported_files.deinit();
         var deit = self.declared_externs.iterator();
         while (deit.next()) |e| {
             self.allocator.free(e.key_ptr.*);
@@ -1074,6 +1086,32 @@ pub const Parser = struct {
             const f_name_tok = self.current;
             try self.expect(.identifier);
             const f_name = self.tokenText(f_name_tok);
+
+            if (self.current.tag == .l_paren) {
+                // Method signature (`name(params): Ret`): no layout field.
+                // Skip the parameter list with nesting, then an optional
+                // return annotation (`: void`, `: T | undefined`).
+                try self.advance();
+                var pd: usize = 1;
+                while (pd > 0 and self.current.tag != .eof) {
+                    switch (self.current.tag) {
+                        .l_paren, .l_bracket, .l_brace => pd += 1,
+                        .r_paren, .r_bracket, .r_brace => pd -= 1,
+                        else => {},
+                    }
+                    try self.advance();
+                }
+                if (try self.accept(.colon)) {
+                    if (self.current.tag == .keyword_void) {
+                        try self.advance();
+                    } else {
+                        _ = try self.parseTypeName();
+                    }
+                }
+                _ = try self.accept(.semicolon);
+                _ = try self.accept(.comma);
+                continue;
+            }
 
             try self.expect(.colon);
 
@@ -3166,7 +3204,151 @@ pub const Parser = struct {
                 const key = try self.allocator.dupe(u8, sym);
                 try self.wasm_syms.put(key, {});
             }
+        } else if (path.len > 0 and path[0] == '.') {
+            // Relative TS module (`./map`, `../stack/stack`): resolve the
+            // file against the entry dir and parse it into the shared
+            // tables (SLA whole-program style), so cross-file classes
+            // resolve. A missing file stays loud at its use sites instead
+            // of aborting the whole compile.
+            self.parseRelativeImport(path) catch |err| {
+                if (err == error.FileNotFound) {
+                    const msg = try std.fmt.allocPrint(
+                        self.allocator,
+                        "error: cannot resolve relative import \"{s}\" from \"{s}\"",
+                        .{ path, self.base_dir },
+                    );
+                    try self.errors.append(.{ .line = path_tok.line, .col = path_tok.col, .message = msg });
+                    std.debug.print("error:{d}:{d}: {s}\n", .{ path_tok.line, path_tok.col, msg });
+                    return;
+                }
+                return err;
+            };
         }
+    }
+
+    /// Resolve a relative TS import to a file: `p`, `p.ts`, `p/index.ts`
+    /// against `base_dir` (SLA `resolveImportFile` shape, TS flavored).
+    /// Returned paths are lexically normalized (`a/./b` -> `a/b`) so the
+    /// cycle guard sees one identity per file even across nested dirs.
+    fn resolveRelativePath(self: *Parser, path: []const u8) anyerror![]const u8 {
+        const suffixes = [_][]const u8{ "", ".ts", "/index.ts" };
+        for (suffixes) |suf| {
+            const raw = try std.fmt.allocPrint(self.allocator, "{s}/{s}{s}", .{ self.base_dir, path, suf });
+            defer self.allocator.free(raw);
+            const cand = try self.normalizePath(raw);
+            std.fs.cwd().access(cand, .{}) catch {
+                self.allocator.free(cand);
+                continue;
+            };
+            return cand;
+        }
+        return error.FileNotFound;
+    }
+
+    /// Lexically normalize a `/`-joined path (`a/./b` -> `a/b`,
+    /// `a/x/../b` -> `a/b`), so import identities are stable.
+    fn normalizePath(self: *Parser, path: []const u8) anyerror![]const u8 {
+        var parts = std.ArrayList([]const u8).init(self.allocator);
+        defer parts.deinit();
+        var it = std.mem.splitScalar(u8, path, '/');
+        const absolute = path.len > 0 and path[0] == '/';
+        while (it.next()) |seg| {
+            if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+            if (std.mem.eql(u8, seg, "..")) {
+                if (parts.items.len > 0) _ = parts.pop();
+                continue;
+            }
+            try parts.append(seg);
+        }
+        var out = std.ArrayList(u8).init(self.allocator);
+        errdefer out.deinit();
+        if (absolute) try out.append('/');
+        for (parts.items, 0..) |p, i| {
+            if (i > 0) try out.append('/');
+            try out.appendSlice(p);
+        }
+        return out.toOwnedSlice();
+    }
+
+    /// Parse an imported TS file into the shared layout/method tables and
+    /// emit its declarations (SLA whole-program compile). The cycle/diamond
+    /// guard keeps each file parsed once; nested imports resolve against
+    /// the imported file's own directory.
+    fn parseRelativeImport(self: *Parser, path: []const u8) anyerror!void {
+        const resolved = try self.resolveRelativePath(path);
+        defer self.allocator.free(resolved);
+        if (self.imported_files.contains(resolved)) return;
+        try self.imported_files.put(try self.allocator.dupe(u8, resolved), {});
+        const content = std.fs.cwd().readFileAlloc(self.allocator, resolved, 4 * 1024 * 1024) catch return error.FileNotFound;
+        defer self.allocator.free(content);
+
+        const saved_lexer = self.lexer;
+        const saved_current = self.current;
+        const saved_peek = self.peek;
+        const saved_tpl = self.template_lexer_mode;
+        const saved_dir = self.base_dir;
+        errdefer {
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+            self.template_lexer_mode = saved_tpl;
+            self.base_dir = saved_dir;
+            self.collect_only = false;
+        }
+        self.base_dir = std.fs.path.dirname(resolved) orelse ".";
+
+        self.lexer = lexer_mod.Lexer{ .source = content };
+        self.current = self.lexer.next();
+        self.peek = self.lexer.next();
+        self.template_lexer_mode = false;
+        // Forward-reference collection pass (mirror parse()).
+        self.collect_only = true;
+        while (self.current.tag != .eof) {
+            if (self.current.tag == .keyword_class) {
+                self.parseClass() catch {
+                    self.skipToSync();
+                };
+            } else if (self.current.tag == .keyword_interface) {
+                self.parseInterface() catch {
+                    self.skipToSync();
+                };
+            } else if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "export")) {
+                try self.advance();
+                if (self.current.tag == .keyword_class) {
+                    self.parseClass() catch {
+                        self.skipToSync();
+                    };
+                } else if (self.current.tag == .keyword_interface) {
+                    self.parseInterface() catch {
+                        self.skipToSync();
+                    };
+                }
+            } else {
+                try self.advance();
+            }
+        }
+        self.collect_only = false;
+        // Real pass: declarations emit into the shared output.
+        self.lexer = lexer_mod.Lexer{ .source = content };
+        self.current = self.lexer.next();
+        self.peek = self.lexer.next();
+        self.template_lexer_mode = false;
+        try self.scope_manager.enterScope();
+        while (self.current.tag != .eof) {
+            self.parseStatement() catch |err| {
+                if (err == error.UnexpectedToken) continue;
+                const msg = try std.fmt.allocPrint(self.allocator, "error: {}", .{err});
+                try self.errors.append(.{ .line = self.current.line, .col = self.current.col, .message = msg });
+                self.skipToSync();
+            };
+        }
+        try self.scope_manager.exitScope(self.lowerer);
+
+        self.lexer = saved_lexer;
+        self.current = saved_current;
+        self.peek = saved_peek;
+        self.template_lexer_mode = saved_tpl;
+        self.base_dir = saved_dir;
     }
 
     // ==========================================
@@ -5648,6 +5830,38 @@ pub const Parser = struct {
                     try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ dest, count });
                     return dest;
                 }
+                if (std.mem.eql(u8, type_name, "Error")) {
+                    // `new Error(msg)`: SA has no exception objects; the
+                    // message materialises as a string slice and `throw`
+                    // panics with it. Non-string payloads fall back to an
+                    // empty message (there is no message form for them).
+                    try self.expect(.l_paren);
+                    var slice = try self.materializeStringChunk("");
+                    if (self.current.tag != .r_paren) {
+                        const m = try self.parseExpression();
+                        if (m.len >= 2 and (m[0] == '"' or m[0] == '\'')) {
+                            slice = try self.materializeStringChunk(m[1 .. m.len - 1]);
+                        } else if (self.scope_manager.lookup(m)) |mv| {
+                            if (std.mem.eql(u8, mv.type_name, "string")) slice = m;
+                        }
+                        while (try self.accept(.comma)) {
+                            _ = try self.parseExpression();
+                        }
+                    }
+                    try self.expect(.r_paren);
+                    return slice;
+                }
+                // Skip optional `C<T>` type args at the expression site
+                // (`new Stack<T>()`): construction is monomorphic here.
+                if (self.current.tag == .less) {
+                    try self.advance();
+                    var depth: usize = 1;
+                    while (depth > 0 and self.current.tag != .eof) {
+                        if (self.current.tag == .less) depth += 1;
+                        if (self.current.tag == .greater) depth -= 1;
+                        try self.advance();
+                    }
+                }
                 const layout = self.layout_table.find(type_name) orelse {
                     std.debug.print("error:{d}:{d}: new of unknown type '{s}': only declared interfaces can be default-constructed\n", .{
                         new_tok.line,
@@ -5880,6 +6094,15 @@ pub const Parser = struct {
             } else {
                 // Property access
                 const v = self.scope_manager.lookup(left) orelse {
+                    // `Number.MAX_VALUE` / `MAX_SAFE_INTEGER`: the subset's
+                    // numbers are i32, so the float huge-value folds to i32 max
+                    // (Talgo uses it as "no limit"). Returned as literal text,
+                    // the same form a numeric literal takes as an operand.
+                    if (std.mem.eql(u8, left, "Number")) {
+                        if (std.mem.eql(u8, member_name, "MAX_VALUE") or
+                            std.mem.eql(u8, member_name, "MAX_SAFE_INTEGER")) return "2147483647";
+                        if (std.mem.eql(u8, member_name, "MIN_SAFE_INTEGER")) return "-2147483648";
+                    }
                     std.debug.print("error:{d}:{d}: property access on undefined variable '{s}'\n", .{
                         member_tok.line, member_tok.col, left,
                     });
@@ -6004,6 +6227,15 @@ pub const Parser = struct {
             self.scope_manager.markConsumed(temp_name);
             self.markRebound(left);
             return temp_name;
+        }
+
+        // `x as T`: a type assertion is a no-op at runtime (every value is
+        // already its lowered form). Consume the annotation and keep `left`,
+        // so `this.stack.pop() as T` and `v as number` lower as `v`.
+        if (tag == .keyword_as) {
+            try self.advance();
+            _ = try self.parseTypeName();
+            return left;
         }
 
         // Function call: name(args)
@@ -6220,6 +6452,8 @@ fn getPrecedence(tag: lexer_mod.Token.Tag) Precedence {
         .star, .slash, .percent => .product,
         .less_less, .greater_greater, .greater_greater_greater => .sum,
         .plus_plus, .minus_minus => .call,
+        // `x as T` binds like a postfix operator (member-call level).
+        .keyword_as => .call,
         .dot, .l_paren, .l_bracket => .call,
         else => .lowest,
     };

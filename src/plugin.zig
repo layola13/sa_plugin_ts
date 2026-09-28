@@ -215,7 +215,8 @@ fn lowerFileToSa(
     };
     defer ctx.allocator.free(source);
     plugin_api.emitLog(ctx, .info, "lowering TypeScript to SA-ASM");
-    return try lowerSource(ctx, source, stderr);
+    const base_dir = std.fs.path.dirname(input_path) orelse ".";
+    return try lowerSource(ctx, source, base_dir, stderr);
 }
 
 fn defaultSaiOut(allocator: std.mem.Allocator, file: []const u8) ![]u8 {
@@ -233,6 +234,7 @@ fn defaultSaiOut(allocator: std.mem.Allocator, file: []const u8) ![]u8 {
 fn lowerSource(
     ctx: *const plugin_api.Context,
     source: []const u8,
+    base_dir: []const u8,
     stderr: std.io.AnyWriter,
 ) anyerror![]u8 {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -248,6 +250,9 @@ fn lowerSource(
         return err;
     };
     defer p.deinit();
+    // Relative TS imports resolve against the entry file's directory
+    // (SLA whole-program style); direct-API sources keep the default.
+    p.base_dir = base_dir;
 
     p.parse() catch |err| {
         plugin_api.emitLog(ctx, .err, "parse error");
