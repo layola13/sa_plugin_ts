@@ -61,8 +61,10 @@ pub const Token = struct {
         bang_equal,
         plus,
         plus_plus,
+        plus_equal,
         minus,
         minus_minus,
+        minus_equal,
         star,
         slash,
         percent,
@@ -198,6 +200,11 @@ pub const Lexer = struct {
                     self.col += 1;
                     return .{ .tag = .plus_plus, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
+                if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .plus_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
                 return .{ .tag = .plus, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
             '-' => {
@@ -205,6 +212,11 @@ pub const Lexer = struct {
                     self.pos += 1;
                     self.col += 1;
                     return .{ .tag = .minus_minus, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .minus_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
                 }
                 return .{ .tag = .minus, .start = start, .len = 1, .line = start_line, .col = start_col };
             },

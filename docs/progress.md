@@ -22,13 +22,13 @@
 | 12 | /tmp/talgo/data_structures/tries/tries.ts | /tmp/talgo_sweep/tries.nolink.ts → /tmp/talgo_sweep/tries.sai | CHECK-FAIL | `FallthroughForbidden` 在 `@export sa_btree_map_range`（extern 声明被当函数体 lower？） |
 | 13 | /tmp/talgo/data_structures/tree/binary_search_tree.ts | /tmp/talgo_sweep/binary_search_tree.nolink.ts → /tmp/talgo_sweep/binary_search_tree.sai | PASS | 箭头参数 `[]` 后缀 + self_call 免释放 + 短调用补0 + panic(1) + while(true) + prologue move |
 | 14 | /tmp/talgo/data_structures/queue/circular_queue.ts | /tmp/talgo_sweep/circular_queue.nolink.ts → /tmp/talgo_sweep/circular_queue.sai | PASS | 动态 `new Array(size)` 经 mem_set 补齐 |
-| 15 | /tmp/talgo/data_structures/disjoint_set/disjoint_set.ts | /tmp/talgo_sweep/disjoint_set.nolink.ts → /tmp/talgo_sweep/disjoint_set.sai | LOWER-ERR | `Array.from`/`Array(n).fill` 已通；残留 `;[a,b]=[b,a]` 解构、`arr[i] +=`、裸 `return` 后 `if` |
+| 15 | /tmp/talgo/data_structures/disjoint_set/disjoint_set.ts | /tmp/talgo_sweep/disjoint_set.nolink.ts → /tmp/talgo_sweep/disjoint_set.sai | PASS | `Array.from`/`fill`+`+=`/`[a,b]=[b,a]`补齐 |
 | 16 | /tmp/talgo/data_structures/set/hash_map_set.ts | /tmp/talgo_sweep/hash_map_set.nolink.ts → /tmp/talgo_sweep/hash_map_set.sai | LOWER-ERR | `class extends is not supported yet`（`extends MapSet` 跨文件父类 + `protected` + 抽象 `initMap`） |
 | 17 | /tmp/talgo/data_structures/heap/heap.ts | /tmp/talgo_sweep/heap.nolink.ts → /tmp/talgo_sweep/heap.sai | LOWER-ERR | `class extends is not supported yet` ×3（Min/MaxHeap/PriorityQueue + `super()`/`super.m()` + fn 字段 `this.compare` 间接调用） |
 | 18 | /tmp/talgo/data_structures/stack/linked_list_stack.ts | /tmp/talgo_sweep/linked_list_stack.nolink.ts → /tmp/talgo_sweep/linked_list_stack.sai | LOWER-ERR | `new of unknown type 'SinglyLinkedList'`（跨文件 import 类）+ `26:10` 泛型 colon |
 | 19 | /tmp/talgo/data_structures/queue/stack_queue.ts | /tmp/talgo_sweep/stack_queue.nolink.ts → /tmp/talgo_sweep/stack_queue.sai | LOWER-ERR | `new of unknown type 'Stack'`（同上跨文件 new）+ `property access on undefined variable 'this'` |
 
-## PASS：11/19；lower 通过：14/19
+## PASS：12/19；lower 通过：15/19
 
 ## 修复优先级（JEV jev_rank，ROI）
 

@@ -825,8 +825,61 @@ pub const Parser = struct {
     // Statement dispatch
     // ==========================================
 
+    /// Array destructuring assignment: `[a, b] = [x, y]` (swap idiom).
+    /// Declaration form (`const [a, b] = ...`) stays with parseLet; here
+    /// every LHS name must already exist. RHS expressions all evaluate
+    /// into fresh temps first, so self-swaps read the old values.
+    fn parseArrayDestructure(self: *Parser) anyerror!void {
+        try self.expect(.l_bracket);
+        var names = std.ArrayList([]const u8).init(self.allocator);
+        defer names.deinit();
+        while (true) {
+            const ntok = self.current;
+            try self.expect(.identifier);
+            try names.append(self.tokenText(ntok));
+            if (!(try self.accept(.comma))) break;
+            if (self.current.tag == .r_bracket) break;
+        }
+        try self.expect(.r_bracket);
+        try self.expect(.equal);
+        try self.expect(.l_bracket);
+        var tmps = std.ArrayList([]const u8).init(self.allocator);
+        defer tmps.deinit();
+        while (true) {
+            const e = try self.parseExpression();
+            // Freeze each RHS value with a pure move (`t = e`): the later
+            // stores must not move a register an earlier element still
+            // needs (`[a, b] = [b, a]`). A copy (`t = add e, 0`) leaves an
+            // arithmetic temp whose bare move into the target trips the
+            // verifier's exit walk, while chained pure moves verify clean.
+            const t = try self.newTemp();
+            try self.lowerer.emit("    {s} = {s}\n", .{ t, e });
+            try tmps.append(t);
+            if (!(try self.accept(.comma))) break;
+            if (self.current.tag == .r_bracket) break;
+        }
+        try self.expect(.r_bracket);
+        _ = try self.accept(.semicolon);
+        if (names.items.len != tmps.items.len) {
+            std.debug.print("error:{d}:{d}: destructuring arity mismatch: {d} names but {d} values\n", .{
+                self.current.line, self.current.col, names.items.len, tmps.items.len,
+            });
+            return error.DestructuringArityMismatch;
+        }
+        for (names.items, tmps.items) |n, t| {
+            if (self.scope_manager.lookup(n) == null) {
+                std.debug.print("error:{d}:{d}: assignment to undefined variable '{s}'\n", .{
+                    self.current.line, self.current.col, n,
+                });
+                return error.UndefinedVariable;
+            }
+            try self.emitMove(n, t);
+        }
+    }
+
     fn parseStatement(self: *Parser) anyerror!void {
         switch (self.current.tag) {
+            .l_bracket => try self.parseArrayDestructure(),
             .l_brace => {
                 try self.expect(.l_brace);
                 try self.scope_manager.enterScope();
@@ -6205,7 +6258,9 @@ pub const Parser = struct {
                     _ = try self.accept(.semicolon);
                     return;
                 }
-                if (self.current.tag == .equal) {
+                if (self.current.tag == .equal or self.current.tag == .plus_equal or self.current.tag == .minus_equal) {
+                    const ch_add_assign = self.current.tag != .equal;
+                    const ch_add_plus = self.current.tag == .plus_equal;
                     try self.advance();
                     const chain_val = try self.parseExpression();
                     _ = try self.accept(.semicolon);
@@ -6224,7 +6279,18 @@ pub const Parser = struct {
                     try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ ch_off, chain_index, ch_size });
                     const ch_addr = try self.newTemp();
                     try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ch_addr, ch_base, ch_off });
-                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ch_addr, chain_val, saTypeOf(ch_elem) });
+                    if (ch_add_assign) {
+                        // `this.arr[i] += v` / `-= v` (disjoint `join`).
+                        const ch_cur = try self.newTemp();
+                        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ ch_cur, ch_addr, saTypeOf(ch_elem) });
+                        const ch_nxt = try self.newTemp();
+                        try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ ch_nxt, if (ch_add_plus) "add" else "sub", ch_cur, chain_val });
+                        self.scope_manager.markConsumed(ch_cur);
+                        try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ch_addr, ch_nxt, saTypeOf(ch_elem) });
+                        self.scope_manager.markConsumed(ch_nxt);
+                    } else {
+                        try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ch_addr, chain_val, saTypeOf(ch_elem) });
+                    }
                     return;
                 }
             }
@@ -6234,13 +6300,25 @@ pub const Parser = struct {
             const index = try self.parseExpression();
             try self.expect(.r_bracket);
 
-            if (self.current.tag == .equal) {
+            if (self.current.tag == .equal or self.current.tag == .plus_equal or self.current.tag == .minus_equal) {
+                const is_add_assign = self.current.tag != .equal;
+                const add_is_plus = self.current.tag == .plus_equal;
                 try self.advance();
                 const val = try self.parseExpression();
                 _ = try self.accept(.semicolon);
                 // A Map-typed base stores through the btree, not the slice
-                // header (`m[k] = v` sugar for `m.set(k, v)`).
+                // header (`m[k] = v` sugar for `m.set(k, v)`). Compound
+                // assignment on map entries stays refused (no read-modify
+                // -write sugar there yet).
                 if (self.isMapVar(name)) {
+                    if (is_add_assign) {
+                        _ = try self.refuseAt(
+                            "error: compound assignment on map entries is not supported",
+                            .{},
+                            error.ConstructorsNotSupported,
+                        );
+                        return error.ConstructorsNotSupported;
+                    }
                     const mks = try self.mapKeySlice(index);
                     try self.lowerer.emitImport("sa_std/btree_map.sa");
                     try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ name, mks, val });
@@ -6261,8 +6339,19 @@ pub const Parser = struct {
                 try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off_temp, index, st_size });
                 const addr_temp = try self.newTemp();
                 try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, base_temp, off_temp });
-                // `store` requires an explicit byte offset, like `load`.
-                try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr_temp, val, saTypeOf(st_elem) });
+                if (is_add_assign) {
+                    // `arr[i] += v` / `arr[i] -= v`: load, combine, store.
+                    const cur_temp = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cur_temp, addr_temp, saTypeOf(st_elem) });
+                    const nxt_temp = try self.newTemp();
+                    try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ nxt_temp, if (add_is_plus) "add" else "sub", cur_temp, val });
+                    self.scope_manager.markConsumed(cur_temp);
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr_temp, nxt_temp, saTypeOf(st_elem) });
+                    self.scope_manager.markConsumed(nxt_temp);
+                } else {
+                    // `store` requires an explicit byte offset, like `load`.
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr_temp, val, saTypeOf(st_elem) });
+                }
             }
         } else if (self.current.tag == .equal) {
             // Simple assignment: x = expr, or x = { ... } for a struct.
@@ -6349,6 +6438,18 @@ pub const Parser = struct {
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
             try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ temp, name });
+            try self.releaseOwnedIfLive(name);
+            try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
+            self.scope_manager.markConsumed(temp);
+            self.markRebound(name);
+        } else if (self.current.tag == .plus_equal or self.current.tag == .minus_equal) {
+            // Compound assignment on a scalar: `x += v` / `x -= v`.
+            const is_add = self.current.tag == .plus_equal;
+            try self.advance();
+            const val = try self.parseExpression();
+            _ = try self.accept(.semicolon);
+            const temp = try self.newTemp();
+            try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp, if (is_add) "add" else "sub", name, val });
             try self.releaseOwnedIfLive(name);
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
             self.scope_manager.markConsumed(temp);

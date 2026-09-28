@@ -1831,6 +1831,64 @@ test "sa_plugin_ts treats return before a statement keyword as bare (ASI)" {
     try std.testing.expect(std.mem.indexOf(u8, asi, "return") != null);
 }
 
+test "sa_plugin_ts lowers scalar and indexed +=/-=" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(a: i32[], i: i32): i32 {
+        \\  let t = 1;
+        \\  t += 5;
+        \\  t -= 2;
+        \\  a[i] += t;
+        \\  return a[i];
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const cae = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, cae, "= add t, 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cae, "= sub t, 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cae, "store ") != null);
+}
+
+test "sa_plugin_ts lowers [a, b] = [b, a] swaps via frozen moves" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  let a = 1;
+        \\  let b = 2;
+        \\  ;[a, b] = [b, a];
+        \\  return a;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const swp = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // RHS frozen before the stores (order matters for the swap).
+    try std.testing.expect(std.mem.indexOf(u8, swp, "a = t_") != null);
+}
+
 test "sa_plugin_ts await unwraps and consumes the ready future" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
