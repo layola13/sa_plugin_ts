@@ -179,6 +179,9 @@ pub const Parser = struct {
     class_traits: std.StringHashMap(void) = undefined,
     /// `Child` -> `Parent` (`extends` clause, trait downgrade: copy-down).
     class_parent: std.StringHashMap([]const u8) = undefined,
+    /// `Child.method` -> defining class for copy-down aliases (the shared
+    /// body emits once as `@Parent_method`; dispatch must use that name).
+    method_emit_owner: std.StringHashMap([]const u8) = undefined,
     /// Expected element type for a dynamic `new Array(n)` / `Array(n)` whose
     /// length is a runtime value: set from the assignment target's declared
     /// element type while lowering the right-hand side (`this.queue = ...`
@@ -333,6 +336,7 @@ pub const Parser = struct {
         parser_inst.class_methods = std.StringHashMap(MethodSig).init(allocator);
         parser_inst.class_traits = std.StringHashMap(void).init(allocator);
         parser_inst.class_parent = std.StringHashMap([]const u8).init(allocator);
+        parser_inst.method_emit_owner = std.StringHashMap([]const u8).init(allocator);
         parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);
         parser_inst.imported_files = std.StringHashMap(void).init(allocator);
 
@@ -932,11 +936,13 @@ pub const Parser = struct {
             const e = try self.parseExpression();
             // Freeze each RHS value with a pure move (`t = e`): the later
             // stores must not move a register an earlier element still
-            // needs (`[a, b] = [b, a]`). A copy (`t = add e, 0`) leaves an
-            // arithmetic temp whose bare move into the target trips the
-            // verifier's exit walk, while chained pure moves verify clean.
+            // needs (`[a, b] = [b, a]`). Moves consume: mark the source so
+            // the exit walk does not release it again (UseAfterMove). A
+            // copy (`t = add e, 0`) would instead leave an arithmetic temp
+            // whose bare move trips the exit walk, so pure moves it is.
             const t = try self.newTemp();
             try self.lowerer.emit("    {s} = {s}\n", .{ t, e });
+            if (self.scope_manager.lookup(e)) |_| self.scope_manager.markConsumed(e);
             try tmps.append(t);
             if (!(try self.accept(.comma))) break;
             if (self.current.tag == .r_bracket) break;
@@ -1058,6 +1064,12 @@ pub const Parser = struct {
                 }
             },
             .keyword_async => try self.parseAsyncFunction(),
+            .keyword_super => {
+                // `super(args);` / `super.m(args);` as a statement: value
+                // discarded (the primary path emits the parent call).
+                _ = try self.parseExpression();
+                _ = try self.accept(.semicolon);
+            },
             .identifier => {
                 // Check for export keyword
                 if (std.mem.eql(u8, self.currentText(), "export")) {
@@ -1768,12 +1780,37 @@ pub const Parser = struct {
             }
         }
         if (self.current.tag == .keyword_extends) {
-            _ = self.refuseAt(
-                "error: class extends is not supported yet (trait-downgrade Phase 2)",
-                .{},
-                error.ClassExtendsNotSupported,
-            ) catch |err| return err;
-            return error.ClassExtendsNotSupported;
+            // Intra-file `extends`: trait downgrade via copy-down. The
+            // parent layout prefixes the child layout (same field offsets),
+            // non-overridden parent methods alias under the child key (one
+            // shared function body), `super(args)` calls the parent ctor and
+            // `super.m(args)` the parent method statically. The parent must
+            // be defined earlier in the file; cross-file parents stay loud.
+            try self.advance();
+            const parent_tok = self.current;
+            try self.expect(.identifier);
+            const parent_name = self.tokenText(parent_tok);
+            if (self.current.tag == .less) {
+                try self.advance();
+                var depth: usize = 1;
+                while (depth > 0 and self.current.tag != .eof) {
+                    if (self.current.tag == .less) depth += 1;
+                    if (self.current.tag == .greater) depth -= 1;
+                    try self.advance();
+                }
+            }
+            if (self.layout_table.find(parent_name) == null) {
+                _ = try self.refuseAt(
+                    "error: extends of unknown class '{s}': the parent must be defined earlier in the file",
+                    .{parent_name},
+                    error.UnknownParentClass,
+                );
+                return error.UnknownParentClass;
+            }
+            try self.class_parent.put(
+                try self.allocator.dupe(u8, class_name),
+                try self.allocator.dupe(u8, parent_name),
+            );
         }
         if (self.current.tag == .keyword_implements) {
             try self.advance();
@@ -1796,6 +1833,36 @@ pub const Parser = struct {
             }
         }
         try self.expect(.l_brace);
+        // Copy-down dispatch, registered UP FRONT (not at class end): the
+        // child's own method bodies resolve inherited calls (`this.size()`)
+        // while parsing. Non-overridden parent methods alias under the
+        // child key (shared body — layouts prefix). Overrides (emitted
+        // later) overwrite these entries; pre-scan stubs skip existing keys.
+        if (self.class_parent.get(class_name)) |parent_name| {
+            var to_alias = std.ArrayList([]const u8).init(self.allocator);
+            defer to_alias.deinit();
+            var kit = self.class_methods.keyIterator();
+            const prefix = try std.fmt.allocPrint(self.allocator, "{s}.", .{parent_name});
+            while (kit.next()) |k| {
+                if (std.mem.startsWith(u8, k.*, prefix)) {
+                    try to_alias.append(k.*);
+                }
+            }
+            for (to_alias.items) |pkey| {
+                const mname = pkey[prefix.len..];
+                const ckey = try self.methodKey(class_name, mname);
+                if (!self.class_methods.contains(ckey)) {
+                    if (self.class_methods.get(pkey)) |entry| {
+                        try self.class_methods.put(ckey, entry);
+                        const owner = self.method_emit_owner.get(pkey) orelse parent_name;
+                        try self.method_emit_owner.put(
+                            try self.allocator.dupe(u8, ckey),
+                            try self.allocator.dupe(u8, owner),
+                        );
+                    }
+                }
+            }
+        }
         // Two-phase lowering: method bodies reference `this` (field layout)
         // and sibling-class types, so the layout must exist before any body
         // is parsed. Pre-scan fields first and register the layout up front;
@@ -1808,6 +1875,21 @@ pub const Parser = struct {
             const saved_tpl = self.template_lexer_mode;
             var pre_fields = std.ArrayList(Field).init(self.allocator);
             var pre_offset: u32 = 0;
+            // Copy-down: parent fields prefix the child layout, so every
+            // parent offset is valid on child instances and parent method
+            // bodies (parsed once, against the parent layout) stay correct.
+            if (self.class_parent.get(class_name)) |parent_name| {
+                if (self.layout_table.find(parent_name)) |playout| {
+                    for (playout.fields.items) |pf| {
+                        try pre_fields.append(.{
+                            .name = try self.allocator.dupe(u8, pf.name),
+                            .offset = pf.offset,
+                            .type_name = try self.allocator.dupe(u8, pf.type_name),
+                        });
+                    }
+                    pre_offset = playout.size;
+                }
+            }
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 _ = try self.skipModifiers();
                 if (self.current.tag == .keyword_constructor or
@@ -1873,23 +1955,33 @@ pub const Parser = struct {
                         try self.expect(.r_paren);
                         // Skip return annotation up to `{` or `;`, then the body.
                     } else if (self.current.tag == .l_paren) {
-                    // Skip `(params)` with nesting (defaults may nest brackets).
-                        try self.advance();
-                        var pd: usize = 1;
-                        while (pd > 0 and self.current.tag != .eof) {
-                            switch (self.current.tag) {
-                                .l_paren, .l_bracket, .l_brace => pd += 1,
-                                .r_paren, .r_bracket, .r_brace => {
-                                    pd -= 1;
-                                    if (pd == 0) {
-                                        try self.advance();
-                                        break;
-                                    }
-                                },
-                                else => {},
+                        // Parse (not just skip) `(params)`: forward calls in
+                        // earlier method bodies need arity/optional/default
+                        // info for short-call padding before the real entry
+                        // lands (`this.bubbleUp()` pads `index` from the
+                        // pre-scan stub). Pure token slicing, no emission.
+                        // Merge into the stub put above (it already exists),
+                        // preserving its void mark.
+                        var pre_params = try self.parseMethodParams();
+                        defer pre_params.deinit();
+                        var stored: ?[]StoredParam = null;
+                        if (pre_params.items.len > 0) {
+                            const arr = try self.allocator.alloc(StoredParam, pre_params.items.len);
+                            for (pre_params.items, 0..) |p, idx| {
+                                arr[idx] = .{
+                                    .name = try self.allocator.dupe(u8, p.name),
+                                    .type_name = try self.allocator.dupe(u8, p.type_name),
+                                    .optional = p.optional,
+                                    .default_src = if (p.default_src) |ds| try self.allocator.dupe(u8, ds) else null,
+                                };
                             }
-                            if (pd > 0) try self.advance();
+                            stored = arr;
                         }
+                        const prev_stub = self.class_methods.get(pre_key);
+                        try self.class_methods.put(pre_key, .{
+                            .is_void = if (prev_stub) |ps| ps.is_void else false,
+                            .params = stored,
+                        });
                     }
                     // Skip return annotation up to `{` or `;`, then the body.
                     // A `: void` annotation marks the method void so callers
@@ -1898,7 +1990,13 @@ pub const Parser = struct {
                         try self.advance();
                         if (self.current.tag == .keyword_void) {
                             const is_ctor = std.mem.eql(u8, pre_name, "ctor");
-                            try self.class_methods.put(pre_key, .{ .is_void = !is_ctor });
+                            // Merge, don't overwrite: the params recorded
+                            // above must survive the void mark.
+                            const prev = self.class_methods.get(pre_key);
+                            try self.class_methods.put(pre_key, .{
+                                .is_void = !is_ctor,
+                                .params = if (prev) |pe| pe.params else null,
+                            });
                         }
                     }
                     while (self.current.tag != .l_brace and self.current.tag != .semicolon and self.current.tag != .eof) {
@@ -3149,6 +3247,10 @@ pub const Parser = struct {
         }
         try self.pushLoopTargets(end_label, loop_label);
 
+        // Loop-carried scalar tracking (emitMove copies instead of moving):
+        // for-of/for set this around their bodies; while must too.
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
         if (self.current.tag == .l_brace) {
             try self.advance();
             try self.scope_manager.enterScope();
@@ -3162,7 +3264,11 @@ pub const Parser = struct {
         }
 
         try self.lowerer.useLabel(loop_label);
-        try self.lowerer.emitJumpTo(loop_label);
+        // A body ending in `break`/`continue`/`return` already terminates:
+        // a back-edge after it would be an unreachable fallthrough block.
+        if (!self.lowerer.isTerminated()) {
+            try self.lowerer.emitJumpTo(loop_label);
+        }
         try self.lowerer.emitLabel(end_label);
         self.popLoopTargets();
     }
@@ -3208,13 +3314,34 @@ pub const Parser = struct {
     /// The old value is released via `releaseOwnedIfLive`; the fresh value
     /// then needs its own future release, hence the flag reset.
     fn emitMove(self: *Parser, name: []const u8, val: []const u8) anyerror!void {
-        if (!std.mem.eql(u8, name, val)) {
-            try self.releaseOwnedIfLive(name);
-            if (self.scope_manager.lookup(val) != null) {
-                self.scope_manager.markConsumed(val);
+        // Loop-carried scalars copy instead of move: a var consumed in the
+        // body but live at entry trips the back-edge merge (PhiStateConflict
+        // — `index = parentIndex` with no later rebind), while the source
+        // is dead at TS level (reassigned each iteration before use).
+        // Pointer/slice/struct values keep move semantics (a copy would
+        // double-own the buffer). Temps are all heap-flagged, so decide by
+        // scalar type instead of the flag.
+        var src: []const u8 = val;
+        if (self.loop_depth > 0 and !std.mem.eql(u8, name, val)) {
+            if (self.scope_manager.lookup(val)) |sv| {
+                const tn = sv.type_name;
+                const scalar = std.mem.eql(u8, tn, "i32") or std.mem.eql(u8, tn, "u32") or
+                    std.mem.eql(u8, tn, "number") or std.mem.eql(u8, tn, "boolean") or
+                    std.mem.eql(u8, tn, "i64") or std.mem.eql(u8, tn, "u64");
+                if (scalar) {
+                    const tmp = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, 0\n", .{ tmp, val });
+                    src = tmp;
+                }
             }
         }
-        try self.lowerer.emit("    {s} = {s}\n", .{ name, val });
+        if (!std.mem.eql(u8, name, src)) {
+            try self.releaseOwnedIfLive(name);
+            if (self.scope_manager.lookup(src) != null) {
+                self.scope_manager.markConsumed(src);
+            }
+        }
+        try self.lowerer.emit("    {s} = {s}\n", .{ name, src });
         self.markRebound(name);
     }
 
@@ -5121,6 +5248,10 @@ pub const Parser = struct {
     fn classMethodEmitName(self: *Parser, static_type: []const u8, method: []const u8) anyerror!?[]const u8 {
         const key = try self.methodKey(static_type, method);
         if (self.class_methods.contains(key)) {
+            // Copy-down alias: the body emits once under the defining class.
+            if (self.method_emit_owner.get(key)) |owner| {
+                return try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ owner, method });
+            }
             return try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ static_type, method });
         }
         return null;
@@ -5155,6 +5286,33 @@ pub const Parser = struct {
             _ = try self.accept(.comma);
         }
         try self.expect(.r_paren);
+        // Short-call padding for defaulted/optional params (mirrors the
+        // arrow-alias rule): `this.bubbleUp()` replays `index = ...` in the
+        // callee prologue from a padded `0`.
+        if (self.class_methods.get(try self.methodKey(recv_type, member_name))) |msig| {
+            if (msig.params) |sparams| {
+                var mreq: usize = 0;
+                for (sparams) |sp| {
+                    if (!sp.optional and sp.default_src == null) mreq += 1;
+                }
+                if (args.items.len < mreq) {
+                    _ = try self.refuseAt(
+                        "error: too few arguments in call",
+                        .{},
+                        error.TooFewArguments,
+                    );
+                    return error.TooFewArguments;
+                }
+                var mpad: usize = sparams.len;
+                if (mpad > args.items.len) {
+                    mpad -= args.items.len;
+                    var mi: usize = 0;
+                    while (mi < mpad) : (mi += 1) {
+                        try args.append("0");
+                    }
+                }
+            }
+        }
         const is_void = try self.classMethodIsVoid(recv_type, member_name);
         if (is_void) {
             try self.lowerer.emit("    call @{s}({s}", .{ emit_name, left });
@@ -6996,6 +7154,98 @@ pub const Parser = struct {
                 try self.advance();
                 return "this";
             },
+            .keyword_super => {
+                // `super(args)` runs the parent ctor on `this`;
+                // `super.m(args)` statically calls the parent method.
+                // Both need the enclosing class (set for every method body,
+                // including ctors) and a recorded intra-file parent.
+                try self.advance();
+                const cur = self.current_class orelse {
+                    _ = try self.refuseAt(
+                        "error: super outside a class method",
+                        .{},
+                        error.SuperOutsideClass,
+                    );
+                    return error.SuperOutsideClass;
+                };
+                const parent = self.class_parent.get(cur) orelse {
+                    _ = try self.refuseAt(
+                        "error: super in a class without extends",
+                        .{},
+                        error.SuperWithoutExtends,
+                    );
+                    return error.SuperWithoutExtends;
+                };
+                if (self.current.tag == .l_paren) {
+                    try self.advance();
+                    // No explicit parent ctor: `super()` is a no-op (there
+                    // is no body to run; field memory comes from the child
+                    // allocation). Emitting a call would reference a
+                    // function that was never declared.
+                    const ckey = try self.methodKey(parent, "ctor");
+                    if (self.class_methods.get(ckey) == null) {
+                        while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                            _ = try self.parseExpression();
+                            _ = try self.accept(.comma);
+                        }
+                        try self.expect(.r_paren);
+                        return "0";
+                    }
+                    try self.lowerer.emit("    call @{s}_ctor(this", .{parent});
+                    while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                        const a = try self.parseExpression();
+                        try self.lowerer.emit(", {s}", .{try self.argReg(a)});
+                        _ = try self.accept(.comma);
+                    }
+                    try self.expect(.r_paren);
+                    try self.lowerer.emit(")\n", .{});
+                    return "0";
+                }
+                try self.expect(.dot);
+                const mtok = self.current;
+                try self.expect(.identifier);
+                const mname = self.tokenText(mtok);
+                try self.expect(.l_paren);
+                var sargs = std.ArrayList([]const u8).init(self.allocator);
+                defer sargs.deinit();
+                while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                    const a = try self.parseExpression();
+                    try sargs.append(try self.argReg(a));
+                    _ = try self.accept(.comma);
+                }
+                try self.expect(.r_paren);
+                const skey = try self.methodKey(parent, mname);
+                const sentry = self.class_methods.get(skey) orelse {
+                    _ = try self.refuseAt(
+                        "error: super.{s} does not resolve in parent '{s}'",
+                        .{ mname, parent },
+                        error.UnknownParentMethod,
+                    );
+                    return error.UnknownParentMethod;
+                };
+                // Resolve through the copy-down alias chain: the body emits
+                // once under the defining class (`Min.swap` aliases
+                // `Heap.swap`, so `super.swap` in `PQ` calls `@Heap_swap`).
+                const semit = self.method_emit_owner.get(skey) orelse parent;
+                if (sentry.is_void) {
+                    try self.lowerer.emit("    call @{s}_{s}(this", .{ semit, mname });
+                    for (sargs.items) |a| {
+                        try self.lowerer.emit(", {s}", .{a});
+                    }
+                    try self.lowerer.emit(")\n", .{});
+                    return "0";
+                }
+                const st = try self.newTemp();
+                try self.lowerer.emit("    {s} = call @{s}_{s}(this", .{ st, semit, mname });
+                for (sargs.items) |a| {
+                    try self.lowerer.emit(", {s}", .{a});
+                }
+                try self.lowerer.emit(")\n", .{});
+                if (sentry.ret) |rt| {
+                    if (!std.mem.eql(u8, rt, "void")) try self.retagTemp(st, rt);
+                }
+                return st;
+            },
             .l_paren => {
                 try self.advance();
                 // Detect arrow function: () =>, (a) =>, (a: T, b) =>.
@@ -7755,14 +8005,43 @@ pub const Parser = struct {
                     // keeps the normal method path.
                     return try self.lowerArrayFrom();
                 } else if (std.mem.eql(u8, left, "Math") and self.scope_manager.lookup(left) == null) {
-                    // `Math.*` silently miscompiled to empty output (member
-                    // recovery swallowed it): refuse loudly instead.
-                    _ = try self.refuseAt(
-                        "error: Math.{s} is not supported",
-                        .{member_name},
-                        error.MathNotSupported,
-                    );
-                    return error.MathNotSupported;
+                    // `Math.floor(e)`: the subset's numbers are i32, and the
+                    // floor of an integer is itself, so integer args lower as
+                    // a copy (heap's `Math.floor((index - 1) / 2)` needs no
+                    // fixup). Float args stay loud; other `Math.*` stay loud
+                    // (they previously miscompiled to empty output silently).
+                    if (!std.mem.eql(u8, member_name, "floor")) {
+                        _ = try self.refuseAt(
+                            "error: Math.{s} is not supported",
+                            .{member_name},
+                            error.MathNotSupported,
+                        );
+                        return error.MathNotSupported;
+                    }
+                    try self.expect(.l_paren);
+                    const fnum = try self.parseExpression();
+                    if (self.current.tag != .r_paren) {
+                        _ = try self.refuseAt(
+                            "error: Math.floor takes a single argument",
+                            .{},
+                            error.MathNotSupported,
+                        );
+                        return error.MathNotSupported;
+                    }
+                    try self.expect(.r_paren);
+                    if (self.scope_manager.lookup(fnum)) |fv| {
+                        if (std.mem.eql(u8, fv.type_name, "f64")) {
+                            _ = try self.refuseAt(
+                                "error: Math.floor on floats is not supported",
+                                .{},
+                                error.MathNotSupported,
+                            );
+                            return error.MathNotSupported;
+                        }
+                    }
+                    const fout = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, 0\n", .{ fout, fnum });
+                    return fout;
                 } else if (std.mem.eql(u8, member_name, "charCodeAt")) {
                     // `s.charCodeAt(i)`: byte load from the string slice.
                     try self.expect(.l_paren);

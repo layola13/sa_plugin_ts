@@ -1803,6 +1803,136 @@ test "sa_plugin_ts lowers Array.from length-mapper to a fill loop" {
     try std.testing.expect(std.mem.indexOf(u8, frm, "store ") != null);
 }
 
+test "sa_plugin_ts lowers extends with copy-down and super calls" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\class Base {
+        \\  x: i32
+        \\  constructor(v: i32) {
+        \\    this.x = v
+        \\  }
+        \\  get(): i32 {
+        \\    return this.x
+        \\  }
+        \\}
+        \\class Child extends Base {
+        \\  constructor(v: i32) {
+        \\    super(v)
+        \\  }
+        \\  get2(): i32 {
+        \\    return super.get()
+        \\  }
+        \\}
+        \\function main(): i32 {
+        \\  const c = new Child(7);
+        \\  return c.get();
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const ext = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Parent ctor runs on the child instance; super.m dispatches to the
+    // shared parent body; inherited calls reuse it (no Child_get emitted).
+    try std.testing.expect(std.mem.indexOf(u8, ext, "call @Base_ctor(this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "call @Base_get(this") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ext, "@Child_get(") == null);
+}
+
+test "sa_plugin_ts lowers Math.floor on integers as identity" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(index: i32): i32 {
+        \\  const p = Math.floor((index - 1) / 2);
+        \\  return p;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const flr = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    try std.testing.expect(std.mem.indexOf(u8, flr, "div ") != null);
+}
+
+test "sa_plugin_ts skips the while back-edge after a terminating body" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(x: i32, y: i32): i32 {
+        \\  while (x || y) {
+        \\    break;
+        \\  }
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const wb = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // The break jumps to the loop end; no dangling back-edge follows it.
+    try std.testing.expect(std.mem.indexOf(u8, wb, "L_endwhile_") != null);
+}
+
+test "sa_plugin_ts copies loop-carried scalars instead of moving them" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(n: i32): i32 {
+        \\  let p = 0;
+        \\  let i = n;
+        \\  while (i > 0) {
+        \\    p = i / 2;
+        \\    i = p;
+        \\  }
+        \\  return i;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const lc = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
+    // Copy, not move: the source stays live for the back-edge merge.
+    try std.testing.expect(std.mem.indexOf(u8, lc, "L_while_") != null);
+}
+
 test "sa_plugin_ts treats return before a statement keyword as bare (ASI)" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
