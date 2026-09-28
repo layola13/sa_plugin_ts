@@ -1750,6 +1750,24 @@ pub const Parser = struct {
                         }
                         try self.advance();
                     }
+                } else if (self.current.tag == .l_brace) {
+                    // Object-literal field initializers (`children:
+                    // Record<...> = {}`) cannot lower in field position (no
+                    // `this` yet): skip structurally. Map/Record fields hold
+                    // btree handles created fresh at every `new` site (see
+                    // parseNew), so an empty `{}` needs no entry replay.
+                    var bdepth: u32 = 0;
+                    while (self.current.tag != .eof) {
+                        if (self.current.tag == .l_brace) bdepth += 1;
+                        if (self.current.tag == .r_brace) {
+                            bdepth -= 1;
+                            if (bdepth == 0) {
+                                try self.advance();
+                                break;
+                            }
+                        }
+                        try self.advance();
+                    }
                 } else {
                     _ = try self.parseExpression();
                 }
@@ -1790,7 +1808,59 @@ pub const Parser = struct {
         try self.expect(.identifier);
         const name = self.tokenText(name_tok);
 
+        // Generic params on the alias (`type Node<T> = ...`): construction
+        // is monomorphic here, so only the base name survives.
+        if (self.current.tag == .less) {
+            try self.advance();
+            var gdepth: usize = 1;
+            while (gdepth > 0 and self.current.tag != .eof) {
+                if (self.current.tag == .less) gdepth += 1;
+                if (self.current.tag == .greater) gdepth -= 1;
+                try self.advance();
+            }
+        }
+
         try self.expect(.equal);
+
+        // Object-shape aliases (`type Node<T> = { value: T; next?: ... }`)
+        // register a struct layout exactly like interfaces, so `{...} as
+        // Node<T>` can build inline.
+        if (self.current.tag == .l_brace) {
+            try self.advance();
+            var alias_fields = std.ArrayList(Field).init(self.allocator);
+            var alias_offset: u32 = 0;
+            while (self.current.tag != .r_brace and self.current.tag != .eof) {
+                const af_tok = self.current;
+                try self.expect(.identifier);
+                const af_name = self.tokenText(af_tok);
+                _ = try self.accept(.question);
+                _ = try self.accept(.bang);
+                try self.expect(.colon);
+                const af_type = try self.parseTypeName();
+                var af_size: u32 = 8;
+                var af_align: u32 = 8;
+                try getTypeSizeAndAlign(af_type, &af_size, &af_align);
+                alias_offset = alignTo(alias_offset, af_align);
+                try alias_fields.append(.{
+                    .name = try self.allocator.dupe(u8, af_name),
+                    .offset = alias_offset,
+                    .type_name = try self.allocator.dupe(u8, af_type),
+                });
+                alias_offset += af_size;
+                _ = try self.accept(.semicolon);
+                _ = try self.accept(.comma);
+            }
+            try self.expect(.r_brace);
+            _ = try self.accept(.semicolon);
+            if (self.layout_table.find(name) == null) {
+                try self.layout_table.register(name, .{
+                    .name = try self.allocator.dupe(u8, name),
+                    .size = alias_offset,
+                    .fields = alias_fields,
+                });
+            }
+            return;
+        }
 
         const target_tok = self.current;
         try self.expect(.identifier);
@@ -1940,7 +2010,17 @@ pub const Parser = struct {
             type_name = try self.parseTypeName();
         }
 
-        try self.expect(.equal);
+        // `let x: T;` declares without an initializer (`undefined` lowers
+        // as null/0); previously `expect(.equal)` threw here and desynced
+        // the rest of the class (`toArray(): T[]` misparsed as a result).
+        if (!(try self.accept(.equal))) {
+            const t_uninit: []const u8 = type_name orelse "i32";
+            const uninit_heap = std.mem.eql(u8, t_uninit, "string") or isFutureType(t_uninit);
+            try self.scope_manager.declareVar(var_name, t_uninit, var_name, uninit_heap);
+            try self.lowerer.emit("    {s} = 0\n", .{var_name});
+            _ = try self.accept(.semicolon);
+            return;
+        }
 
         // `{...}` initializers dispatch on the annotation: a known struct
         // layout builds inline, Map/Record constructs a btree, otherwise
@@ -6599,7 +6679,18 @@ pub const Parser = struct {
                 }
                 try self.lowerer.emit("    {s} = alloc {d}\n", .{ dest, layout.size });
                 for (layout.fields.items) |f| {
-                    try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ dest, f.offset, saTypeOf(f.type_name) });
+                    if (std.mem.eql(u8, f.type_name, "Map") or std.mem.eql(u8, f.type_name, "Record")) {
+                        // Map/Record fields always hold btree handles: a
+                        // zeroed slot would be a null map (`children = {}`
+                        // has no ctor to run in). Fresh btree per `new`; a
+                        // ctor body overwrites it when it assigns the field.
+                        try self.lowerer.emitImport("sa_std/btree_map.sa");
+                        const bt_reg = try self.newTemp();
+                        try self.lowerer.emit("    {s} = call @sa_btree_map_new()\n", .{bt_reg});
+                        try self.lowerer.emit("    store {s} + {d}, {s} as ptr\n", .{ dest, f.offset, bt_reg });
+                    } else {
+                        try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ dest, f.offset, saTypeOf(f.type_name) });
+                    }
                 }
                 // Trait downgrade: `new C(args)` = alloc + zero-init + `@C_ctor`.
                 // No explicit ctor keeps the old zero-init behavior.
