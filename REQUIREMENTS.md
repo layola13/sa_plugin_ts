@@ -15,8 +15,20 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] **Static Offset Mapping**: Interface property access lowered to static byte offsets.
 - [x] **Ownership Injection**: SA ownership operator `!` injected from lexical scope, and released on every exit path.
 - [x] **Standard Library Mapping**: fs and net calls mapped to SA `@sa_fs_*` / `@sa_net_*` primitives with string arg expansion.
-- [x] **Async/Await Support**: `async function f(): T` lowers to a ready-future
-  wrapper (no executor; `await` unwraps the value). Verifier-accepted.
+- [x] **Async/Await Support** (copied from `sa_plugin_sla`'s future model):
+  `async function f(): T` returns a ready-future handle (ReadyFuture layout,
+  state +0 / value +8, width-aware stores); `return v` wraps via the
+  `FUTURE_READY_STATE_NEW` shape, `await` unwraps and consumes via the
+  `FUTURE_READY_STATE_INTO_INNER` shape (state set to PENDING, so a second
+  poll observes pending). `await` inside `async` checks the state and
+  returns a pending handle to the caller (SLA's
+  `ready_pending_state_return_if_async` shape with pending-path cleanups).
+  `async function main` is driven by a synthesized synchronous `@main`
+  entry (the TS equivalent of SLA's `sched_block_on_timeout` boundary
+  driver in `sa_std/async.sla`): it calls `@async_main()` and unwraps the
+  ready value as the exit status. Async signatures are pre-registered, so
+  forward calls (`main` first) still tag future results. Verifier-accepted;
+  demos `263_async_await` / `264_async_chain` match Node (42).
 - [x] **WASM Interop**: `.wasm` imports declare an arity-matched `@extern` at
   the first call site (verifier-accepted; linking needs the real module).
 - [x] **WIT Support**: `.wit` imports are refused with a located diagnostic —
@@ -76,7 +88,8 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] SA-ASM validity regression tests, plus an end-to-end check that runs `sa build` on lowered output
 - [x] TypeScript demo corpus: 260 demos under `demos/`, verified by
       `tools/verify_demos.sh` (each demo is lowered and then assembled with the
-      real `sa build`). Currently 260 verified against Node, 0 refused, 0 fail.
+      real `sa build`). Currently 262 verified against Node, 0 refused, 0 fail
+      (including `263_async_await` and `264_async_chain`).
 - [x] `new` expressions (minimal): `new Map()` lowers to the real
   `sa_std/btree_map.sa` backend (`call @sa_btree_map_new()`); `new Array(n)` /
   `new Array<T>(n)` with an integer-literal length lowers to the 16-byte

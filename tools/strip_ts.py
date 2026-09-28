@@ -65,7 +65,7 @@ def strip(src: str) -> str:
 
 
 HARNESS = """
-const __r = (typeof main === 'function') ? main() : 0;
+const __r = (typeof main === 'function') ? await main() : 0;
 process.stdout.write(String(__r === undefined ? 0 : __r));
 """
 

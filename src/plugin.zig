@@ -1593,6 +1593,74 @@ test "sa_plugin_ts lowers new Array(n) to a zeroed slice" {
     try std.testing.expect(std.mem.indexOf(u8, result, "+ 8, 3 as u64") != null);
 }
 
+test "sa_plugin_ts await unwraps and consumes the ready future" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\async function fetch(): i32 {
+        \\  return 41;
+        \\}
+        \\function main(): i32 {
+        \\  const v = await fetch();
+        \\  return v + 1;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+    // Ready value is loaded out of the handle ...
+    try std.testing.expect(std.mem.indexOf(u8, result, " + 8 as i32") != null);
+    // ... and the handle is consumed (state set to PENDING, like
+    // FUTURE_READY_STATE_INTO_INNER).
+    try std.testing.expect(std.mem.indexOf(u8, result, " + 0, 0 as u64") != null);
+}
+
+test "sa_plugin_ts await inside async propagates a pending future" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\async function fetch(): i32 {
+        \\  return 41;
+        \\}
+        \\async function wrap(): i32 {
+        \\  const v = await fetch();
+        \\  return v + 1;
+        \\}
+        \\function main(): i32 {
+        \\  const v = await wrap();
+        \\  return v;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    const result = low.output.items;
+    // SLA's ready_pending_state_return_if_async shape: state check with a
+    // pending-return branch before the ready unwrap.
+    try std.testing.expect(std.mem.indexOf(u8, result, "L_await_pend_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "L_await_ready_") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, " = eq ") != null);
+}
+
 test "sa_plugin_ts compiles return statements" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);

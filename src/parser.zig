@@ -170,8 +170,11 @@ pub const Parser = struct {
     /// Depth inside `async function` bodies, with the innermost Tokio-style
     /// ready-future value type. An `async function f(): T` returns a
     /// `future<T>` handle (a 16-byte `{state, value}` heap struct mirroring
-    /// SLA's ReadyFuture); `await` unwraps it. There is no executor and no
-    /// pending state in the subset, so every future is already ready.
+    /// SLA's ReadyFuture); `await` unwraps and consumes it, and inside an
+    /// `async function` a pending handle propagates to the caller (SLA's
+    /// `ready_pending_state_return_if_async`). Created futures are always
+    /// ready; the pending path covers consumed handles and executor-driven
+    /// ones. `async function main` is driven by a synthesized sync `@main`.
     async_depth: u32 = 0,
     async_inner: ?[]const u8 = null,
     /// Async function names (duped) to their inner value type (duped).
@@ -229,6 +232,65 @@ pub const Parser = struct {
         parser_inst.wasm_syms = std.StringHashMap(void).init(allocator);
         parser_inst.wit_syms = std.StringHashMap(void).init(allocator);
         parser_inst.declared_externs = std.StringHashMap(void).init(allocator);
+
+        // Pre-register `async function` signatures (name -> inner value
+        // type) so forward calls still tag future-typed results: demos put
+        // `main` first and callees later, and the single-pass body walk
+        // would otherwise see an untagged call temp, making `await` pass
+        // the raw handle through as a value. Only the map is pre-filled;
+        // bodies still parse in order.
+        {
+            var scan = lexer_mod.Lexer{ .source = source };
+            var tok = scan.next();
+            while (tok.tag != .eof) {
+                if (tok.tag == .keyword_async) {
+                    const t_fn = scan.next();
+                    const t_name = scan.next();
+                    if (t_fn.tag == .keyword_function and t_name.tag == .identifier) {
+                        const name = source[t_name.start .. t_name.start + t_name.len];
+                        var t = scan.next();
+                        if (t.tag == .l_paren) {
+                            var depth: u32 = 1;
+                            while (depth > 0) {
+                                t = scan.next();
+                                if (t.tag == .eof) break;
+                                if (t.tag == .l_paren) depth += 1;
+                                if (t.tag == .r_paren) depth -= 1;
+                            }
+                            t = scan.next();
+                            var inner: []const u8 = "i32";
+                            if (t.tag == .colon) {
+                                t = scan.next();
+                                if (t.tag == .identifier) {
+                                    const type_start = t.start;
+                                    var type_end = t.start + t.len;
+                                    var t2 = scan.next();
+                                    if (t2.tag == .less) {
+                                        var gdepth: u32 = 1;
+                                        while (gdepth > 0) {
+                                            t2 = scan.next();
+                                            if (t2.tag == .eof) break;
+                                            if (t2.tag == .less) gdepth += 1;
+                                            if (t2.tag == .greater) gdepth -= 1;
+                                        }
+                                        type_end = t2.start + t2.len;
+                                    }
+                                    const raw = source[type_start..type_end];
+                                    if (!std.mem.eql(u8, raw, "void")) inner = raw;
+                                }
+                            }
+                            const key: []const u8 = if (std.mem.eql(u8, name, "main")) "async_main" else name;
+                            if (!parser_inst.async_fns.contains(key)) {
+                                try parser_inst.async_fns.put(try allocator.dupe(u8, key), try allocator.dupe(u8, inner));
+                            }
+                            tok = scan.next();
+                            continue;
+                        }
+                    }
+                }
+                tok = scan.next();
+            }
+        }
 
         return parser_inst;
     }
@@ -511,6 +573,35 @@ pub const Parser = struct {
 
     fn releaseArrowLive(self: *Parser) anyerror!void {
         try self.releaseArrowLiveExcept(null);
+    }
+
+    /// Emit cleanups for an `await` pending-propagation return (`return fut`
+    /// on the `L_await_pend` branch), mirroring sa_plugin_sla's
+    /// `emitAwaitPendingCleanups`: every live owned register except the
+    /// returned handle is released on that path only.
+    ///
+    /// Unlike `releaseLiveRegistersExcept`, the `is_released` flags are
+    /// snapshotted and restored: the pending `!`s execute only if the branch
+    /// is taken, while the ready path (and the function-exit walk) still
+    /// owns those registers. Marking them released here would leak them on
+    /// the ready path.
+    fn emitPendingReturnCleanups(self: *Parser, keep: []const u8) anyerror!void {
+        var saved = std.ArrayList(bool).init(self.allocator);
+        defer saved.deinit();
+        for (self.scope_manager.scopes.items) |*scope| {
+            for (scope.variables.items) |*v| {
+                try saved.append(v.is_released);
+            }
+        }
+        try self.refreshDominators();
+        try self.scope_manager.releaseAllOwnedExcept(self.lowerer, keep);
+        var idx: usize = 0;
+        for (self.scope_manager.scopes.items) |*scope| {
+            for (scope.variables.items) |*v| {
+                v.is_released = saved.items[idx];
+                idx += 1;
+            }
+        }
     }
 
     // ==========================================
@@ -1223,12 +1314,41 @@ pub const Parser = struct {
         if (return_type) |rt| {
             if (!std.mem.eql(u8, rt, "void")) inner = rt;
         }
+        // The SA entry point must be a synchronous `@main() -> i32` (its
+        // result is the process exit status). An `async function main`
+        // therefore keeps its body under `@async_main() -> ptr` and gets a
+        // synthesized synchronous driver, the TS equivalent of SLA's
+        // `sched_block_on_timeout` boundary driver (`sa_std/async.sla`):
+        // call the async body, then unwrap the (ready) future. Pending
+        // handles cannot be constructed yet, so no poll loop is needed;
+        // a pending handle at this boundary would unwrap stale data, which
+        // is documented in REQUIREMENTS rather than silently accepted.
+        const is_entry = std.mem.eql(u8, func_name, "main");
+        if (is_entry) {
+            if (!std.mem.eql(u8, inner, "i32")) {
+                std.debug.print("error:{d}:{d}: async 'main' must resolve to i32 (the exit status channel)\n", .{
+                    func_name_tok.line,
+                    func_name_tok.col,
+                });
+                return error.AsyncMainType;
+            }
+            if (params.items.len != 0) {
+                std.debug.print("error:{d}:{d}: async 'main' takes no arguments\n", .{
+                    func_name_tok.line,
+                    func_name_tok.col,
+                });
+                return error.AsyncMainArgs;
+            }
+        }
+        const emit_name: []const u8 = if (is_entry) "async_main" else func_name;
         const future_t = try futureTypeName(self.allocator, inner);
         defer self.allocator.free(future_t);
-        try self.scope_manager.declareVar(func_name, future_t, func_name, false);
-        try self.async_fns.put(try self.allocator.dupe(u8, func_name), try self.allocator.dupe(u8, inner));
+        try self.scope_manager.declareVar(emit_name, future_t, emit_name, false);
+        if (!self.async_fns.contains(emit_name)) {
+            try self.async_fns.put(try self.allocator.dupe(u8, emit_name), try self.allocator.dupe(u8, inner));
+        }
 
-        try self.lowerer.emit("@{s}(", .{func_name});
+        try self.lowerer.emit("@{s}(", .{emit_name});
         for (params.items, 0..) |p, idx| {
             if (idx > 0) try self.lowerer.emit(", ", .{});
             try self.lowerer.emit("{s}: {s}", .{ p.name, saTypeOf(p.type_name) });
@@ -1275,6 +1395,25 @@ pub const Parser = struct {
             try self.lowerer.emitTerm("    return {s}\n", .{fut});
         }
         try self.lowerer.finishFunction("return 0");
+        if (is_entry) {
+            try self.lowerer.emit("@main() -> i32:\n", .{});
+            self.lowerer.beginFunction();
+            self.scope_manager.defer_releases = true;
+            try self.scope_manager.enterScope();
+            const fut = try self.newTemp();
+            try self.retagTemp(fut, "future<i32>");
+            try self.lowerer.emit("    {s} = call @async_main()\n", .{fut});
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as i32\n", .{ out, fut });
+            try self.lowerer.emit("    store {s} + 0, 0 as u64\n", .{fut});
+            try self.lowerer.emit("    !{s}\n", .{fut});
+            self.scope_manager.markConsumed(fut);
+            try self.releaseLiveRegistersExcept(out);
+            try self.lowerer.emitTerm("    return {s}\n", .{out});
+            try self.scope_manager.exitScope(self.lowerer);
+            self.scope_manager.defer_releases = false;
+            try self.lowerer.finishFunction("return 0");
+        }
     }
 
     // ==========================================
@@ -1425,9 +1564,12 @@ pub const Parser = struct {
         self.markRebound(name);
     }
 
-    /// Build a ready-future handle holding `val` (or zero): a 16-byte heap
-    /// struct with state 1 (READY) at +0 and the value at +8, mirroring SLA's
-    /// ReadyFuture layout. Returns the owned future register.
+    /// Build a ready-future handle holding `val` (or zero), mirroring
+    /// sa_plugin_sla's `genReadyFutureI64` / `FUTURE_READY_STATE_NEW`
+    /// (`sa_std/core/future.sa`): a 16-byte heap struct with state 1 (READY)
+    /// at +0 and the value at +8. The value store stays width-aware
+    /// (`saTypeOf(inner)`) because TS futures carry typed values while the
+    /// std macro hardcodes `u64`. Returns the owned future register.
     fn buildReadyFuture(self: *Parser, val: ?[]const u8, inner: []const u8) anyerror![]const u8 {
         const fut = try self.newTemp();
         const future_t = try futureTypeName(self.allocator, inner);
@@ -3596,18 +3738,59 @@ pub const Parser = struct {
                 return temp_name;
             },
             .keyword_await => {
-                // `await` unwraps a ready-future handle into its value (every
-                // future in the subset is ready: no executor, no pending
-                // state). Awaiting a plain value is the identity, per JS
-                // semantics. Like other unary operators the operand is parsed
-                // tightly, so `await f() + 1` awaits the call, then adds.
+                // `await` unwraps a future handle into its value, mirroring
+                // sa_plugin_sla's await lowering (`planAwaitFuture` +
+                // `FUTURE_READY_STATE_INTO_INNER`): the ready value is loaded
+                // out of the `{state, value}` handle (ReadyFuture layout,
+                // state +0, value +8) and the handle is consumed (state set
+                // to 0 = PENDING, so a second poll observes pending, exactly
+                // like the std macro). Stores stay width-aware
+                // (`saTypeOf(inner)`): the std macro hardcodes `u64`, but TS
+                // futures carry typed values (`i32`, `f64`, pointers), so a
+                // literal `EXPAND FUTURE_READY_STATE_NEW/INTO_INNER` would be
+                // a width mismatch on 32-bit inners.
+                //
+                // Inside an `async function` (but not inside a nested arrow
+                // callback, whose `return` targets the callback, not the
+                // async function) a pending handle propagates: state is
+                // checked, `0` returns the handle to the caller (SLA's
+                // `ready_pending_state_return_if_async` shape:
+                // `br pending -> L_pend, L_ready` / `L_pend: return fut`),
+                // otherwise the ready value is unwrapped. Pending handles
+                // are not constructible yet (every created future is ready),
+                // but the branch keeps the lowering honest for consumed
+                // (double-awaited) handles and executor-driven futures.
+                //
+                // Awaiting a plain value is the identity, per JS semantics.
+                // Like other unary operators the operand is parsed tightly,
+                // so `await f() + 1` awaits the call, then adds.
                 try self.advance();
                 const operand = try self.parseExpressionWithPrecedence(.prefix);
                 if (self.scope_manager.lookup(operand)) |v| {
                     if (isFutureType(v.type_name)) {
                         const inner = futureInner(v.type_name);
+                        // The result temp is created after the pending branch
+                        // below: creating it before would make the pending-path
+                        // cleanup release a register that is only defined on
+                        // the ready path (`UnknownRegister`).
+                        if (self.async_depth > 0 and self.arrow_depth == 0) {
+                            const await_id = self.nextLabelId();
+                            const pend_label = try std.fmt.allocPrint(self.allocator, "L_await_pend_{d}", .{await_id});
+                            const ready_label = try std.fmt.allocPrint(self.allocator, "L_await_ready_{d}", .{await_id});
+                            const state_reg = try self.newTemp();
+                            const is_pend = try self.newTemp();
+                            try self.lowerer.emit("    {s} = load {s} + 0 as u64\n", .{ state_reg, operand });
+                            try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ is_pend, state_reg });
+                            try self.lowerer.emitBranchTo(is_pend, pend_label, ready_label);
+                            try self.lowerer.emitLabel(pend_label);
+                            try self.emitPendingReturnCleanups(operand);
+                            try self.lowerer.emitTerm("    return {s}\n", .{operand});
+                            try self.lowerer.emitLabel(ready_label);
+                        }
                         const temp_name = try self.newTemp();
+                        try self.retagTemp(temp_name, inner);
                         try self.lowerer.emit("    {s} = load {s} + 8 as {s}\n", .{ temp_name, operand, saTypeOf(inner) });
+                        try self.lowerer.emit("    store {s} + 0, 0 as u64\n", .{operand});
                         return temp_name;
                     }
                 }
