@@ -12,6 +12,7 @@ pub const Token = struct {
         identifier,
         keyword_let,
         keyword_const,
+        keyword_var,
         keyword_function,
         keyword_interface,
         keyword_if,
@@ -446,6 +447,7 @@ pub const Lexer = struct {
 fn getKeywordTag(text: []const u8) Token.Tag {
     if (std.mem.eql(u8, text, "let")) return .keyword_let;
     if (std.mem.eql(u8, text, "const")) return .keyword_const;
+    if (std.mem.eql(u8, text, "var")) return .keyword_var;
     if (std.mem.eql(u8, text, "function")) return .keyword_function;
     if (std.mem.eql(u8, text, "interface")) return .keyword_interface;
     if (std.mem.eql(u8, text, "if")) return .keyword_if;

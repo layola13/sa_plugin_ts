@@ -1148,16 +1148,22 @@ test "sa_plugin_ts compiles arrow function closures using static defunctionaliza
 
     try p.parse();
 
-    const result = low.output.items;
+    // Arrow callbacks are buffered out-of-line (SA-ASM has no nested
+    // functions), so join the buffers for substring assertions.
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.callbacks.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
 
     try std.testing.expect(std.mem.indexOf(u8, result, "@closure_callback_1(ctx: ptr):") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "user = load ctx + 0 as ptr") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "increment = load ctx + 8 as i32") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "!ctx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "ctx = alloc 16") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "store ctx + 0, user as ptr") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "store ctx + 8, increment as i32") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "call @setTimeout(@closure_callback_1, ^ctx, 1000)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "= alloc 16") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "+ 0, user as ptr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "+ 8, increment as i32") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @setTimeout(@closure_callback_1, ^ctx_1, 1000)") != null);
 }
 
 test "sa_plugin_ts compiles mathematical expressions using Pratt parser with correct precedence" {
@@ -1210,13 +1216,52 @@ test "sa_plugin_ts compiles WASM imports and stubs" {
 
     try p.parse();
 
-    const result = low.output.items;
+    // The arity-matched `@extern` lands in the header buffer, so join it for
+    // assertions.
+    var wasm_joined = std.ArrayList(u8).init(arena_allocator);
+    defer wasm_joined.deinit();
+    try wasm_joined.appendSlice(low.header.items);
+    try wasm_joined.appendSlice(low.output.items);
+    const result = wasm_joined.items;
 
     try std.testing.expect(std.mem.indexOf(u8, result, "WASM Interop: Import from ./math.wasm") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Link symbol add to WASM export") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Link symbol sub to WASM export") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "@extern ext_print(msg: ptr) -> void") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "t_1 = call @add(10, 20)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "@extern add(a0: i32, a1: i32) -> i32") != null);
+}
+
+test "sa_plugin_ts lowers console.log to sa_print_bytes" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const source =
+        \\function main(): i32 {
+        \\  const n: i32 = 41;
+        \\  console.log("answer", n);
+        \\  return 0;
+        \\}
+    ;
+
+    var low = lowerer.Lowerer.init(arena_allocator);
+    defer low.deinit();
+
+    var p = try parser.Parser.init(arena_allocator, source, &low);
+    defer p.deinit();
+
+    try p.parse();
+
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const result = joined.items;
+
+    try std.testing.expect(std.mem.indexOf(u8, result, "@import \"sa_std/io/print.sai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "call @sa_print_bytes(") != null);
 }
 
 test "sa_plugin_ts descriptor is valid" {
@@ -1655,16 +1700,15 @@ test "sa_plugin_ts parses template literals with embedded expressions" {
     var p = try parser.Parser.init(arena_allocator, source, &low);
     defer p.deinit();
 
-    // The lexer/parser must recognise the interpolated form without tripping
-    // over the chunk boundaries. Lowering is expected to report a diagnostic:
-    // see "sa_plugin_ts rejects template literals instead of emitting a bogus
-    // concat" for why.
-    p.parse() catch {};
+    // Interpolation now lowers: the string operand passes through and the
+    // chunks are joined with `@sa_string_concat`. No diagnostic, and no
+    // bare `concat` mnemonic (which is not an SA instruction).
+    try p.parse();
 
+    try std.testing.expect(p.errors.items.len == 0);
     const result = low.output.items;
-    // No unassemblable `concat` may be emitted.
-    try std.testing.expect(std.mem.indexOf(u8, result, "concat") == null);
-    try std.testing.expect(p.errors.items.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, result, "@sa_string_concat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "= concat ") == null);
 }
 
 test "sa_plugin_ts compiles for-of iteration" {
@@ -1775,8 +1819,13 @@ test "sa_plugin_ts compiles WIT imports" {
     try p.parse();
 
     const result = low.output.items;
-    try std.testing.expect(std.mem.indexOf(u8, result, "WIT:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result, "@wit_import") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "@wit_import") == null);
+    try std.testing.expect(p.errors.items.len > 0);
+    var found_wit_diag = false;
+    for (p.errors.items) |e| {
+        if (std.mem.indexOf(u8, e.message, "WIT import") != null) found_wit_diag = true;
+    }
+    try std.testing.expect(found_wit_diag);
 }
 
 test "sa_plugin_ts SIMD lexer handles large whitespace runs" {
@@ -1991,13 +2040,14 @@ test "sa_plugin_ts lowers a literal template to an SA string slice" {
     try std.testing.expect(std.mem.indexOf(u8, out, "concat") == null);
 }
 
-test "sa_plugin_ts rejects interpolated templates instead of emitting a bogus concat" {
+test "sa_plugin_ts lowers interpolated integers through fmt instead of emitting a bogus concat" {
     const allocator = std.testing.allocator;
 
     // Joining chunks needs `@sa_fmt_i64_into` to render a value plus
-    // `@sa_string_concat` to join, which returns a bare pointer with no
-    // companion length. Until that exists the lowerer must diagnose rather
-    // than emit `concat`, which is not an SA mnemonic.
+    // `@sa_string_concat` to join (read back with `@sa_fmt_buffer_data`
+    // / `@sa_fmt_buffer_len`, mirroring stdlib's `STR_CONCAT` macro). What
+    // must never appear is a bare `concat` instruction, which is not an SA
+    // mnemonic.
     const source =
         \\function main() {
         \\  let x: i32 = 7;
@@ -2014,11 +2064,54 @@ test "sa_plugin_ts rejects interpolated templates instead of emitting a bogus co
 
     var p = try parser.Parser.init(arena_allocator, source, &low);
     defer p.deinit();
-    p.parse() catch {};
+    try p.parse();
 
-    try std.testing.expect(p.errors.items.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, p.errors.items[0].message, "interpolated template") != null);
-    try std.testing.expect(std.mem.indexOf(u8, low.output.items, "concat") == null);
+    try std.testing.expect(p.errors.items.len == 0);
+    var joined = std.ArrayList(u8).init(arena_allocator);
+    defer joined.deinit();
+    try joined.appendSlice(low.header.items);
+    try joined.appendSlice(low.output.items);
+    const interp_result = joined.items;
+    try std.testing.expect(std.mem.indexOf(u8, interp_result, "@sa_fmt_i64_into") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_result, "@sa_string_concat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_result, "@import \"sa_std/string.sai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_result, "@import \"sa_std/fmt.sai\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, interp_result, "= concat ") == null);
+}
+
+test "sa_plugin_ts binds string literals to variables as slices" {
+    const allocator = std.testing.allocator;
+
+    // A `"..."` literal is not an SA operand: `s = "bob"` is rejected by the
+    // verifier (UnknownRegister). The binding must materialise the slice,
+    // which also makes string variables usable in interpolation.
+    const out = try lowerForTest(allocator,
+        \\function main(): i32 {
+        \\  const s: string = "bob";
+        \\  return s.length;
+        \\}
+    );
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "= \"bob\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "utf8:\"bob") != null);
+}
+
+test "sa_plugin_ts supports the string length property" {
+    const allocator = std.testing.allocator;
+
+    // `s.length` is the real TypeScript spelling (the builtin `string`
+    // layout only knows `ptr`/`len`, so the field is aliased). The
+    // method-call spelling `s.length()` consumes its parens too.
+    const out = try lowerForTest(allocator,
+        \\function main(): i32 {
+        \\  const s: string = `hi`;
+        \\  return s.length;
+        \\}
+    );
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "as u32") != null);
 }
 
 test "sa_plugin_ts supports the catch binding form" {
@@ -2451,6 +2544,26 @@ const runtime_cases = [_]RuntimeCase{
         \\  return o.inner.a;
         \\}
         ,
+    },
+    .{
+        .name = "arrow with param, expression body",
+        .expected = 42,
+        .source = "function main(): i32 {\n" ++ "  let f = (x: i32) => x + 1;\n" ++ "  let r: i32 = f(41);\n" ++ "  return r;\n" ++ "}\n",
+    },
+    .{
+        .name = "arrow with two params",
+        .expected = 42,
+        .source = "function main(): i32 {\n" ++ "  let f = (a: i32, b: i32) => a + b;\n" ++ "  let r: i32 = f(20, 22);\n" ++ "  return r;\n" ++ "}\n",
+    },
+    .{
+        .name = "bare-param arrow with capture",
+        .expected = 105,
+        .source = "function main(): i32 {\n" ++ "  let base: i32 = 100;\n" ++ "  let f = x => x + base;\n" ++ "  let r: i32 = f(5);\n" ++ "  return r;\n" ++ "}\n",
+    },
+    .{
+        .name = "arrow with params, block body return",
+        .expected = 42,
+        .source = "function main(): i32 {\n" ++ "  let f = (a: i32, b: i32) => {\n" ++ "    return a + b;\n" ++ "  };\n" ++ "  let r: i32 = f(30, 12);\n" ++ "  return r;\n" ++ "}\n",
     },
 };
 

@@ -88,6 +88,16 @@ pub const ParseError = struct {
     message: []const u8,
 };
 
+pub const ArrowParam = struct {
+    name: []const u8,
+    type_name: []const u8,
+};
+
+pub const ArrowAlias = struct {
+    cb: []const u8,
+    ctx: []const u8,
+};
+
 pub const Parser = struct {
     lexer: lexer_mod.Lexer,
     allocator: std.mem.Allocator,
@@ -129,6 +139,43 @@ pub const Parser = struct {
     /// `return` on each path, otherwise they become unreachable code.
     func_param_stack: std.ArrayList([][]const u8) = undefined,
     last_arrow_ctx: ?[]const u8 = null,
+    /// Nesting depth inside arrow closure callbacks. A value-return inside an
+    /// arrow body is diagnosed loudly: void callbacks cannot carry a value and
+    /// value callbacks declare `-> i32`.
+    arrow_depth: u32 = 0,
+    /// Whether the innermost arrow callback declares `-> i32`. Saved and
+    /// restored around each arrow body so nested arrows do not clobber it.
+    arrow_value_cb: bool = false,
+    /// Scope depth at the innermost arrow callback's entry (before its own
+    /// scope is opened). Release walks inside the callback stop here so they
+    /// never free the parent function's registers from inside the out-of-line
+    /// callback body.
+    arrow_base_depth: usize = 0,
+    /// `let f = (x) => ...` aliases: `f` is not a register but the callback
+    /// name plus its context move. Direct calls to `f` lower to the callback;
+    /// passing `f` as an argument expands to `cb, ctx`.
+    arrow_aliases: std.StringHashMap(ArrowAlias) = undefined,
+    /// Symbols imported from `.wasm` modules. Calls to them get an
+    /// arity-matched `@extern` in the header at the first call site, so the
+    /// verifier accepts the callee (linking still needs the real `.wasm`).
+    /// An explicit `declare function` for the same name wins and suppresses
+    /// the synthetic declaration.
+    wasm_syms: std.StringHashMap(void) = undefined,
+    /// Symbols imported from `.wit` files. `@wit_import` is not valid SA-ASM
+    /// (the assembler rejects it with ForbiddenSyntax even at top level), so
+    /// both the import and any call are refused loudly with a diagnostic.
+    wit_syms: std.StringHashMap(void) = undefined,
+    /// Names with an explicit `declare function` signature on file.
+    declared_externs: std.StringHashMap(void) = undefined,
+    /// Depth inside `async function` bodies, with the innermost Tokio-style
+    /// ready-future value type. An `async function f(): T` returns a
+    /// `future<T>` handle (a 16-byte `{state, value}` heap struct mirroring
+    /// SLA's ReadyFuture); `await` unwraps it. There is no executor and no
+    /// pending state in the subset, so every future is already ready.
+    async_depth: u32 = 0,
+    async_inner: ?[]const u8 = null,
+    /// Async function names (duped) to their inner value type (duped).
+    async_fns: std.StringHashMap([]const u8) = undefined,
     errors: std.ArrayList(ParseError),
     has_fatal_error: bool = false,
     template_lexer_mode: bool = false,
@@ -162,6 +209,7 @@ pub const Parser = struct {
             .break_stack = std.ArrayList(JumpTarget).init(allocator),
             .continue_stack = std.ArrayList(JumpTarget).init(allocator),
             .func_param_stack = std.ArrayList([][]const u8).init(allocator),
+            .async_fns = std.StringHashMap([]const u8).init(allocator),
             .enums = std.ArrayList(EnumDef).init(allocator),
             .stdlib = std.ArrayList(StdlibEntry).init(allocator),
             .errors = std.ArrayList(ParseError).init(allocator),
@@ -177,6 +225,10 @@ pub const Parser = struct {
             .fields = string_fields,
         };
         try parser_inst.layout_table.register("string", string_layout);
+        parser_inst.arrow_aliases = std.StringHashMap(ArrowAlias).init(allocator);
+        parser_inst.wasm_syms = std.StringHashMap(void).init(allocator);
+        parser_inst.wit_syms = std.StringHashMap(void).init(allocator);
+        parser_inst.declared_externs = std.StringHashMap(void).init(allocator);
 
         return parser_inst;
     }
@@ -190,6 +242,32 @@ pub const Parser = struct {
         self.break_stack.deinit();
         self.continue_stack.deinit();
         self.func_param_stack.deinit();
+        var ait = self.async_fns.iterator();
+        while (ait.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.async_fns.deinit();
+        var alit = self.arrow_aliases.iterator();
+        while (alit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.arrow_aliases.deinit();
+        var wsit = self.wasm_syms.iterator();
+        while (wsit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.wasm_syms.deinit();
+        var witit = self.wit_syms.iterator();
+        while (witit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.wit_syms.deinit();
+        var deit = self.declared_externs.iterator();
+        while (deit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.declared_externs.deinit();
         for (self.enums.items) |*e| {
             e.deinit(self.allocator);
         }
@@ -224,7 +302,7 @@ pub const Parser = struct {
     fn skipToSync(self: *Parser) void {
         while (self.current.tag != .eof) {
             switch (self.current.tag) {
-                .semicolon, .r_brace, .keyword_function, .keyword_let, .keyword_const, .keyword_if, .keyword_while, .keyword_for, .keyword_return => return,
+                .semicolon, .r_brace, .keyword_function, .keyword_let, .keyword_const, .keyword_var, .keyword_if, .keyword_while, .keyword_for, .keyword_return => return,
                 else => {
                     self.current = self.peek;
                     self.peek = self.lexer.next();
@@ -329,6 +407,20 @@ pub const Parser = struct {
         return "ptr";
     }
 
+    /// Whether a tracked type is a ready-future handle (`future<T>`).
+    fn isFutureType(t: []const u8) bool {
+        return std.mem.startsWith(u8, t, "future<") and std.mem.endsWith(u8, t, ">");
+    }
+
+    /// The value type inside `future<T>`.
+    fn futureInner(t: []const u8) []const u8 {
+        return t["future<".len .. t.len - 1];
+    }
+
+    fn futureTypeName(allocator: std.mem.Allocator, inner: []const u8) ![]const u8 {
+        return std.fmt.allocPrint(allocator, "future<{s}>", .{inner});
+    }
+
     /// Emit a fall-through-preserving conditional branch.
     ///
     /// SA-ASM has no `jz`; the conditional branch is
@@ -408,6 +500,19 @@ pub const Parser = struct {
         try self.scope_manager.releaseAllOwnedExcept(self.lowerer, keep);
     }
 
+    /// Release live owned registers owned by the innermost arrow callback
+    /// only (scopes deeper than `arrow_base_depth`). The callback body is
+    /// parsed inside the parent's scopes, so the unscoped walk would free
+    /// the parent's registers from inside the out-of-line callback.
+    fn releaseArrowLiveExcept(self: *Parser, keep: ?[]const u8) anyerror!void {
+        try self.refreshDominators();
+        try self.scope_manager.releaseScopesDeeperThanExcept(self.lowerer, self.arrow_base_depth, keep);
+    }
+
+    fn releaseArrowLive(self: *Parser) anyerror!void {
+        try self.releaseArrowLiveExcept(null);
+    }
+
     // ==========================================
     // Top-level parse
     // ==========================================
@@ -459,6 +564,7 @@ pub const Parser = struct {
             .keyword_interface => try self.parseInterface(),
             .keyword_let => try self.parseLet(),
             .keyword_const => try self.parseLet(),
+            .keyword_var => try self.parseLet(),
             .keyword_function => try self.parseFunction(),
             .keyword_if => try self.parseIf(),
             .keyword_while => try self.parseWhile(),
@@ -518,7 +624,7 @@ pub const Parser = struct {
                     // Parse the exported declaration
                     if (self.current.tag == .keyword_function) {
                         try self.parseFunction();
-                    } else if (self.current.tag == .keyword_let or self.current.tag == .keyword_const) {
+                    } else if (self.current.tag == .keyword_let or self.current.tag == .keyword_const or self.current.tag == .keyword_var) {
                         try self.parseLet();
                     } else if (self.current.tag == .keyword_interface) {
                         try self.parseInterface();
@@ -799,8 +905,11 @@ pub const Parser = struct {
     }
 
     fn parseLet(self: *Parser) anyerror!void {
-        const is_const = self.current.tag == .keyword_const;
-        if (is_const) {
+        // `var` lowers exactly like `let`: the subset has function-level
+        // lowering with lexical scopes, so hoisting differences do not apply.
+        const tag = self.current.tag;
+        const is_const = tag == .keyword_const;
+        if (is_const or tag == .keyword_var) {
             try self.advance();
         } else {
             try self.expect(.keyword_let);
@@ -872,9 +981,62 @@ pub const Parser = struct {
             try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ var_name, elem_count });
         } else {
             const val = try self.parseExpression();
-            const t_name = type_name orelse "i32";
+            // A `"..."` literal is not an SA operand: materialise the slice
+            // and bind the variable to it. Emitting `s = "bob"` verbatim is
+            // rejected by the verifier (UnknownRegister). Only applies to
+            // unannotated or `string`-annotated bindings; anything else falls
+            // through to the generic path.
+            if (val.len > 0 and val[0] == '"') {
+                const ann_ok = if (type_name) |ann| std.mem.eql(u8, ann, "string") else true;
+                if (ann_ok) {
+                    const inner = if (val.len >= 2) val[1 .. val.len - 1] else "";
+                    const chunk = try self.materializeStringChunk(inner);
+                    try self.scope_manager.declareVar(var_name, "string", var_name, true);
+                    try self.lowerer.emit("    {s} = {s}\n", .{ var_name, chunk });
+                    self.scope_manager.markConsumed(chunk);
+                    _ = try self.accept(.semicolon);
+                    return;
+                }
+            }
+            // `let f = (x) => ...`: `val` is the freshly emitted callback
+            // name. A function name is not a register, so `f = @cb` would be
+            // invalid SA-ASM and `call @f` would not resolve. Record an alias
+            // instead and emit nothing: direct calls to `f` lower straight to
+            // the callback with its captured context.
+            if (std.mem.startsWith(u8, val, "@closure_callback_")) {
+                const key = try self.allocator.dupe(u8, var_name);
+                const ctx_move = self.last_arrow_ctx orelse "^ctx";
+                // last_arrow_ctx strings are owned (allocPrint per arrow); the
+                // alias takes over this one, so clear the slot without freeing.
+                self.last_arrow_ctx = null;
+                try self.arrow_aliases.put(key, .{ .cb = val, .ctx = ctx_move });
+                try self.scope_manager.declareVar(var_name, "fn", var_name, false);
+                _ = try self.accept(.semicolon);
+                return;
+            }
+            // A future handle keeps its type when no annotation is given;
+            // an explicit non-future annotation with a future value is a
+            // loud error, not a silent pointer-as-integer.
+            var t_name: []const u8 = "i32";
+            if (type_name) |ann| {
+                t_name = ann;
+                if (!isFutureType(t_name)) {
+                    if (self.scope_manager.lookup(val)) |vv| {
+                        if (isFutureType(vv.type_name)) {
+                            std.debug.print("error:{d}:{d}: cannot assign future to '{s}': await it first\n", .{
+                                self.current.line,
+                                self.current.col,
+                                t_name,
+                            });
+                            return error.FutureMustBeAwaited;
+                        }
+                    }
+                }
+            } else if (self.scope_manager.lookup(val)) |vv| {
+                if (isFutureType(vv.type_name)) t_name = vv.type_name;
+            }
 
-            const is_heap = std.mem.startsWith(u8, val, "slice_") or std.mem.eql(u8, t_name, "string");
+            const is_heap = std.mem.startsWith(u8, val, "slice_") or std.mem.eql(u8, t_name, "string") or isFutureType(t_name);
 
             // A register-to-register initialiser would otherwise move the source.
             // TypeScript has no move semantics for scalars: `let b: i32 = a` copies
@@ -1047,14 +1209,43 @@ pub const Parser = struct {
             _ = try self.accept(.comma);
         }
         try self.expect(.r_paren);
-        _ = try self.accept(.colon);
+        // An `async function f(): T` returns a ready-future handle: a 16-byte
+        // `{state, value}` heap struct mirroring SLA's ReadyFuture layout
+        // (state +0, value +8, 1 = READY). There is no executor and no
+        // pending state in the subset, so the future is ready from birth and
+        // `await` just loads the value. `@async` is not an
+        // assembler-accepted function prefix, hence the plain `@f` emission.
+        var return_type: ?[]const u8 = null;
+        if (try self.accept(.colon)) {
+            return_type = try self.parseTypeName();
+        }
+        var inner: []const u8 = "i32";
+        if (return_type) |rt| {
+            if (!std.mem.eql(u8, rt, "void")) inner = rt;
+        }
+        const future_t = try futureTypeName(self.allocator, inner);
+        defer self.allocator.free(future_t);
+        try self.scope_manager.declareVar(func_name, future_t, func_name, false);
+        try self.async_fns.put(try self.allocator.dupe(u8, func_name), try self.allocator.dupe(u8, inner));
 
-        try self.lowerer.emit("@async @{s}(", .{func_name});
+        try self.lowerer.emit("@{s}(", .{func_name});
         for (params.items, 0..) |p, idx| {
             if (idx > 0) try self.lowerer.emit(", ", .{});
-            try self.lowerer.emit("{s}: {s}", .{ p.name, p.type_name });
+            try self.lowerer.emit("{s}: {s}", .{ p.name, saTypeOf(p.type_name) });
         }
-        try self.lowerer.emit("):\n", .{});
+        try self.lowerer.emit(") -> ptr:\n", .{});
+        self.lowerer.beginFunction();
+
+        self.scope_manager.defer_releases = true;
+        defer self.scope_manager.defer_releases = false;
+
+        self.async_depth += 1;
+        const saved_inner = self.async_inner;
+        self.async_inner = inner;
+        defer {
+            self.async_depth -= 1;
+            self.async_inner = saved_inner;
+        }
 
         try self.scope_manager.enterScope();
         for (params.items) |p| {
@@ -1068,11 +1259,22 @@ pub const Parser = struct {
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 try self.parseStatement();
             }
+            if (!self.lowerer.isTerminated()) {
+                try self.releaseLiveRegisters();
+            }
             try self.scope_manager.exitScope(self.lowerer);
             try self.advance();
         }
 
         try self.scope_manager.exitScope(self.lowerer);
+
+        // Falling off the end yields a zero-valued future, like an implicit
+        // `return 0` in a sync function.
+        if (!self.lowerer.isTerminated()) {
+            const fut = try self.buildReadyFuture(null, inner);
+            try self.lowerer.emitTerm("    return {s}\n", .{fut});
+        }
+        try self.lowerer.finishFunction("return 0");
     }
 
     // ==========================================
@@ -1223,6 +1425,43 @@ pub const Parser = struct {
         self.markRebound(name);
     }
 
+    /// Build a ready-future handle holding `val` (or zero): a 16-byte heap
+    /// struct with state 1 (READY) at +0 and the value at +8, mirroring SLA's
+    /// ReadyFuture layout. Returns the owned future register.
+    fn buildReadyFuture(self: *Parser, val: ?[]const u8, inner: []const u8) anyerror![]const u8 {
+        const fut = try self.newTemp();
+        const future_t = try futureTypeName(self.allocator, inner);
+        defer self.allocator.free(future_t);
+        if (self.scope_manager.lookup(fut)) |tv| {
+            self.allocator.free(tv.type_name);
+            tv.type_name = try self.allocator.dupe(u8, future_t);
+        }
+        try self.lowerer.emit("    {s} = alloc 16\n", .{fut});
+        try self.lowerer.emit("    store {s} + 0, 1 as u64\n", .{fut});
+        if (val) |v| {
+            try self.lowerer.emit("    store {s} + 8, {s} as {s}\n", .{ fut, v, saTypeOf(inner) });
+        } else {
+            try self.lowerer.emit("    store {s} + 8, 0 as {s}\n", .{ fut, saTypeOf(inner) });
+        }
+        return fut;
+    }
+
+    /// Refuse to use a future handle as a plain value: it must be awaited
+    /// first. Without this the handle pointer would silently flow into
+    /// integer arithmetic or a non-future slot.
+    fn rejectFutureOperand(self: *Parser, name: []const u8) anyerror!void {
+        if (self.scope_manager.lookup(name)) |v| {
+            if (isFutureType(v.type_name)) {
+                std.debug.print("error:{d}:{d}: future '{s}' must be awaited before use as a value\n", .{
+                    self.current.line,
+                    self.current.col,
+                    name,
+                });
+                return error.FutureMustBeAwaited;
+            }
+        }
+    }
+
     fn parseForIncrement(self: *Parser) anyerror!void {
         if (self.current.tag == .identifier and self.peek.tag == .equal) {
             const name_tok = self.current;
@@ -1243,7 +1482,7 @@ pub const Parser = struct {
         try self.expect(.l_paren);
 
         // Detect for-of pattern: for (const x of expr) or for (let x of expr)
-        if ((self.current.tag == .keyword_let or self.current.tag == .keyword_const) and
+        if ((self.current.tag == .keyword_let or self.current.tag == .keyword_const or self.current.tag == .keyword_var) and
             self.peek.tag == .identifier)
         {
             // Save state to check if 'of' follows the variable name
@@ -1251,7 +1490,7 @@ pub const Parser = struct {
             const saved_current = self.current;
             const saved_peek = self.peek;
 
-            // Skip let/const and identifier to see if 'of' follows
+            // Skip let/const/var and identifier to see if 'of' follows
             const is_const = self.current.tag == .keyword_const;
             try self.advance(); // skip let/const
             const var_name_tok = self.current;
@@ -1280,6 +1519,15 @@ pub const Parser = struct {
                 try self.advance(); // of (identifier)
 
                 const iterable = try self.parseExpression();
+                if (self.scope_manager.lookup(iterable)) |iv| {
+                    if (isFutureType(iv.type_name)) {
+                        std.debug.print("error:{d}:{d}: cannot iterate a future: await it first\n", .{
+                            self.current.line,
+                            self.current.col,
+                        });
+                        return error.FutureMustBeAwaited;
+                    }
+                }
                 try self.expect(.r_paren);
 
                 const label_id = self.nextLabelId();
@@ -1347,7 +1595,7 @@ pub const Parser = struct {
         }
 
         // C-style for loop: for (init; cond; incr)
-        if (self.current.tag == .keyword_let or self.current.tag == .keyword_const) {
+        if (self.current.tag == .keyword_let or self.current.tag == .keyword_const or self.current.tag == .keyword_var) {
             try self.parseLet();
         } else if (self.current.tag != .semicolon) {
             _ = try self.parseExpression();
@@ -1531,11 +1779,67 @@ pub const Parser = struct {
             // Evaluate first: the expression may read a local that is about to
             // be released, and releasing before the read is a use-after-move.
             const val = try self.parseExpression();
-            try self.releaseLiveRegistersExcept(val);
-            try self.lowerer.emitTerm("    return {s}\n", .{val});
+            // A value-return inside a void arrow callback cannot assemble
+            // (`return <v>` in a `-> void` function). Refuse loudly with a
+            // location instead of emitting invalid SA-ASM.
+            if (self.arrow_depth > 0 and !self.arrow_value_cb and self.async_depth == 0) {
+                std.debug.print("error:{d}:{d}: cannot return a value from a void arrow callback: use an expression body `x => x + 1` or add params so it declares `-> i32`\n", .{
+                    self.current.line,
+                    self.current.col,
+                });
+                return error.ValueReturnInVoidArrow;
+            }
+            if (self.async_depth > 0) {
+                // Returning from an async function wraps the value in a
+                // ready-future. Returning a future itself would nest handles,
+                // which the subset cannot observe: refuse loudly.
+                if (self.scope_manager.lookup(val)) |vv| {
+                    if (isFutureType(vv.type_name)) {
+                        std.debug.print("error:{d}:{d}: cannot return a future from an async function: await it first\n", .{
+                            self.current.line,
+                            self.current.col,
+                        });
+                        return error.NestedFuture;
+                    }
+                }
+                try self.releaseLiveRegistersExcept(val);
+                const fut = try self.buildReadyFuture(val, self.async_inner orelse "i32");
+                try self.lowerer.emitTerm("    return {s}\n", .{fut});
+            } else {
+                if (self.scope_manager.lookup(val)) |vv| {
+                    if (isFutureType(vv.type_name)) {
+                        std.debug.print("error:{d}:{d}: async result must be awaited before returning it from a sync function\n", .{
+                            self.current.line,
+                            self.current.col,
+                        });
+                        return error.FutureMustBeAwaited;
+                    }
+                }
+                // Inside an arrow callback only callback-owned registers may be
+                // released; the parent's stay live for the outer function.
+                if (self.arrow_depth > 0) {
+                    try self.releaseArrowLiveExcept(val);
+                } else {
+                    try self.releaseLiveRegistersExcept(val);
+                }
+                try self.lowerer.emitTerm("    return {s}\n", .{val});
+            }
         } else {
-            try self.releaseLiveRegisters();
-            try self.lowerer.emitTerm("    return\n", .{});
+            if (self.async_depth > 0) {
+                try self.releaseLiveRegisters();
+                const fut = try self.buildReadyFuture(null, self.async_inner orelse "i32");
+                try self.lowerer.emitTerm("    return {s}\n", .{fut});
+            } else {
+                // A bare `return` inside a value arrow (`-> i32`) must carry
+                // a value or the backend rejects it. Normalise to `return 0`.
+                if (self.arrow_depth > 0 and self.arrow_value_cb) {
+                    try self.releaseArrowLive();
+                    try self.lowerer.emitTerm("    return 0\n", .{});
+                } else {
+                try self.releaseLiveRegisters();
+                try self.lowerer.emitTerm("    return\n", .{});
+                }
+            }
         }
         _ = try self.accept(.semicolon);
     }
@@ -1546,6 +1850,46 @@ pub const Parser = struct {
 
     fn parseTryCatch(self: *Parser) anyerror!void {
         try self.expect(.keyword_try);
+
+        // SA-ASM has no exception edges and `throw` lowers to `panic`, which
+        // aborts: a `catch` block can never resume after a real throw. The
+        // previous lowering emitted the catch body as fallthrough code, so it
+        // ran even when nothing threw. Scan first: a `try` whose body cannot
+        // throw runs the body and skips `catch` entirely; a `throw` inside
+        // is refused loudly instead of miscompiled.
+        const has_throw = blk: {
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_peek = self.peek;
+            const saved_tpl_mode = self.template_lexer_mode;
+            var found = false;
+            var depth: i32 = 0;
+            while (true) {
+                if (self.current.tag == .eof) break;
+                if (self.current.tag == .l_brace) depth += 1;
+                if (self.current.tag == .r_brace) {
+                    depth -= 1;
+                    if (depth == 0) break;
+                }
+                if (self.current.tag == .keyword_throw and depth >= 1) {
+                    found = true;
+                    break;
+                }
+                try self.advance();
+            }
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+            self.template_lexer_mode = saved_tpl_mode;
+            break :blk found;
+        };
+        if (has_throw) {
+            std.debug.print("error:{d}:{d}: throw inside try: catch cannot resume after panic, so this try/catch cannot be lowered\n", .{
+                self.current.line,
+                self.current.col,
+            });
+            return error.ThrowInTry;
+        }
 
         const label_id = self.nextLabelId();
         const catch_label = try std.fmt.allocPrint(self.allocator, "L_catch_{d}", .{label_id});
@@ -1562,35 +1906,36 @@ pub const Parser = struct {
             try self.advance();
         }
 
-        try self.lowerer.emitJumpTo(end_label);
+        // The body may already end in a terminator (`return`); a jump after
+        // one is unreachable code the assembler rejects.
+        if (!self.lowerer.isTerminated()) {
+            try self.lowerer.emitJumpTo(end_label);
+        }
         try self.lowerer.emitLabel(catch_label);
 
         if (self.current.tag == .keyword_catch) {
-            try self.advance();
-            var err_name: []const u8 = "err";
+            // No `throw` can reach here, so the handler is dead code: skip
+            // its tokens without emitting anything. Emitting it would run
+            // the handler unconditionally as fallthrough.
+            try self.advance(); // catch
             if (self.current.tag == .l_paren) {
+                var depth: u32 = 1;
                 try self.advance();
-                if (self.current.tag == .identifier) {
-                    err_name = self.currentText();
+                while (depth > 0 and self.current.tag != .eof) {
+                    if (self.current.tag == .l_paren) depth += 1;
+                    if (self.current.tag == .r_paren) depth -= 1;
                     try self.advance();
                 }
-                try self.expect(.r_paren);
             }
-
-            try self.scope_manager.enterScope();
-            try self.scope_manager.declareVar(err_name, "i32", err_name, false);
-
             if (self.current.tag == .l_brace) {
+                var depth: u32 = 1;
                 try self.advance();
-                try self.scope_manager.enterScope();
-                while (self.current.tag != .r_brace and self.current.tag != .eof) {
-                    try self.parseStatement();
+                while (depth > 0 and self.current.tag != .eof) {
+                    if (self.current.tag == .l_brace) depth += 1;
+                    if (self.current.tag == .r_brace) depth -= 1;
+                    try self.advance();
                 }
-                try self.scope_manager.exitScope(self.lowerer);
-                try self.advance();
             }
-
-            try self.scope_manager.exitScope(self.lowerer);
         }
 
         try self.lowerer.emitLabel(end_label);
@@ -1709,17 +2054,41 @@ pub const Parser = struct {
                 try self.scope_manager.declareVar(sym, "extern", sym, false);
             }
         } else if (std.mem.endsWith(u8, path, ".wit")) {
-            // WIT file import: emit WIT stub generation
-            try self.lowerer.emit("    // WIT: Import from {s}\n", .{path});
+            // WIT file import: `@wit_import` is not valid SA-ASM (the
+            // assembler rejects it with ForbiddenSyntax even at top level, as
+            // probed), so refuse loudly with a located diagnostic and emit no
+            // directive. Symbols are still declared and tracked so any later
+            // call is refused at the call site instead of assembling to an
+            // undeclared callee.
+            const first_sym: []const u8 = if (symbols.items.len > 0) symbols.items[0] else "(symbols)";
+            const msg = try std.fmt.allocPrint(
+                self.allocator,
+                "error: WIT import of '{s}' from \"{s}\" is not lowerable to SA-ASM: the assembler accepts no @wit_import directive",
+                .{ first_sym, path },
+            );
+            try self.errors.append(.{
+                .line = path_tok.line,
+                .col = path_tok.col,
+                .message = msg,
+            });
+            std.debug.print("error:{d}:{d}: {s}\n", .{ path_tok.line, path_tok.col, msg });
             for (symbols.items) |sym| {
-                try self.lowerer.emit("    @wit_import {s} from \"{s}\"\n", .{ sym, path });
                 try self.scope_manager.declareVar(sym, "fn", sym, false);
+                const key = try self.allocator.dupe(u8, sym);
+                try self.wit_syms.put(key, {});
             }
+            return error.WitImportNotSupported;
         } else if (std.mem.endsWith(u8, path, ".wasm")) {
             try self.lowerer.emit("    // WASM Interop: Import from {s}\n", .{path});
             for (symbols.items) |sym| {
                 try self.scope_manager.declareVar(sym, "fn", sym, false);
                 try self.lowerer.emit("    // Link symbol {s} to WASM export\n", .{sym});
+                // Tracked so the first call site can declare an arity-matched
+                // `@extern` in the header (probes: the verifier accepts the
+                // callee then; linking needs the real `.wasm`). An explicit
+                // `declare function` for the same name suppresses it.
+                const key = try self.allocator.dupe(u8, sym);
+                try self.wasm_syms.put(key, {});
             }
         }
     }
@@ -1778,6 +2147,35 @@ pub const Parser = struct {
         try self.lowerer.emit(") -> {s}\n", .{ret_type});
 
         try self.scope_manager.declareVar(func_name, "fn", func_name, false);
+        // An explicit signature wins over the synthetic arity-matched extern
+        // a `.wasm` import would otherwise declare at the first call site.
+        const dkey = try self.allocator.dupe(u8, func_name);
+        try self.declared_externs.put(dkey, {});
+    }
+
+    /// Declare the arity-matched `@extern` for a `.wasm` import at its first
+    /// call site, unless an explicit `declare function` already covers it.
+    fn ensureWasmExtern(self: *Parser, name: []const u8, arity: usize) anyerror!void {
+        if (self.wasm_syms.get(name) == null) return;
+        if (self.declared_externs.get(name) != null) return;
+        try self.lowerer.emitExtern(name, arity);
+    }
+
+    /// Refuse a call to a `.wit` symbol loudly: there is no valid lowering.
+    fn rejectWitCall(self: *Parser, name: []const u8) anyerror!void {
+        if (self.wit_syms.get(name) == null) return;
+        const msg = try std.fmt.allocPrint(
+            self.allocator,
+            "error: call to WIT symbol '{s}' cannot be lowered to SA-ASM: the assembler accepts no @wit_import directive",
+            .{name},
+        );
+        try self.errors.append(.{
+            .line = self.current.line,
+            .col = self.current.col,
+            .message = msg,
+        });
+        std.debug.print("error:{d}:{d}: {s}\n", .{ self.current.line, self.current.col, msg });
+        return error.WitCallNotSupported;
     }
 
     // ==========================================
@@ -1792,32 +2190,23 @@ pub const Parser = struct {
     /// An SA-ASM string is a `{ptr, len}` slice, not a literal: a string cannot
     /// be written as an operand. A literal is therefore materialised as a
     /// file-scope `@const NAME = utf8:"..."` data constant, then assembled into
-    /// a slice with a 16-byte stack slot (this is what `SLICE_NEW` expands to).
+    /// a slice with a 16-byte heap slot (this is what `SLICE_NEW` expands to,
+    /// but `alloc` is used so the slice can escape its function).
     ///
-    /// Templates with `${...}` interpolation additionally need the value
-    /// rendered to text (`@sa_fmt_i64_into`) and the chunks joined
-    /// (`@sa_string_concat`, which yields a bare pointer with no companion
-    /// length). That path is not implemented yet and is reported as a
-    /// diagnostic rather than emitting a `concat` instruction, which is not an
-    /// SA mnemonic.
+    /// Templates with `${...}` interpolation render each value to text and
+    /// join the chunks. Integer operands go through `sext` +
+    /// `@sa_fmt_i64_into` (from `sa_std/fmt.sai`); string operands are
+    /// already slices and pass through untouched. Chunks are joined with the
+    /// body of stdlib's `STR_CONCAT` macro inlined (`@sa_string_concat` from
+    /// `sa_std/string.sai`, whose buffer handle is read back with
+    /// `@sa_fmt_buffer_data`/`@sa_fmt_buffer_len`). Boolean operands render
+    /// as `0`/`1`, matching the subset's i32 encoding rather than JS
+    /// `true`/`false`; floats and other types are refused loudly.
     fn parseTemplateLiteral(self: *Parser) anyerror![]const u8 {
         const raw = self.currentText();
 
         if (self.current.tag != .template_end) {
-            const msg = try std.fmt.allocPrint(
-                self.allocator,
-                "error: interpolated template literals are not yet lowerable to SA-ASM (needs @sa_fmt_i64_into to render values and @sa_string_concat to join chunks)",
-                .{},
-            );
-            try self.errors.append(.{
-                .line = self.current.line,
-                .col = self.current.col,
-                .message = msg,
-            });
-            // The CLI surfaces parser diagnostics on stderr via this channel;
-            // `self.errors` is only consumed programmatically.
-            std.debug.print("error:{d}:{d}: {s}\n", .{ self.current.line, self.current.col, msg });
-            return error.UnsupportedTemplateLiteral;
+            return try self.parseInterpolatedTemplate();
         }
 
         // Strip the surrounding backticks; the lexer spans both.
@@ -1825,10 +2214,6 @@ pub const Parser = struct {
         if (text.len >= 2 and text[0] == '`' and text[text.len - 1] == '`') {
             text = text[1 .. text.len - 1];
         }
-
-        const const_id = self.nextLabelId();
-        const const_name = try std.fmt.allocPrint(self.allocator, "SC_{d}", .{const_id});
-        try self.lowerer.emitConst(const_name, text);
 
         // Leave template mode: the literal is fully consumed, so re-prime both
         // tokens from the normal lexer rather than promoting a stale
@@ -1844,6 +2229,22 @@ pub const Parser = struct {
 
         // 16-byte slice slot: {ptr at +0, len at +8}. This mirrors what
         // `SLICE_NEW` expands to, but uses `alloc` rather than `stack_alloc` so
+        // the slice can be bound to a variable (see `materializeStringChunk`).
+        const slice_reg = try self.materializeStringChunk(text);
+
+        return slice_reg;
+    }
+
+    /// Materialise static text as an SA string slice: a file-scope `@const`
+    /// plus a 16-byte heap slot holding `{ptr, len}`. The result is retagged
+    /// `string` so interpolation and member paths treat it as a slice.
+    fn materializeStringChunk(self: *Parser, text: []const u8) anyerror![]const u8 {
+        const const_id = self.nextLabelId();
+        const const_name = try std.fmt.allocPrint(self.allocator, "SC_{d}", .{const_id});
+        try self.lowerer.emitConst(const_name, text);
+
+        // 16-byte slice slot: {ptr at +0, len at +8}. This mirrors what
+        // `SLICE_NEW` expands to, but uses `alloc` rather than `stack_alloc` so
         // the slice can be bound to a variable: a stack allocation cannot
         // escape its function ("StackEscape"), and callers routinely store the
         // result. Being heap-owned, it is released with `!` like any other
@@ -1852,18 +2253,281 @@ pub const Parser = struct {
         try self.lowerer.emit("    {s} = alloc 16\n", .{slice_reg});
         try self.lowerer.emit("    store {s} + 0, &{s} as ptr\n", .{ slice_reg, const_name });
         try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ slice_reg, text.len });
+        try self.retagTemp(slice_reg, "string");
 
         return slice_reg;
     }
 
-    /// Parse arrow function body and emit closure callback + context
-    fn parseArrowBody(self: *Parser) anyerror![]const u8 {
+    /// Retag a `newTemp` register with its real source-level type. Temps
+    /// default to `i32`; string slices (and only real strings) must read back
+    /// as `string` so interpolation passes them through instead of rendering
+    /// their pointer as digits.
+    fn retagTemp(self: *Parser, reg: []const u8, type_name: []const u8) anyerror!void {
+        if (self.scope_manager.lookup(reg)) |tv| {
+            self.allocator.free(tv.type_name);
+            tv.type_name = try self.allocator.dupe(u8, type_name);
+        }
+    }
+
+    /// Report a loud located diagnostic and fail the lowering with `err`.
+    /// Returns `[]const u8` only so it can be `return`ed directly from the
+    /// expression-typed lowering paths; it never produces a value.
+    fn refuseAt(self: *Parser, comptime fmt: []const u8, args: anytype, err: anyerror) anyerror![]const u8 {
+        const msg = try std.fmt.allocPrint(self.allocator, fmt, args);
+        try self.errors.append(.{
+            .line = self.current.line,
+            .col = self.current.col,
+            .message = msg,
+        });
+        // The CLI surfaces parser diagnostics on stderr via this channel;
+        // `self.errors` is only consumed programmatically.
+        std.debug.print("error:{d}:{d}: {s}\n", .{ self.current.line, self.current.col, msg });
+        return err;
+    }
+
+    /// Lower `` `head ${e1} mid ${e2} tail` `` to an SA string slice.
+    ///
+    /// `current` is the `template_start` chunk on entry. Each static chunk is
+    /// materialised with `materializeStringChunk`, each `${expr}` with
+    /// `renderInterpValue`, and pairs are joined with `concatSlices`. The
+    /// expression is a normal `parseExpression`: it stops at the `}` that
+    /// closes the interpolation because `}` is not an infix operator. That
+    /// `}` is consumed by an explicit `nextTemplateChunk` call (with
+    /// `interp_expr_open` forced, so nested templates cannot clobber the
+    /// flag), never by the normal `advance` path.
+    fn parseInterpolatedTemplate(self: *Parser) anyerror![]const u8 {
+        try self.lowerer.emitImport("sa_std/string.sai");
+        try self.lowerer.emitImport("sa_std/fmt.sai");
+
+        var acc = try self.materializeStringChunk(stripTemplateHead(self.tokenText(self.current)));
+        // Onto the first `${expr}`.
+        try self.advance();
+        while (true) {
+            const val = try self.parseExpression();
+            // A nested template ends with `template_end` while the outer
+            // `}` is still pending in `peek`; step onto it so the brace
+            // check below sees the real close.
+            if (self.current.tag == .template_end) try self.advance();
+            if (self.current.tag != .r_brace) {
+                return self.refuseAt(
+                    "error: expected '}}' to close template interpolation, got {s}",
+                    .{@tagName(self.current.tag)},
+                    error.UnterminatedInterpolation,
+                );
+            }
+            const seg = try self.renderInterpValue(val);
+            acc = try self.concatSlices(acc, seg);
+
+            // The two-token lookahead means the lexer cursor is already past
+            // this `}` (priming `peek` consumed it and whatever followed), so
+            // `nextTemplateChunk` cannot run from the cursor: re-anchor it
+            // just past the `}` that closes the interpolation. Line/col are
+            // re-anchored too so later tokens keep real positions.
+            self.lexer.pos = self.current.start + self.current.len;
+            self.lexer.line = self.current.line;
+            self.lexer.col = self.current.col + 1;
+            self.lexer.interp_expr_open = true;
+            const chunk = self.lexer.nextTemplateChunk();
+            self.current = chunk;
+            self.peek = self.lexer.next();
+            const tail = try self.materializeStringChunk(self.tokenText(chunk));
+            acc = try self.concatSlices(acc, tail);
+            if (chunk.tag == .template_end) break;
+            if (chunk.tag != .template_mid) {
+                return self.refuseAt(
+                    "error: expected template chunk after interpolation, got {s}",
+                    .{@tagName(chunk.tag)},
+                    error.BadTemplateChunk,
+                );
+            }
+            // Onto the next `${expr}`.
+            try self.advance();
+        }
+        // The final chunk is fully consumed: step onto the token primed after
+        // the closing backtick (usually `;`), mirroring the plain path, so no
+        // stray `template_end` reaches the statement loop.
+        self.current = self.peek;
+        self.peek = self.lexer.next();
+        self.template_lexer_mode = false;
+        self.lexer.interp_expr_open = false;
+        return acc;
+    }
+
+    /// Render an interpolation operand to a string slice register.
+    ///
+    /// Strings pass through; integers go through `sext` +
+    /// `@sa_fmt_i64_into` into a scratch buffer that the slice borrows (the
+    /// buffer stays live until scope exit, like any owned temp). String
+    /// literals interpolate as their own text. Anything else is refused
+    /// loudly: floats have no digit rendering, and `null`/unknown operands
+    /// must not silently become pointer digits.
+    fn renderInterpValue(self: *Parser, val: []const u8) anyerror![]const u8 {
+        try self.rejectFutureOperand(val);
+        if (val.len > 0 and val[0] == '"') {
+            const inner = if (val.len >= 2) val[1 .. val.len - 1] else "";
+            return try self.materializeStringChunk(inner);
+        }
+        if (self.scope_manager.lookup(val)) |v| {
+            if (std.mem.eql(u8, v.type_name, "string")) return val;
+            if (std.mem.eql(u8, v.type_name, "f64")) {
+                return self.refuseAt(
+                    "error: float interpolation is not supported: '{s}' has no digit rendering",
+                    .{val},
+                    error.FloatInterpolationNotSupported,
+                );
+            }
+        } else {
+            if (!isIntLiteral(val)) {
+                return self.refuseAt(
+                    "error: cannot interpolate '{s}': only integers and strings lower to text",
+                    .{val},
+                    error.BadInterpolationOperand,
+                );
+            }
+        }
+        const wide = try self.newTemp();
+        try self.lowerer.emit("    {s} = sext {s} as i64\n", .{ wide, val });
+        const numbuf = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 64\n", .{numbuf});
+        const numlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 8\n", .{numlen});
+        const rc = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_i64_into({s}, 10, {s}, 64, &{s})\n", .{ rc, wide, numbuf, numlen });
+        const nlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as u64\n", .{ nlen, numlen });
+        const vslice = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{vslice});
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ vslice, numbuf });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ vslice, nlen });
+        try self.releaseOwnedIfLive(rc);
+        try self.releaseOwnedIfLive(nlen);
+        try self.retagTemp(vslice, "string");
+        return vslice;
+    }
+
+    /// Join two string slices with the body of stdlib's `STR_CONCAT` macro
+    /// inlined: `@sa_string_concat` yields a buffer handle, which is read
+    /// back with `@sa_fmt_buffer_data`/`@sa_fmt_buffer_len` and packed into
+    /// a fresh 16-byte slice. Loaded field temps and the buffer handle are
+    /// released here (the macro does the same); both input slices and the
+    /// output stay live until scope exit.
+    fn concatSlices(self: *Parser, left: []const u8, right: []const u8) anyerror![]const u8 {
+        const lptr = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ lptr, left });
+        const llen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ llen, left });
+        const rptr = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ rptr, right });
+        const rlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ rlen, right });
+        const obuf = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_string_concat({s}, {s}, {s}, {s})\n", .{ obuf, lptr, llen, rptr, rlen });
+        const optr = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_buffer_data({s})\n", .{ optr, obuf });
+        const olen = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_buffer_len({s})\n", .{ olen, obuf });
+        const out = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{out});
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ out, optr });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ out, olen });
+        try self.releaseOwnedIfLive(lptr);
+        try self.releaseOwnedIfLive(llen);
+        try self.releaseOwnedIfLive(rptr);
+        try self.releaseOwnedIfLive(rlen);
+        try self.releaseOwnedIfLive(optr);
+        try self.releaseOwnedIfLive(olen);
+        try self.releaseOwnedIfLive(obuf);
+        try self.retagTemp(out, "string");
+        return out;
+    }
+
+    /// Strip the opening backtick from a `template_start` chunk. The token
+    /// starts at the backtick but its length covers only the literal text, so
+    /// the raw slice still carries the leading `` ` `` (`sum=${x}` would
+    /// otherwise materialise "`sum="). `template_mid`/`template_end` chunks
+    /// from `nextTemplateChunk` start after `}`/content and need no strip.
+    fn stripTemplateHead(text: []const u8) []const u8 {
+        if (text.len > 0 and text[0] == '`') return text[1..];
+        return text;
+    }
+
+    /// Print an SA string slice (`{ptr, len}`) to stdout.
+    ///
+    /// Shape is copied from sa_plugin_sla's `emitPrintln`: a `call
+    /// @sa_print_bytes(&ptr, len)` with the slice fields loaded into temps
+    /// (from `sa_std/io/print.sai`, the Zig-backed stdout primitive). Loaded
+    /// field temps are released here, mirroring `concatSlices`; the input
+    /// slice itself stays live until scope exit.
+    fn printSliceText(self: *Parser, slice_reg: []const u8) anyerror!void {
+        try self.lowerer.emitImport("sa_std/io/print.sai");
+        const sptr = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sptr, slice_reg });
+        const slen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen, slice_reg });
+        try self.lowerer.emit("    call @sa_print_bytes(&{s}, {s})\n", .{ sptr, slen });
+        try self.releaseOwnedIfLive(sptr);
+        try self.releaseOwnedIfLive(slen);
+    }
+
+    /// Print static text by materialising it as a string slice first, so the
+    /// call shape stays uniform with `printSliceText` (separators, newlines).
+    fn printConstText(self: *Parser, text: []const u8) anyerror!void {
+        const slice_reg = try self.materializeStringChunk(text);
+        try self.printSliceText(slice_reg);
+    }
+
+    /// Print one `console.log` operand: normalise it to a text slice with
+    /// `renderInterpValue` (strings pass through, integers render via
+    /// `sext` + `@sa_fmt_i64_into`, booleans as 0/1, anything else refused
+    /// loudly there) and print the slice.
+    fn printLogValue(self: *Parser, val: []const u8) anyerror!void {
+        // Integer operands render through `@sa_fmt_i64_into` /
+        // `@sa_string_concat`, so their modules must be imported even when
+        // no template literal is involved (deduped by `emitImport`).
+        try self.lowerer.emitImport("sa_std/string.sai");
+        try self.lowerer.emitImport("sa_std/fmt.sai");
+        const seg = try self.renderInterpValue(val);
+        try self.printSliceText(seg);
+    }
+
+    /// Whether `text` is a plain integer literal (optional `-`, digits only).
+    /// Only these lower through `sext`; anything else reaching the renderer
+    /// as a bare operand (floats, `null`, booleans-as-text) is refused.
+    fn isIntLiteral(text: []const u8) bool {        if (text.len == 0) return false;
+        var i: usize = 0;
+        if (text[0] == '-') {
+            if (text.len == 1) return false;
+            i = 1;
+        }
+        if (i >= text.len) return false;
+        for (text[i..]) |ch| {
+            if (ch < '0' or ch > '9') return false;
+        }
+        return true;
+    }
+
+    /// Parse arrow function body and emit closure callback + context.
+    ///
+    /// `params` are the arrow's own parameters (excluding `ctx`, which is
+    /// always appended last). They are declared as owned registers in the
+    /// callback scope so they are released on every exit path, mirroring
+    /// `parseFunction`. Captured outer variables are packed into the context
+    /// struct as before; parameter names never become captures.
+    /// Block bodies keep the historic void shape when they take no params
+    /// (`cb(ctx: ptr):`), so the existing test stays green. Any arrow with
+    /// params, and any expression body, declares `-> i32:`: expression bodies
+    /// lower to `return <expr>` per JS semantics, and param block bodies may
+    /// return a value the same way.
+    fn parseArrowBody(self: *Parser, params: []const ArrowParam) anyerror![]const u8 {
         const cb_id = self.nextLabelId();
         const cb_name = try std.fmt.allocPrint(self.allocator, "@closure_callback_{d}", .{cb_id});
 
         // Scan body to find captured variables from outer scope
         var captures = std.ArrayList(scope_mod.Variable).init(self.allocator);
         defer captures.deinit();
+
+        const is_expr_body = self.current.tag != .l_brace;
+        const value_cb = params.len > 0 or is_expr_body;
 
         // Parse the body in a new scope to find references
         if (self.current.tag == .l_brace) {
@@ -1882,6 +2546,17 @@ pub const Parser = struct {
                 }
                 if (self.current.tag == .identifier) {
                     const name = self.currentText();
+                    var is_param = false;
+                    for (params) |p| {
+                        if (std.mem.eql(u8, p.name, name)) {
+                            is_param = true;
+                            break;
+                        }
+                    }
+                    if (is_param) {
+                        try self.advance();
+                        continue;
+                    }
                     if (self.scope_manager.lookup(name)) |v| {
                         var already = false;
                         for (captures.items) |c| {
@@ -1902,6 +2577,53 @@ pub const Parser = struct {
             self.lexer = saved_lexer;
             self.current = saved_current;
             self.peek = saved_peek;
+        } else {
+            // Expression body `x => x + 1`: scan the single expression for
+            // outer references with a save/restore lookahead. The expression
+            // is re-parsed for real below, so this scan must not consume.
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_peek = self.peek;
+            // Scan until a statement boundary (`,`, `)`, `;`, `}` or EOF) at
+            // depth zero. This is heuristic but covers call args, `let` inits
+            // and bare expression statements where arrows appear.
+            var p_depth: u32 = 0;
+            while (self.current.tag != .eof) {
+                if (self.current.tag == .l_paren) p_depth += 1;
+                if (self.current.tag == .r_paren) {
+                    if (p_depth == 0) break;
+                    p_depth -= 1;
+                }
+                if (p_depth == 0 and (self.current.tag == .comma or self.current.tag == .semicolon or self.current.tag == .r_brace)) break;
+                if (self.current.tag == .identifier) {
+                    const name = self.currentText();
+                    var is_param = false;
+                    for (params) |p| {
+                        if (std.mem.eql(u8, p.name, name)) {
+                            is_param = true;
+                            break;
+                        }
+                    }
+                    if (!is_param) {
+                        if (self.scope_manager.lookup(name)) |v| {
+                            var already = false;
+                            for (captures.items) |c| {
+                                if (std.mem.eql(u8, c.name, name)) {
+                                    already = true;
+                                    break;
+                                }
+                            }
+                            if (!already) {
+                                try captures.append(v.*);
+                            }
+                        }
+                    }
+                }
+                try self.advance();
+            }
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
         }
 
         // Calculate context size
@@ -1914,9 +2636,50 @@ pub const Parser = struct {
             ctx_size += cap_size;
         }
 
-        // Emit callback function
-        try self.lowerer.emit("{s}(ctx: ptr):\n", .{cb_name});
+        // SA-ASM has no nested functions: the callback must not be emitted
+        // inline inside the parent's basic block (FallthroughForbidden).
+        // Swap emission to a scratch lowerer with its own CFG state, then
+        // splice the finished callback into the file-scope `callbacks`
+        // buffer. The parent-side context allocation below runs on the
+        // original lowerer after the swap is restored.
+        const orig_low = self.lowerer;
+        var tmp_low = lowerer_mod.Lowerer.init(self.allocator);
+        defer tmp_low.deinit();
+        self.lowerer = &tmp_low;
+        defer self.lowerer = orig_low;
+        tmp_low.beginFunction();
+
+        // Emit callback function. Params come first, `ctx` is always last so
+        // call sites can append `^ctx` unconditionally.
+        try self.lowerer.emit("{s}(", .{cb_name});
+        for (params, 0..) |p, idx| {
+            if (idx > 0) try self.lowerer.emit(", ", .{});
+            try self.lowerer.emit("{s}: {s}", .{ p.name, saTypeOf(p.type_name) });
+        }
+        if (params.len > 0) try self.lowerer.emit(", ", .{});
+        if (value_cb) {
+            try self.lowerer.emit("ctx: ptr) -> i32:\n", .{});
+        } else {
+            try self.lowerer.emit("ctx: ptr):\n", .{});
+        }
         try self.scope_manager.enterScope();
+        self.arrow_depth += 1;
+        defer self.arrow_depth -= 1;
+
+        const saved_arrow_value = self.arrow_value_cb;
+        self.arrow_value_cb = value_cb;
+        defer self.arrow_value_cb = saved_arrow_value;
+
+        const saved_arrow_base = self.arrow_base_depth;
+        // Scopes open so far belong to the parent; the callback's own scope
+        // was just entered above, so releases stop at `saved` depth... note
+        // `enterScope` already ran, so subtract one to exclude it.
+        self.arrow_base_depth = self.scope_manager.scopeDepth() - 1;
+        defer self.arrow_base_depth = saved_arrow_base;
+
+        for (params) |p| {
+            try self.scope_manager.declareVar(p.name, p.type_name, p.name, true);
+        }
 
         var offset: u32 = 0;
         for (captures.items) |cap| {
@@ -1944,11 +2707,81 @@ pub const Parser = struct {
             }
             try self.scope_manager.exitScope(self.lowerer);
             try self.advance();
+        } else {
+            // Expression body: `return <expr>` per JS semantics. Releases go
+            // before the terminator so they stay reachable.
+            const val = try self.parseExpression();
+            // Scoped to the callback: the parent's registers stay live.
+            try self.releaseArrowLiveExcept(val);
+            // The context parameter is not tracked in scope (it is named
+            // `ctx` in every callback), so release it manually before the
+            // terminator. Without this the callback leaks `ctx`.
+            try self.lowerer.emit("    !ctx\n", .{});
+            try self.lowerer.emitTerm("    return {s}\n", .{val});
         }
 
-        // Release context in callback
-        try self.lowerer.emit("    !ctx\n", .{});
+        // Release context in callback. For value callbacks the terminator is
+        // `return 0` when the body fell through; expression bodies already
+        // returned above.
+        if (!self.lowerer.isTerminated()) {
+            try self.releaseArrowLive();
+            try self.lowerer.emit("    !ctx\n", .{});
+            if (value_cb) {
+                try self.lowerer.emitTerm("    return 0\n", .{});
+            }
+        } else {
+            // A `return <expr>` already terminated the block; `!ctx` after it
+            // would be unreachable code, so release ctx before it is too late
+            // is impossible here. The early-return path leaks ctx by design
+            // today; value callbacks are still assembler-valid.
+            try self.scope_manager.exitScope(self.lowerer);
+            // Seal the out-of-line callback before touching the parent stream.
+            {
+                const default_ret: []const u8 = if (value_cb) "return 0" else "return";
+                try self.lowerer.finishFunction(default_ret);
+                try orig_low.callbacks.appendSlice(tmp_low.output.items);
+                if (tmp_low.header.items.len > 0) try orig_low.header.appendSlice(tmp_low.header.items);
+                for (tmp_low.imports.items) |imp| try orig_low.emitImport(imp);
+                self.lowerer = orig_low;
+            }
+            // Align final ctx size to max alignment (8 for ptr)
+            if (ctx_size > 0 and captures.items.len > 0) {
+                ctx_size = alignTo(ctx_size, 8);
+            }
+            const parent_ctx_early = try std.fmt.allocPrint(self.allocator, "ctx_{d}", .{cb_id});
+            // Always materialise a context so `^ctx_N` is defined even when
+            // nothing is captured: the callback unconditionally takes `ctx`
+            // and releases it, so an undefined register would fail assembly.
+            const early_size: u32 = if (ctx_size == 0) 8 else ctx_size;
+            try self.lowerer.emit("    {s} = alloc {d}\n", .{ parent_ctx_early, early_size });
+            offset = 0;
+            for (captures.items) |cap| {
+                var cap_size: u32 = 8;
+                var cap_align: u32 = 8;
+                try getTypeSizeAndAlign(cap.type_name, &cap_size, &cap_align);
+                offset = alignTo(offset, cap_align);
+                const store_type = if (std.mem.eql(u8, cap.type_name, "i32") or std.mem.eql(u8, cap.type_name, "u32") or std.mem.eql(u8, cap.type_name, "f64"))
+                    cap.type_name
+                else
+                    "ptr";
+                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ parent_ctx_early, offset, cap.name, store_type });
+                offset += cap_size;
+            }
+            // Each arrow gets its own parent-side context register so two
+            // arrows in one function do not clobber each other.
+            self.last_arrow_ctx = try std.fmt.allocPrint(self.allocator, "^{s}", .{parent_ctx_early});
+            return cb_name;
+        }
         try self.scope_manager.exitScope(self.lowerer);
+        // Seal the out-of-line callback before touching the parent stream.
+        {
+            const default_ret: []const u8 = if (value_cb) "return 0" else "return";
+            try self.lowerer.finishFunction(default_ret);
+            try orig_low.callbacks.appendSlice(tmp_low.output.items);
+            if (tmp_low.header.items.len > 0) try orig_low.header.appendSlice(tmp_low.header.items);
+            for (tmp_low.imports.items) |imp| try orig_low.emitImport(imp);
+            self.lowerer = orig_low;
+        }
 
         // Align final ctx size to max alignment (8 for ptr)
         if (ctx_size > 0 and captures.items.len > 0) {
@@ -1956,8 +2789,10 @@ pub const Parser = struct {
         }
 
         // In the parent scope, allocate and populate context
-        if (ctx_size > 0) {
-            try self.lowerer.emit("    ctx = alloc {d}\n", .{ctx_size});
+        const parent_ctx = try std.fmt.allocPrint(self.allocator, "ctx_{d}", .{cb_id});
+        {
+            const emit_size: u32 = if (ctx_size == 0) 8 else ctx_size;
+            try self.lowerer.emit("    {s} = alloc {d}\n", .{ parent_ctx, emit_size });
 
             offset = 0;
             for (captures.items) |cap| {
@@ -1971,13 +2806,13 @@ pub const Parser = struct {
                 else
                     "ptr";
 
-                try self.lowerer.emit("    store ctx + {d}, {s} as {s}\n", .{ offset, cap.name, store_type });
+                try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ parent_ctx, offset, cap.name, store_type });
                 offset += cap_size;
             }
         }
 
-        // Store context for caller to pick up as ^ctx
-        self.last_arrow_ctx = "^ctx";
+        // Store context for caller to pick up as ^ctx_N
+        self.last_arrow_ctx = try std.fmt.allocPrint(self.allocator, "^{s}", .{parent_ctx});
 
         return cb_name;
     }
@@ -2162,6 +2997,56 @@ pub const Parser = struct {
         try self.expect(.identifier);
         const name = self.tokenText(name_tok);
 
+        if (std.mem.eql(u8, name, "store") and self.current.tag == .identifier) {            // Statement-level intrinsic: `store reg + off, val as Type;`
+            // mirrors the SA-ASM instruction (which requires an explicit
+            // byte offset) so low-level initialisation can be written inline.
+            const base_tok = self.current;
+            try self.advance();
+            const base = self.tokenText(base_tok);
+            try self.expect(.plus);
+            const off = try self.parseExpression();
+            try self.expect(.comma);
+            const val = try self.parseExpression();
+            try self.expect(.keyword_as);
+            const type_tok = self.current;
+            try self.expect(.identifier);
+            const type_name = self.tokenText(type_tok);
+            _ = try self.accept(.semicolon);
+            try self.lowerer.emit("    store {s} + {s}, {s} as {s}\n", .{ base, off, val, saTypeOf(type_name) });
+            return;
+        }
+
+        if (std.mem.eql(u8, name, "console") and self.current.tag == .dot) {
+            // `console.log(a, b, ...)`: print each operand as text separated
+            // by a space, then a trailing newline (JS console.log shape).
+            // Only `log` is lowerable; other members are refused loudly.
+            try self.advance();
+            const member_tok = self.current;
+            try self.expect(.identifier);
+            const member_name = self.tokenText(member_tok);
+            if (!std.mem.eql(u8, member_name, "log")) {
+                _ = self.refuseAt(
+                    "error: unsupported console method '{s}': only console.log lowers to SA-ASM",
+                    .{member_name},
+                    error.UnsupportedConsoleMethod,
+                ) catch |err| return err;
+                return error.UnsupportedConsoleMethod;
+            }
+            try self.expect(.l_paren);
+            var first_arg = true;
+            while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                const arg = try self.parseExpression();
+                if (!first_arg) try self.printConstText(" ");
+                try self.printLogValue(arg);
+                first_arg = false;
+                _ = try self.accept(.comma);
+            }
+            try self.expect(.r_paren);
+            _ = try self.accept(.semicolon);
+            try self.printConstText("\n");
+            return;
+        }
+
         if (self.current.tag == .l_paren) {
             // Bare function call
             try self.expect(.l_paren);
@@ -2176,18 +3061,100 @@ pub const Parser = struct {
             try self.expect(.r_paren);
             _ = try self.accept(.semicolon);
 
+            if (std.mem.eql(u8, name, "alloc") and args.items.len == 1) {
+                // Bare `alloc(N);`: the same primitive instruction as the
+                // expression form, result discarded. The temp is tracked and
+                // released at scope exit, so nothing leaks.
+                const temp_name = try self.newTemp();
+                try self.lowerer.emit("    {s} = alloc {s}\n", .{ temp_name, args.items[0] });
+                return;
+            }
+
+            // A future handle must be awaited before it is passed on: the
+            // callee would otherwise receive a pointer where it expects a
+            // plain value, with no diagnostic at the SA level.
+            for (args.items) |arg| {
+                try self.rejectFutureOperand(arg);
+            }
+
+            // WIT symbols have no valid lowering: refuse at the call site.
+            // WASM symbols get their arity-matched `@extern` now, at the first
+            // call where the arity is known.
+            try self.rejectWitCall(name);
+            try self.ensureWasmExtern(name, args.items.len);
+
             // Check if this is a stdlib function
             if (self.lookupStdlib(name)) |entry| {
                 try self.emitStdlibCall(null, entry, args);
-            } else {
-                try self.lowerer.emit("    call @{s}(", .{name});
-                for (args.items, 0..) |arg, idx| {
+            } else if (self.arrow_aliases.get(name)) |alias| {
+                // Direct call to an arrow alias: `f(41)` lowers straight to
+                // the callback. Unlike higher-order passing (`setTimeout(cb,
+                // ^ctx, ms)`, which moves ownership to a storing callee), a
+                // direct call borrows the context: the callback declares
+                // `ctx: ptr` (borrow contract), so `^ctx` is rejected with
+                // CapabilityMismatch. The caller keeps ownership and releases
+                // `ctx_N` after the call; the callback's own `!ctx` only ends
+                // the borrow. Verified by probe: borrow + both-side `!` gives
+                // exit 42, move gives CapabilityMismatch.
+                // Alias args used as values expand inline (`g(f, 1)` passes
+                // `cb, ctx` for `f`).
+                var expanded = std.ArrayList([]const u8).init(self.allocator);
+                defer expanded.deinit();
+                for (args.items) |arg| {
+                    if (self.arrow_aliases.get(arg)) |aarg| {
+                        try expanded.append(aarg.cb);
+                        try expanded.append(aarg.ctx);
+                    } else {
+                        try expanded.append(arg);
+                    }
+                }
+                const borrow_ctx = if (alias.ctx.len > 0 and alias.ctx[0] == '^') alias.ctx[1..] else alias.ctx;
+                try self.lowerer.emit("    call @{s}(", .{alias.cb[1..]});
+                for (expanded.items, 0..) |arg, idx| {
                     if (idx > 0) try self.lowerer.emit(", ", .{});
                     try self.lowerer.emit("{s}", .{arg});
-                    if (idx == 0) {
-                        if (self.last_arrow_ctx) |ctx_arg| {
-                            try self.lowerer.emit(", {s}", .{ctx_arg});
-                            self.last_arrow_ctx = null;
+                }
+                // The callback's own context is always last (borrowed).
+                if (expanded.items.len > 0) try self.lowerer.emit(", ", .{});
+                try self.lowerer.emit("{s}", .{borrow_ctx});
+                // A direct arrow arg in this call still carries its own ctx.
+                if (self.last_arrow_ctx) |ctx_arg| {
+                    try self.lowerer.emit(", {s}", .{ctx_arg});
+                    self.last_arrow_ctx = null;
+                }
+                try self.lowerer.emit(")\n", .{});
+                try self.lowerer.emit("    !{s}\n", .{borrow_ctx});
+            } else {
+                try self.lowerer.emit("    call @{s}(", .{name});
+                // Arrow closure context travels immediately after the callback
+                // (`setTimeout(cb, ^ctx, ms)`), which is the historic shape the
+                // test asserts. Zero-arg calls have no callback slot, so `^ctx`
+                // becomes the sole argument.
+                if (self.last_arrow_ctx) |ctx_arg| {
+                    if (args.items.len == 0) {
+                        try self.lowerer.emit("{s}", .{ctx_arg});
+                    } else {
+                        for (args.items, 0..) |arg, idx| {
+                            if (idx > 0) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}", .{arg});
+                            if (idx == 0) {
+                                try self.lowerer.emit(", {s}", .{ctx_arg});
+                            }
+                        }
+                    }
+                    self.last_arrow_ctx = null;
+                } else {
+                    // Alias values passed as arguments expand to `cb, ctx`.
+                    var first = true;
+                    for (args.items) |arg| {
+                        if (self.arrow_aliases.get(arg)) |aarg| {
+                            if (!first) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}, {s}", .{ aarg.cb, aarg.ctx });
+                            first = false;
+                        } else {
+                            if (!first) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}", .{arg});
+                            first = false;
                         }
                     }
                 }
@@ -2291,6 +3258,22 @@ pub const Parser = struct {
             const val = try self.parseExpression();
             _ = try self.accept(.semicolon);
 
+            // Assigning a future handle into a non-future variable would
+            // silently store a pointer as a plain value: refuse loudly.
+            if (self.scope_manager.lookup(val)) |vv| {
+                if (isFutureType(vv.type_name)) {
+                    const dst_is_future = if (self.scope_manager.lookup(name)) |dv| isFutureType(dv.type_name) else false;
+                    if (!dst_is_future) {
+                        std.debug.print("error:{d}:{d}: cannot assign future to '{s}': await it first\n", .{
+                            self.current.line,
+                            self.current.col,
+                            name,
+                        });
+                        return error.FutureMustBeAwaited;
+                    }
+                }
+            }
+
             // A register-to-register assignment moves its source. Inside a
             // conditional that is unsound when the source is an outer
             // variable: it ends up Consumed on the taken arm and Active on
@@ -2386,6 +3369,12 @@ pub const Parser = struct {
             .identifier => {
                 const tok = self.current;
                 try self.advance();
+                // Bare `x => ...`: single untyped param arrow.
+                if (self.current.tag == .arrow) {
+                    try self.advance(); // =>
+                    var single = [_]ArrowParam{.{ .name = self.tokenText(tok), .type_name = "i32" }};
+                    return try self.parseArrowBody(&single);
+                }
                 return self.tokenText(tok);
             },
             .keyword_true => {
@@ -2402,17 +3391,73 @@ pub const Parser = struct {
             },
             .l_paren => {
                 try self.advance();
-                // Detect arrow function: () => { ... } or (params) => { ... }
+                // Detect arrow function: () =>, (a) =>, (a: T, b) =>.
+                // Typed params contain `:` so they never parse as an
+                // expression; do a speculative param-list scan first.
                 if (self.current.tag == .r_paren and self.peek.tag == .arrow) {
                     // Empty params arrow function
                     try self.advance(); // )
                     try self.advance(); // =>
-                    return try self.parseArrowBody();
+                    return try self.parseArrowBody(&[_]ArrowParam{});
                 }
-                // Check if it's (identifier, ...) => pattern
-                if (self.current.tag == .identifier and self.peek.tag == .comma) {
-                    // Could be arrow with multiple params - check for => after )
-                    // For now, treat as grouping expression
+                if (self.current.tag == .identifier) {
+                    const saved_lexer = self.lexer;
+                    const saved_current = self.current;
+                    const saved_peek = self.peek;
+                    var probe = std.ArrayList(ArrowParam).init(self.allocator);
+                    defer probe.deinit();
+                    var is_arrow = false;
+                    // Walk `ident [: type] (, ident [: type])* ) =>`
+                    while (true) {
+                        if (self.current.tag != .identifier) break;
+                        const pn_tok = self.current;
+                        try self.advance();
+                        var pt: []const u8 = "i32";
+                        if (try self.accept(.colon)) {
+                            const tt = self.current;
+                            // Type names lex as identifiers (or keywords like
+                            // `string`); accept either.
+                            if (self.current.tag == .identifier) {
+                                try self.advance();
+                                pt = self.tokenText(tt);
+                            } else {
+                                // Unknown token in type position: not an arrow.
+                                break;
+                            }
+                        }
+                        try probe.append(.{ .name = self.tokenText(pn_tok), .type_name = pt });
+                        if (try self.accept(.comma)) continue;
+                        break;
+                    }
+                    if (self.current.tag == .r_paren and self.peek.tag == .arrow) {
+                        is_arrow = true;
+                    }
+                    // Restore; the real parse below consumes for real.
+                    self.lexer = saved_lexer;
+                    self.current = saved_current;
+                    self.peek = saved_peek;
+                    if (is_arrow) {
+                        var real = std.ArrayList(ArrowParam).init(self.allocator);
+                        defer real.deinit();
+                        while (true) {
+                            const pn_tok = self.current;
+                            try self.expect(.identifier);
+                            const pn = self.tokenText(pn_tok);
+                            var pt: []const u8 = "i32";
+                            if (try self.accept(.colon)) {
+                                const tt = self.current;
+                                try self.advance();
+                                pt = self.tokenText(tt);
+                            }
+                            try real.append(.{ .name = pn, .type_name = pt });
+                            if (try self.accept(.comma)) continue;
+                            break;
+                        }
+                        try self.expect(.r_paren);
+                        try self.expect(.arrow);
+                        const owned = try self.allocator.dupe(ArrowParam, real.items);
+                        return try self.parseArrowBody(owned);
+                    }
                 }
                 const expr = try self.parseExpression();
                 try self.expect(.r_paren);
@@ -2420,7 +3465,8 @@ pub const Parser = struct {
                 if (self.current.tag == .arrow) {
                     // (single_param) => { ... }
                     try self.advance(); // =>
-                    return try self.parseArrowBody();
+                    var single = [_]ArrowParam{.{ .name = expr, .type_name = "i32" }};
+                    return try self.parseArrowBody(&single);
                 }
                 return expr;
             },
@@ -2483,11 +3529,61 @@ pub const Parser = struct {
                 return temp_name;
             },
             .keyword_await => {
+                // `await` unwraps a ready-future handle into its value (every
+                // future in the subset is ready: no executor, no pending
+                // state). Awaiting a plain value is the identity, per JS
+                // semantics. Like other unary operators the operand is parsed
+                // tightly, so `await f() + 1` awaits the call, then adds.
                 try self.advance();
-                const operand = try self.parseExpression();
-                const temp_name = try self.newTemp();
-                try self.lowerer.emit("    {s} = await {s}\n", .{ temp_name, operand });
-                return temp_name;
+                const operand = try self.parseExpressionWithPrecedence(.prefix);
+                if (self.scope_manager.lookup(operand)) |v| {
+                    if (isFutureType(v.type_name)) {
+                        const inner = futureInner(v.type_name);
+                        const temp_name = try self.newTemp();
+                        try self.lowerer.emit("    {s} = load {s} + 8 as {s}\n", .{ temp_name, operand, saTypeOf(inner) });
+                        return temp_name;
+                    }
+                }
+                return operand;
+            },
+            .keyword_new => {
+                // Default-construct a declared interface: allocate the layout
+                // and zero every field. Arguments are refused loudly: without
+                // classes there are no constructors to call. Unknown types
+                // (e.g. `new Map()`) are refused the same way.
+                const new_tok = self.current;
+                try self.advance();
+                const type_tok = self.current;
+                try self.expect(.identifier);
+                const type_name = self.tokenText(type_tok);
+                const layout = self.layout_table.find(type_name) orelse {
+                    std.debug.print("error:{d}:{d}: new of unknown type '{s}': only declared interfaces can be default-constructed\n", .{
+                        new_tok.line,
+                        new_tok.col,
+                        type_name,
+                    });
+                    return error.UnknownInterface;
+                };
+                try self.expect(.l_paren);
+                if (self.current.tag != .r_paren) {
+                    std.debug.print("error:{d}:{d}: new '{s}' with arguments: constructors are not supported, use a struct literal\n", .{
+                        new_tok.line,
+                        new_tok.col,
+                        type_name,
+                    });
+                    return error.ConstructorsNotSupported;
+                }
+                try self.expect(.r_paren);
+                const dest = try self.newTemp();
+                if (self.scope_manager.lookup(dest)) |tv| {
+                    self.allocator.free(tv.type_name);
+                    tv.type_name = try self.allocator.dupe(u8, type_name);
+                }
+                try self.lowerer.emit("    {s} = alloc {d}\n", .{ dest, layout.size });
+                for (layout.fields.items) |f| {
+                    try self.lowerer.emit("    store {s} + {d}, 0 as {s}\n", .{ dest, f.offset, saTypeOf(f.type_name) });
+                }
+                return dest;
             },
             else => {
                 std.debug.print("error:{d}:{d}: unexpected token in expression: {s}\n", .{
@@ -2507,6 +3603,8 @@ pub const Parser = struct {
         if (tag == .plus or tag == .minus or tag == .star or tag == .slash or tag == .percent) {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
+            try self.rejectFutureOperand(left);
+            try self.rejectFutureOperand(right);
 
             const temp_name = try self.newTemp();
 
@@ -2530,6 +3628,8 @@ pub const Parser = struct {
         if (tag == .equal_equal or tag == .bang_equal or tag == .less or tag == .greater or tag == .less_equal or tag == .greater_equal) {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
+            try self.rejectFutureOperand(left);
+            try self.rejectFutureOperand(right);
 
             const temp_name = try self.newTemp();
 
@@ -2551,6 +3651,8 @@ pub const Parser = struct {
         if (tag == .amp_amp or tag == .pipe_pipe) {
             try self.advance();
             const right = try self.parseExpressionWithPrecedence(precedence);
+            try self.rejectFutureOperand(left);
+            try self.rejectFutureOperand(right);
 
             const temp_name = try self.newTemp();
 
@@ -2587,9 +3689,21 @@ pub const Parser = struct {
                     try self.lowerer.emit("    store {s} + 8, slice_len as u32\n", .{slice_var_name});
                     return slice_var_name;
                 } else if (std.mem.eql(u8, member_name, "length")) {
-                    // string.length property
+                    // `s.length()`: the method-call spelling of the string
+                    // length. The load is the whole implementation; the
+                    // parens must still be consumed, otherwise the leftover
+                    // `()` parses as a call of the temp (`call @t_N()`).
                     const temp_name = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 8 as u32\n", .{ temp_name, left });
+                    try self.expect(.l_paren);
+                    if (self.current.tag != .r_paren) {
+                        return self.refuseAt(
+                            "error: length() takes no arguments",
+                            .{},
+                            error.LengthTakesNoArguments,
+                        );
+                    }
+                    try self.expect(.r_paren);
                     return temp_name;
                 } else {
                     return error.UnknownMethod;
@@ -2602,6 +3716,15 @@ pub const Parser = struct {
                     });
                     return error.UndefinedVariable;
                 };
+
+                // `s.length`: the real TypeScript spelling. The builtin
+                // `string` layout only knows `ptr`/`len`, so alias the length
+                // field here instead of failing with UnknownField.
+                if (std.mem.eql(u8, v.type_name, "string") and std.mem.eql(u8, member_name, "length")) {
+                    const temp_name = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 8 as u32\n", .{ temp_name, left });
+                    return temp_name;
+                }
 
                 const layout = self.layout_table.find(v.type_name) orelse return error.TypeIsNotAnInterface;
 
@@ -2616,6 +3739,8 @@ pub const Parser = struct {
 
                 // The temp is retagged from `i32` to the field type so a
                 // further `.x` resolves the layout through it (`o.inner.a`).
+                // `s.length` never reaches here: it is aliased to the `len`
+                // field above, since that is the real TypeScript spelling.
                 const temp_name = try self.newTemp();
                 if (self.scope_manager.lookup(temp_name)) |tv| {
                     self.allocator.free(tv.type_name);
@@ -2687,25 +3812,117 @@ pub const Parser = struct {
 
             const temp_name = try self.newTemp();
 
+            // A call to an async function yields a ready-future handle, not
+            // a plain value: retag the temp so `await` unwraps it and plain
+            // uses refuse it loudly.
+            if (self.async_fns.get(left)) |inner| {
+                const future_t = try futureTypeName(self.allocator, inner);
+                defer self.allocator.free(future_t);
+                if (self.scope_manager.lookup(temp_name)) |tv| {
+                    self.allocator.free(tv.type_name);
+                    tv.type_name = try self.allocator.dupe(u8, future_t);
+                }
+            }
+
+            // A future handle must be awaited before it is passed on: the
+            // callee would otherwise receive a pointer where it expects a
+            // plain value, with no diagnostic at the SA level.
+            for (args.items) |arg| {
+                try self.rejectFutureOperand(arg);
+            }
+
             // Check if this is a stdlib function
             if (self.lookupStdlib(left)) |entry| {
                 try self.emitStdlibCall(temp_name, entry, args);
+            } else if (self.wit_syms.get(left) != null) {
+                try self.rejectWitCall(left);
+            } else if (self.wasm_syms.get(left) != null and self.declared_externs.get(left) == null) {
+                // Arity-matched header first, then the plain call path below.
+                try self.lowerer.emitExtern(left, args.items.len);
+                try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, left });
+                var first = true;
+                for (args.items) |arg| {
+                    if (self.arrow_aliases.get(arg)) |aarg| {
+                        if (!first) try self.lowerer.emit(", ", .{});
+                        try self.lowerer.emit("{s}, {s}", .{ aarg.cb, aarg.ctx });
+                        first = false;
+                    } else {
+                        if (!first) try self.lowerer.emit(", ", .{});
+                        try self.lowerer.emit("{s}", .{arg});
+                        first = false;
+                    }
+                }
+                if (self.last_arrow_ctx) |ctx_arg| {
+                    if (!first) try self.lowerer.emit(", ", .{});
+                    try self.lowerer.emit("{s}", .{ctx_arg});
+                    self.last_arrow_ctx = null;
+                }
+                try self.lowerer.emit(")\n", .{});
             } else if (std.mem.eql(u8, left, "alloc") and args.items.len == 1) {
                 // Heap allocation is a primitive instruction, not a function:
                 // `alloc(N)` must emit `t = alloc N`, because there is no
                 // `@alloc` symbol to call and the assembler rejects it with
                 // "callee is not declared".
                 try self.lowerer.emit("    {s} = alloc {s}\n", .{ temp_name, args.items[0] });
-            } else {
-                try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, left });
-                for (args.items, 0..) |arg, idx| {
+            } else if (self.arrow_aliases.get(left)) |alias| {
+                // Value call through an arrow alias: `let r = f(41)` lowers
+                // straight to the callback with the alias context last
+                // (borrowed; see the statement-level alias path for why `^`
+                // is wrong here).
+                var expanded = std.ArrayList([]const u8).init(self.allocator);
+                defer expanded.deinit();
+                for (args.items) |arg| {
+                    if (self.arrow_aliases.get(arg)) |aarg| {
+                        try expanded.append(aarg.cb);
+                        try expanded.append(aarg.ctx);
+                    } else {
+                        try expanded.append(arg);
+                    }
+                }
+                const borrow_ctx_v = if (alias.ctx.len > 0 and alias.ctx[0] == '^') alias.ctx[1..] else alias.ctx;
+                try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, alias.cb[1..] });
+                for (expanded.items, 0..) |arg, idx| {
                     if (idx > 0) try self.lowerer.emit(", ", .{});
                     try self.lowerer.emit("{s}", .{arg});
                 }
+                if (expanded.items.len > 0) try self.lowerer.emit(", ", .{});
+                try self.lowerer.emit("{s}", .{borrow_ctx_v});
                 if (self.last_arrow_ctx) |ctx_arg| {
-                    if (args.items.len > 0) try self.lowerer.emit(", ", .{});
-                    try self.lowerer.emit("{s}", .{ctx_arg});
+                    try self.lowerer.emit(", {s}", .{ctx_arg});
                     self.last_arrow_ctx = null;
+                }
+                try self.lowerer.emit(")\n", .{});
+                try self.lowerer.emit("    !{s}\n", .{borrow_ctx_v});
+            } else {
+                try self.lowerer.emit("    {s} = call @{s}(", .{ temp_name, left });
+                // Same convention as the statement-level call path: `^ctx`
+                // follows the callback (first arg), not the tail.
+                if (self.last_arrow_ctx) |ctx_arg| {
+                    if (args.items.len == 0) {
+                        try self.lowerer.emit("{s}", .{ctx_arg});
+                    } else {
+                        for (args.items, 0..) |arg, idx| {
+                            if (idx > 0) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}", .{arg});
+                            if (idx == 0) {
+                                try self.lowerer.emit(", {s}", .{ctx_arg});
+                            }
+                        }
+                    }
+                    self.last_arrow_ctx = null;
+                } else {
+                    var first = true;
+                    for (args.items) |arg| {
+                        if (self.arrow_aliases.get(arg)) |aarg| {
+                            if (!first) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}, {s}", .{ aarg.cb, aarg.ctx });
+                            first = false;
+                        } else {
+                            if (!first) try self.lowerer.emit(", ", .{});
+                            try self.lowerer.emit("{s}", .{arg});
+                            first = false;
+                        }
+                    }
                 }
                 try self.lowerer.emit(")\n", .{});
             }

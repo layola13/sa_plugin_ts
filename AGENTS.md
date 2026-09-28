@@ -13,8 +13,8 @@ This file covers the entire `sa_plugin_ts` plugin project.
 - All errors reported via `plugin_api.emitLog`.
 
 ### Build
-- `zig build` produces `libsa_plugin_ts.so`. Use the default (Debug) build: optimized builds (`-Doptimize=ReleaseSmall/Safe`, and therefore `sa plugin install`) currently crash at load with a host `lock` segfault; this reproduces on the pristine tree without any CLI changes, so it is a pre-existing defect, not a regression from the `test`/`build-exe` work.
-- `zig build test` runs all 37 tests (all pass).
+- `zig build` produces `libsa_plugin_ts.so`. Use the default (Debug) build: raw optimized builds (`-Doptimize=ReleaseSmall/Safe/Fast` without `SA_PLUGIN_DEV=1`) still crash at load with a host `lock` segfault; this reproduces on the pristine tree without any CLI changes, so it is a pre-existing defect, not a regression from the `test`/`build-exe` work. `build.zig` mirrors sa_plugin_sla's compilation plumbing verbatim: `effectiveOptimizeForDevInstall` (ReleaseFast + `SA_PLUGIN_DEV=1` forces Debug, so `sa plugin install --dev` installs the tested Debug artifact), `test-filter` build option, `linkHostSystemLibs` (ws2_32/iphlpapi on Windows) on lib + tests, and `sap.json` installed to `lib/sap.json`.
+- `zig build test` runs all 40 tests (all pass; the runtime table holds 23 node-verified expectations).
 - `tools/verify_e2e.sh` lowers a corpus of TypeScript and runs `sa build` on the
   result. Run this after any change to emission: the Zig tests only assert on
   substrings and cannot catch an instruction the assembler rejects.
@@ -22,6 +22,16 @@ This file covers the entire `sa_plugin_ts` plugin project.
   arg validation, `init` scaffold, `sa.mod` workspace fallback, `build-exe` /
   `test` delegation). Run it after any change to `handle_command` or `sap.json`.
 - Plugin API is imported as a module in `build.zig`.
+
+### Dev install and test
+- `SA_PLUGIN_DEV=1 sa plugin install --dev .` installs in seconds and now works end to end: the build.zig downgrade forces the Debug artifact, so the installed plugin no longer segfaults in the host `lock` on first dispatch (verified 2026-09-28: `ts check`/`build-exe`/`test` via the installed path, plus a 256-demo installed-path sweep: 255 pass, 1 refused-with-diagnostic, 0 fail).
+- The old manual workaround (`zig build` Debug, then copy `zig-out/lib/libsa_plugin_ts.so` over `~/.local/share/sa_plugins/installed/sa_plugin_ts/current/` and `0.1.0/`) is no longer needed.
+- Day-to-day dev testing does not need the install at all: the verify scripts
+  set `SA_PLUGINS_PATH=$PLUGIN_DIR/zig-out/lib` and exercise the Debug build
+  directly (they export `SA_PLUGIN_DEV=1` like sa_plugin_sla's sweep scripts,
+  since `zig-out/lib` now ships `sap.json` and the host requires dev mode).
+- `sa build` linking needs `XDG_CACHE_HOME=/tmp/xdg` in this container (the
+  default cache is ReadOnlyFileSystem and `zig cc` fails without it).
 
 ### Testing caveat
 The inline tests match substrings of the lowerer output. That is necessary but
@@ -61,9 +71,9 @@ to assemble.
   afterwards, and `Variable.is_released` keeps the walks idempotent.
 
 ### Source Layout
-- `src/plugin.zig` — Plugin entry, descriptor, C-ABI exports, CLI handler (`lower`/`check`/`build`/`build-exe`/`test`/`init`/`skills`/`help`), 37 tests (36 substring/structural + 1 runtime table with 19 node-verified expectations: lower in-process, `sa build`, run, assert exit status). `[file]` is optional with `sa.mod` workspace fallback (`-p name`/`-p=name`/`--package=name`); `test`/`build-exe` lower to a temp `.sai` and delegate to `sa` (`sa test` / `sa build-exe <tmp.sai>`, extra args passed straight through, `--jobs auto` appended) via `resolveSaExecutable` (SA_EXE > SCI_ROOT dev layout > host dir > PATH), like `sa_plugin_sla`; needs `link_libc` (see `build.zig`) for `Child.spawn` env inheritance. `init` scaffolds `sa.mod` + `src/main.ts` + `.gitignore` and never overwrites.
+- `src/plugin.zig` — Plugin entry, descriptor, C-ABI exports, CLI handler (`lower`/`check`/`build`/`build-exe`/`test`/`init`/`skills`/`help`), 39 tests (38 substring/structural + 1 runtime table with 23 node-verified expectations: lower in-process, `sa build`, run, assert exit status). `[file]` is optional with `sa.mod` workspace fallback (`-p name`/`-p=name`/`--package=name`); `test`/`build-exe` lower to a temp `.sai` and delegate to `sa` (`sa test` / `sa build-exe <tmp.sai>`, extra args passed straight through, `--jobs auto` appended) via `resolveSaExecutable` (SA_EXE > SCI_ROOT dev layout > host dir > PATH), like `sa_plugin_sla`; needs `link_libc` (see `build.zig`) for `Child.spawn` env inheritance. `init` scaffolds `sa.mod` + `src/main.ts` + `.gitignore` and never overwrites.
 - `src/lexer.zig` — 30+ keywords, zero-copy scanning, SIMD-optimized whitespace skip, line:col tracking, template literal chunk scanning.
-- `src/parser.zig` — Pratt expression parser, LayoutTable, ScopeManager, stdlib mapping (static + dynamic), arrow closure synthesis, generic type parameters, for-of iteration, template literals, module import/export, WIT imports, error recovery.
+- `src/parser.zig` — Pratt expression parser, LayoutTable, ScopeManager, stdlib mapping (static + dynamic), arrow closures with parameters, generic type parameters, for-of iteration, template literals, module import/export (WASM arity-matched externs, WIT refusal), error recovery.
 - `src/lowerer.zig` — SA-ASM emitter. Records a CFG (`edges`, filled by
   `emitBranchTo`/`emitJumpTo` plus an implicit fallthrough edge) and provides
   `computeDominators`, an iterative immediate-dominator analysis returning a
@@ -113,11 +123,19 @@ String args auto-expanded from TS string structs (ptr+len) into SA pointer+lengt
 - Generic type parameters (Box<T>, Map<K,V>) — base name used for layout lookup
 - Enums with auto-numbered variants
 - Type aliases
-- Arrow function closures (static defunctionalization with context struct)
+- Arrow function closures with parameters (static defunctionalization, out-of-line callbacks, per-arrow context registers, `let f = (x) => ...` aliases; direct calls borrow `ctx`, higher-order passing moves `^ctx`)
 - Template literals: a plain literal (`` `text` ``) lowers to an SA string
-  slice; interpolated forms (`` `text ${expr}` ``) are diagnosed. See Known Gaps.
+  slice; interpolated forms (`` `text ${expr}` ``) lower too — integer
+  operands go through `sext` + `@sa_fmt_i64_into`, string operands pass
+  through, chunks join with `@sa_string_concat`. Booleans render as 0/1.
+  Float/other operands are refused with a located diagnostic. See Known Gaps.
 - for-of iteration over arrays
-- Module import/export (local .ts/.sa files, .wasm, .wit)
+- `console.log(...)` lowers to `@sa_print_bytes` (`sa_std/io/print.sai`, the
+  sla `emitPrintln` shape): each operand normalises to a text slice via the
+  interpolation renderer (strings pass through, integers via `sext` +
+  `@sa_fmt_i64_into`, booleans as 0/1), args join with a space, trailing
+  newline. Other `console` members are refused with a located diagnostic.
+- Module import/export (local .ts/.sa files; `.wasm` imports declare arity-matched `@extern` at the first call site, linking needs the real module; `.wit` imports are refused with a located diagnostic)
 
 ### Parser
 - Pratt expression parser with correct left-associativity (<= comparison)
@@ -132,25 +150,30 @@ These are deliberate, documented refusals rather than silent bad codegen. See
 `REQUIREMENTS.md` section 7 for the full list and the reference implementation
 for each.
 
-- **Interpolated template literals** — an SA-ASM string is a `{ptr, len}` slice
-  and cannot appear as an operand. A plain literal lowers via
-  `Lowerer.emitConst` (a file-scope `@const NAME = utf8:"..."`, buffered in
-  `Lowerer.header` and prepended by `toOwnedSlice`) plus a 16-byte `alloc` slot
-  holding `{ptr, len}`. Interpolated forms additionally need
-  `@sa_fmt_i64_into` and `@sa_string_concat(ptr, len, ptr, len) -> u64`; because
-  that returns a bare pointer with no companion length, a slice cannot be rebuilt
-  from it, so `parseTemplateLiteral` records a diagnostic and returns
-  `error.UnsupportedTemplateLiteral` rather than emitting a `concat`
-  instruction, which is not an SA mnemonic. Note `SLICE_NEW` is just
-  `store r+0, p as ptr` / `store r+8, n as u64`, so the macro is not required;
-  `alloc` is used instead of `stack_alloc` because a stack allocation cannot
-  escape its function (`StackEscape`).
+- **Interpolated template literals with non-integer operands** — integers
+  lower via `sext` + `@sa_fmt_i64_into` (`sa_std/fmt.sai`) and strings pass
+  through, joined chunk-by-chunk with `@sa_string_concat` (`sa_std/string.sai`)
+  into a fresh `{ptr, len}` slice. Booleans render as 0/1 (documented). Float
+  or other operand types record a located diagnostic and return
+  `error.UnsupportedTemplateLiteral` instead of emitting bad SA.
+- **String variable binding** — `const s: string = "..."` materializes a real
+  slice (plain `s = "..."` is not a valid SA-ASM register assignment).
+- **`s.length` property** — aliases to the string slice's `len` field. The
+  method form `s.length()` is legacy and intentionally unhandled.
 - **`try` / `catch` / `throw`** — SA-ASM has no exception edges. `throw` becomes
   `panic` (an abort), so `catch` cannot resume.
-- **Statement-level intrinsics** (`store ...` / `alloc` as statements), `var`,
-  `new`, and arrow functions with parameters.
-- **Async/await, `.wasm`, `.wit`** — parsed only; emitted directives are not
-  assembler-accepted.
+- **Statement-level intrinsics** (`store ...` / `alloc` as statements), `var`
+  and `new` for declared interfaces lower normally; arrow functions take
+  parameters (`(x: T) =>`, `(a, b) =>`, bare `x =>`, block and expression
+  bodies) via out-of-line callbacks.
+- **Async/await** lower to ready-future wrappers (`async function` returns a
+  16-byte `{state, value}` handle, `await` unwraps); there is no executor.
+- **`.wasm` imports** declare an arity-matched `@extern` at the first call
+  site (verifier-accepted; linking needs the real module). An explicit
+  `declare function` signature wins.
+- **`.wit` imports** are refused with a located diagnostic: the assembler
+  accepts no `@wit_import` directive, so none is emitted and calls are refused
+  at the call site too.
 
 ## Diagnostics
 

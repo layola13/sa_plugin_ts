@@ -181,6 +181,30 @@ pub const ScopeManager = struct {
         }
     }
 
+    /// Scoped variant of `releaseAllOwnedExcept`: only scopes opened after
+    /// `depth` are considered. Arrow callbacks parse inside their parent's
+    /// scopes, so an unscoped walk would release the parent's registers from
+    /// inside the callback.
+    pub fn releaseScopesDeeperThanExcept(self: *ScopeManager, lowerer: anytype, depth: usize, except: ?[]const u8) !void {
+        if (self.scopes.items.len <= depth) return;
+        const current_block = lowerer.currentBlock();
+        var s = self.scopes.items.len;
+        while (s > depth) {
+            s -= 1;
+            const scope = &self.scopes.items[s];
+            var i = scope.variables.items.len;
+            while (i > 0) {
+                i -= 1;
+                const v = &scope.variables.items[i];
+                if (except != null and std.mem.eql(u8, v.reg, except.?)) continue;
+                if (v.is_heap_allocated and !v.is_consumed and !v.is_released and dominatesWith(self.reaches, v.def_block, current_block)) {
+                    try lowerer.emit("    !{s}\n", .{v.reg});
+                    v.is_released = true;
+                }
+            }
+        }
+    }
+
     pub fn declareVar(self: *ScopeManager, name: []const u8, type_name: []const u8, reg: []const u8, is_heap: bool) !void {
         if (self.scopes.items.len == 0) return error.NoActiveScope;
         const current = &self.scopes.items[self.scopes.items.len - 1];

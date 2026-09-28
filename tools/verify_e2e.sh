@@ -22,6 +22,10 @@ if [[ ! -x "$SA_BIN" ]]; then
 fi
 
 export SA_PLUGINS_PATH="$PLUGIN_DIR/zig-out/lib"
+# Dev-mode flag (mirrors sa_plugin_sla sweep scripts): zig-out/lib now ships
+# sap.json, so the host treats it as a manifest-backed plugin dir and requires
+# dev mode (permissions.lock) instead of the bare-.so lenient path.
+export SA_PLUGIN_DEV=1
 if [[ ! -f "$SA_PLUGINS_PATH/libsa_plugin_ts.so" ]]; then
   echo "error: plugin not built; run 'zig build' in $PLUGIN_DIR" >&2
   exit 2
@@ -91,21 +95,8 @@ check "switch with return in cases" 'function d(a: i32): i32 { switch (a) { case
 
 check "literal template string" 'function greet() { const msg: string = `hello world`; }'
 
-# Interpolated templates are recognised but not lowerable: an SA-ASM string is a
-# {ptr,len} slice, so joining chunks needs @sa_fmt_i64_into + @sa_string_concat.
-# The lowerer must report a diagnostic instead of emitting a `concat`
-# instruction, which is not an SA mnemonic.
-printf '%s' 'function main() { const s: string = `sum=${1}`; }' > "$WORK/tpl.ts"
-if "$SA_BIN" ts lower --out "$WORK/tpl.sai" "$WORK/tpl.ts" 2> "$WORK/tpl.err"; then
-  if grep -q 'interpolated template' "$WORK/tpl.err" && ! grep -q 'concat' "$WORK/tpl.sai"; then
-    echo "PASS interpolated template reports a diagnostic (no bogus concat)"; pass=$((pass+1))
-  else
-    echo "FAIL interpolated template (expected a diagnostic and no 'concat' in output)"
-    sed 's/^/    /' "$WORK/tpl.err"; fail=$((fail+1))
-  fi
-else
-  echo "FAIL interpolated template (lower)"; sed 's/^/    /' "$WORK/tpl.err"; fail=$((fail+1))
-fi
+check "interpolated template lowers and assembles" 'function main(): i32 { const s: string = `sum=${41}`; return s.length; }'
+check "multi-chunk interpolated template" 'function main(): i32 { const name: string = "bob"; const s: string = `a${7}b${8}c-${name}!`; return s.length; }'
 
 echo
 echo "passed: $pass  failed: $fail"

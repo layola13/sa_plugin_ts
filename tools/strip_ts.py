@@ -53,6 +53,14 @@ def strip(src: str) -> str:
     out = re.sub(r'(\bfor\s*\(\s*(?:const|let|var)\s+\w+)\s*:\s*' + TS_TYPE + r'(?=\s*=)',
                  r'\1', out)
 
+    # (x: i32) => ...  /  (a: i32, b) => ...  ->  (x) => ...  /  (a, b) => ...
+    # Without this, arrow demos keep their annotations and Node rejects them
+    # with a SyntaxError, leaving an empty oracle that verify_demos.sh
+    # auto-passes without a real differential check.
+    out = re.sub(r'\(([^()\n]*?)\)(\s*=>)',
+                 lambda m: '(' + re.sub(r':\s*' + TS_TYPE, '', m.group(1)) + ')' + m.group(2),
+                 out)
+
     return out
 
 

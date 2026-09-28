@@ -22,6 +22,10 @@ if [[ ! -x "$SA_BIN" ]]; then
 fi
 
 export SA_PLUGINS_PATH="$PLUGIN_DIR/zig-out/lib"
+# Dev-mode flag (mirrors sa_plugin_sla sweep scripts): zig-out/lib now ships
+# sap.json, so the host treats it as a manifest-backed plugin dir and requires
+# dev mode (permissions.lock) instead of the bare-.so lenient path.
+export SA_PLUGIN_DEV=1
 if [[ ! -f "$SA_PLUGINS_PATH/libsa_plugin_ts.so" ]]; then
   echo "error: plugin not built; run 'zig build' in $PLUGIN_DIR" >&2
   exit 2
@@ -119,6 +123,7 @@ for src in "$DEMO_DIR"/*/main.ts; do
       head -2 "$WORK/run.out" | sed 's/^/    /'
       fail=$((fail+1)); failed_names+=("$dir")
     elif [ -n "$oracle" ]; then
+      if [[ "$oracle" =~ ^-?[0-9]+$ ]]; then
       # `@main()` returns a negative value as an unsigned exit status.
       # A process exit status is exactly `value & 0xFF`, so compare the low
       # byte. Folding on "greater than 127" was wrong: 128..255 are ordinary
@@ -134,6 +139,22 @@ for src in "$DEMO_DIR"/*/main.ts; do
         fi
       else
         pass=$((pass+1))
+      fi
+      else
+        # Print demo: the Node oracle is program stdout plus the harness's
+        # trailing `String(main())`. Print demos conventionally `return 0`,
+        # so the oracle must equal the SA binary's captured stdout with a
+        # trailing "0" appended byte-for-byte (no command substitution: it
+        # would strip trailing newlines and mask whitespace diffs).
+        cat "$WORK/run.out" > "$WORK/want.out"
+        printf '0' >> "$WORK/want.out"
+        if cmp -s "$WORK/want.out" <(printf '%s' "$oracle"); then
+          pass=$((pass+1))
+        else
+          echo "FAIL $dir (wrong output)"
+          diff <(cat "$WORK/run.out") <(printf '%s' "$oracle") | head -5 | sed 's/^/    /'
+          fail=$((fail+1)); failed_names+=("$dir")
+        fi
       fi
     else
       pass=$((pass+1))

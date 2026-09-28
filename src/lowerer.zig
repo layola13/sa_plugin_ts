@@ -14,6 +14,15 @@ pub const Lowerer = struct {
     /// Already-emitted `@import` paths, so imports are deduplicated.
     imports: std.ArrayList([]const u8),
 
+    /// Arity-matched `@extern` names already declared in the header.
+    externs: std.StringHashMapUnmanaged(void) = .{},
+
+    /// Out-of-line arrow closure callbacks. Arrows are parsed mid-function but
+    /// SA-ASM has no nested functions: emitting the callback inline splits the
+    /// parent's basic block (FallthroughForbidden). Callbacks are buffered here
+    /// and spliced between the header and the main output by `toOwnedSlice`.
+    callbacks: std.ArrayList(u8),
+
     /// When non-null, `emit` redirects into this buffer instead of `output`.
     ///
     /// Used to parse an expression fragment (e.g. the increment clause of a
@@ -70,6 +79,7 @@ pub const Lowerer = struct {
             .output = std.ArrayList(u8).init(allocator),
             .header = std.ArrayList(u8).init(allocator),
             .imports = std.ArrayList([]const u8).init(allocator),
+            .callbacks = std.ArrayList(u8).init(allocator),
         };
     }
 
@@ -77,6 +87,8 @@ pub const Lowerer = struct {
         self.output.deinit();
         self.header.deinit();
         self.imports.deinit();
+        self.callbacks.deinit();
+        self.externs.deinit(self.allocator);
         self.label_refs.deinit(self.allocator);
         for (self.succ_names.items) |*l| l.deinit(self.allocator);
         self.succ_names.deinit(self.allocator);
@@ -117,6 +129,27 @@ pub const Lowerer = struct {
         const gop = try self.label_refs.getOrPut(self.allocator, name);
         if (!gop.found_existing) gop.value_ptr.* = 0;
         gop.value_ptr.* += 1;
+    }
+
+    /// Declare a file-scope `@extern` with `arity` `i32` parameters returning
+    /// `i32`, deduplicated by name (first arity wins; a later call with a
+    /// different arity fails loudly at the call site instead of silently
+    /// miscompiling).
+    ///
+    /// The header is prepended to the output, so this is position-independent:
+    /// it runs lazily at the first call site, where the arity is known. A bare
+    /// `() -> i32` default would be wrong: probes show a call with arguments
+    /// against a zero-param extern fails verification with CapabilityMismatch.
+    pub fn emitExtern(self: *Lowerer, name: []const u8, arity: usize) !void {
+        if (self.externs.contains(name)) return;
+        try self.externs.put(self.allocator, name, {});
+        try self.header.writer().print("@extern {s}(", .{name});
+        var i: usize = 0;
+        while (i < arity) : (i += 1) {
+            if (i > 0) try self.header.appendSlice(", ");
+            try self.header.writer().print("a{d}: i32", .{i});
+        }
+        try self.header.appendSlice(") -> i32\n");
     }
 
     /// Mark `name` as needing emission before any branch to it is seen.
@@ -418,10 +451,15 @@ pub const Lowerer = struct {
     }
 
     pub fn toOwnedSlice(self: *Lowerer) ![]u8 {
-        if (self.header.items.len == 0) return self.output.toOwnedSlice();
-        var out = try self.allocator.alloc(u8, self.header.items.len + self.output.items.len);
-        @memcpy(out[0..self.header.items.len], self.header.items);
-        @memcpy(out[self.header.items.len..], self.output.items);
+        if (self.header.items.len == 0 and self.callbacks.items.len == 0) return self.output.toOwnedSlice();
+        const total = self.header.items.len + self.callbacks.items.len + self.output.items.len;
+        var out = try self.allocator.alloc(u8, total);
+        var off: usize = 0;
+        @memcpy(out[off..][0..self.header.items.len], self.header.items);
+        off += self.header.items.len;
+        @memcpy(out[off..][0..self.callbacks.items.len], self.callbacks.items);
+        off += self.callbacks.items.len;
+        @memcpy(out[off..][0..self.output.items.len], self.output.items);
         return out;
     }
 };

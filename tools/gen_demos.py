@@ -11,9 +11,10 @@ Run tools/verify_demos.sh afterwards: a demo only counts if the emitted SA-ASM
 actually assembles.
 
 The corpus deliberately stays inside the lowerer's verified subset (see
-REQUIREMENTS.md "Known Gaps"): no interpolated templates, no try/catch, no
-console.log, no async/wasm/wit. Constructs the lowerer refuses are represented
-only where a demo is specifically about the refusal.
+REQUIREMENTS.md "Known Gaps"): no try/catch, no console.log, no async/wasm/wit.
+Interpolation covers integers and strings (booleans render as 0/1);
+constructs the lowerer refuses are represented only where a demo is
+specifically about the refusal.
 """
 import os
 import textwrap
@@ -2979,6 +2980,72 @@ d("251_kitchen_sink", "Kitchen Sink", "End-to-end coverage: arithmetic, control 
     }
 
     return total;
+  }
+  """)
+
+d("252_arrow_param_expr", "Arrow With Param", "Arrow function with one typed parameter and an expression body, called through a binding.",
+  """
+  function main(): i32 {
+    let f = (x: i32) => x + 1;
+    let r: i32 = f(41);
+    return r;
+  }
+  """)
+
+d("253_arrow_two_params", "Arrow Two Params", "Arrow function with two typed parameters.",
+  """
+  function main(): i32 {
+    let f = (a: i32, b: i32) => a + b;
+    let r: i32 = f(20, 22);
+    return r;
+  }
+  """)
+
+d("254_arrow_capture", "Arrow Capture", "Bare-param arrow capturing an outer variable.",
+  """
+  function main(): i32 {
+    let base: i32 = 100;
+    let f = x => x + base;
+    let r: i32 = f(5);
+    return r;
+  }
+  """)
+
+d("255_arrow_block_body", "Arrow Block Body", "Arrow with parameters and a block body returning a value.",
+  """
+  function main(): i32 {
+    let f = (a: i32, b: i32) => {
+      return a + b;
+    };
+    let r: i32 = f(30, 12);
+    return r;
+  }
+  """)
+
+d("256_interp_basic", "Interpolated Template", "Template with one integer interpolation, observed via string length.",
+  """
+  function main(): i32 {
+    let x: i32 = 42;
+    const s: string = `sum=${x}`;
+    return s.length;
+  }
+  """)
+
+d("257_interp_multi_string", "Interpolation Multi Segment", "Multiple integer segments plus a string variable passing through untouched.",
+  """
+  function main(): i32 {
+    const name: string = "bob";
+    const s: string = `a${7}b${8}c-${name}!`;
+    return s.length;
+  }
+  """)
+
+d("258_string_bind_length", "String Bind And Length", "Double-quoted literal bound to a variable; length via the property spelling.",
+  """
+  function main(): i32 {
+    const s: string = "hello";
+    const t: string = `hi`;
+    return s.length + t.length;
   }
   """)
 

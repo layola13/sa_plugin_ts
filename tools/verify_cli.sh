@@ -19,6 +19,10 @@ if [[ ! -x "$SA_BIN" ]]; then
 fi
 
 export SA_PLUGINS_PATH="$PLUGIN_DIR/zig-out/lib"
+# Dev-mode flag (mirrors sa_plugin_sla sweep scripts): zig-out/lib now ships
+# sap.json, so the host treats it as a manifest-backed plugin dir and requires
+# dev mode (permissions.lock) instead of the bare-.so lenient path.
+export SA_PLUGIN_DEV=1
 export SA_EXE="$SA_BIN"
 if [[ ! -f "$SA_PLUGINS_PATH/libsa_plugin_ts.so" ]]; then
   echo "error: plugin not built; run 'zig build' in $PLUGIN_DIR" >&2
