@@ -91,6 +91,10 @@ pub const ParseError = struct {
 pub const ArrowParam = struct {
     name: []const u8,
     type_name: []const u8,
+    /// `?` marker or `= default` (same convention as MethodParam).
+    optional: bool = false,
+    /// Duplicated source slice of a `= default` initializer (see StoredParam).
+    default_src: ?[]const u8 = null,
 };
 
 pub const MethodParam = struct {
@@ -101,6 +105,8 @@ pub const MethodParam = struct {
     is_property: bool = false,
     /// `?` marker or `= default`: missing args pad with `0` at `new`.
     optional: bool = false,
+    /// Duplicated source slice of a `= default` initializer (see StoredParam).
+    default_src: ?[]const u8 = null,
 };
 
 /// Stored constructor/method parameter for call padding and `extends`
@@ -109,6 +115,11 @@ pub const StoredParam = struct {
     name: []const u8,
     type_name: []const u8,
     optional: bool = false,
+    /// Duplicated source slice of a `= default` initializer, replayed in the
+    /// callee prologue when the call site pads the argument with `0`
+    /// (`traverse(this.rootNode)` replays `[]`; `new MinHeap()` replays the
+    /// default comparator arrow). Null when no default was declared.
+    default_src: ?[]const u8 = null,
 };
 
 /// Trait-downgrade method signature: emit name is `Class_method`, and void
@@ -122,15 +133,29 @@ pub const MethodSig = struct {
     /// Positional parameter types for forwarder emission and `new` arity
     /// padding (`new TreeNode(data)` vs a 3-param ctor with 2 optional).
     params: ?[]StoredParam = null,
+    /// Duplicated `{ ... }` body source for `extends` copy-down: a child
+    /// re-parses each inherited body with itself as `current_class`, so
+    /// virtual calls (`this.initMap()`) resolve to the child's override.
+    /// Null for abstract/no-body signatures.
+    body_src: ?[]const u8 = null,
 };
 
 pub const ArrowAlias = struct {
     cb: []const u8,
     ctx: []const u8,
+    /// Declared arity for short-call padding (`traverse(this.rootNode)`
+    /// pads the defaulted `array` with `0`; the callee prologue replays the
+    /// default). Calls passing fewer than `required` args are loud errors.
+    arity: u8 = 0,
+    required: u8 = 0,
     /// Top-level capture-free arrows lower as plain named SA functions
     /// (`@f`, no trailing `ctx` param). Calls to a plain alias must not
     /// append a context register.
     plain: bool = false,
+    /// Self-recursive reference (`const traverse = ...` pre-registered while
+    /// its body parses): calls pass the callback's own `ctx` and skip the
+    /// trailing borrow release (the shared exit sequence releases it).
+    self_call: bool = false,
 };
 
 pub const Parser = struct {
@@ -152,6 +177,28 @@ pub const Parser = struct {
     class_methods: std.StringHashMap(MethodSig) = undefined,
     /// `Class` -> `Trait` conformance (`implements` clause).
     class_traits: std.StringHashMap(void) = undefined,
+    /// `Child` -> `Parent` (`extends` clause, trait downgrade: copy-down).
+    class_parent: std.StringHashMap([]const u8) = undefined,
+    /// Expected element type for a dynamic `new Array(n)` / `Array(n)` whose
+    /// length is a runtime value: set from the assignment target's declared
+    /// element type while lowering the right-hand side (`this.queue = ...`
+    /// with `queue: T[]` allocates 8-byte slots, `size: number[]` 4-byte).
+    array_elem_hint: ?[]const u8 = null,
+    /// `const name = <arrow>` being lowered: the next `parseArrowBody` reached
+    /// pre-registers `name` so the body can call itself recursively
+    /// (`const traverse = (...) => { ...; traverse(...); ... }`). Consumed by
+    /// that arrow, cleared by `parseLet` when no arrow follows.
+    pending_arrow_bind: ?[]const u8 = null,
+    /// Captures of the most recently lowered arrow (for the captureless-only
+    /// `fn`-slot rule: only captureless callbacks may flow into `fn`-typed
+    /// fields/params, whose indirect calls pass a fresh empty context).
+    last_arrow_captures: u32 = 0,
+    /// Arity of the most recently lowered arrow (short-call padding).
+    last_arrow_arity: u8 = 0,
+    last_arrow_required: u8 = 0,
+    /// Names (`@closure_callback_N`) of captureless callbacks, callable
+    /// through a bare function pointer with an empty context.
+    captureless_cb: std.StringHashMap(void) = undefined,
     /// Nesting depth of loop bodies currently being parsed.
     ///
     /// A register bound inside a loop is re-assigned each iteration, so it must
@@ -285,6 +332,8 @@ pub const Parser = struct {
         parser_inst.declared_externs = std.StringHashMap(void).init(allocator);
         parser_inst.class_methods = std.StringHashMap(MethodSig).init(allocator);
         parser_inst.class_traits = std.StringHashMap(void).init(allocator);
+        parser_inst.class_parent = std.StringHashMap([]const u8).init(allocator);
+        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);
         parser_inst.imported_files = std.StringHashMap(void).init(allocator);
 
         // Pre-register `async function` signatures (name -> inner value
@@ -1243,11 +1292,16 @@ pub const Parser = struct {
                     p_type = try self.parseTypeName();
                 }
             }
+            var p_default: ?[]const u8 = null;
             if (try self.accept(.equal)) {
                 p_optional = true;
-                _ = try self.parseExpression();
+                // Save, don't evaluate: the default replays in the callee
+                // prologue (per short call), where `this`/params are in scope.
+                // Eager evaluation here would emit into the enclosing scope
+                // (file scope for methods) and discard the value.
+                p_default = try self.saveBalancedDefault();
             }
-            try params.append(.{ .name = p_name, .type_name = p_type, .is_property = had_mod, .optional = p_optional });
+            try params.append(.{ .name = p_name, .type_name = p_type, .is_property = had_mod, .optional = p_optional, .default_src = p_default });
             _ = try self.accept(.comma);
         }
         try self.expect(.r_paren);
@@ -1266,6 +1320,108 @@ pub const Parser = struct {
             if (self.current.tag == .less) depth += 1;
             if (self.current.tag == .greater) depth -= 1;
             try self.advance();
+        }
+    }
+
+    /// Save a parameter default value's source slice without emitting code.
+    /// Returns a duplicated slice (`src[start..end]`) replayed later in the
+    /// callee prologue when a call site pads the argument with `0`. Stops at
+    /// a depth-zero `,`, `)`/`]`/`}` (never consumed), mirroring
+    /// `skipBalancedDefault`.
+    fn saveBalancedDefault(self: *Parser) anyerror!?[]const u8 {
+        if (self.current.tag == .eof) return null;
+        const src = self.lexer.source;
+        const start: usize = @as(usize, self.current.start);
+        var end: usize = start;
+        var depth: usize = 0;
+        scan: while (self.current.tag != .eof) {
+            const t = self.current;
+            switch (t.tag) {
+                .l_paren, .l_bracket, .l_brace => {
+                    depth += 1;
+                    end = @as(usize, t.start) + @as(usize, t.len);
+                    try self.advance();
+                },
+                .r_paren, .r_bracket, .r_brace => {
+                    if (depth == 0) break :scan;
+                    depth -= 1;
+                    end = @as(usize, t.start) + @as(usize, t.len);
+                    try self.advance();
+                },
+                .comma => {
+                    if (depth == 0) break :scan;
+                    end = @as(usize, t.start) + @as(usize, t.len);
+                    try self.advance();
+                },
+                else => {
+                    end = @as(usize, t.start) + @as(usize, t.len);
+                    try self.advance();
+                },
+            }
+        }
+        if (end <= start or start >= src.len) return null;
+        const clamped = @min(end, src.len);
+        if (clamped <= start) return null;
+        return try self.allocator.dupe(u8, src[start..clamped]);
+    }
+
+    /// Replay saved `= default` slices in the callee prologue: a parameter
+    /// holding `0` (padded by a short call) is reassigned the default value.
+    /// Runs after `this`/params are declared, so defaults may reference them
+    /// (`index = this.size() - 1`) or construct values (`array = []`, including
+    /// captureless default arrows). `0` standing in for a real argument is an
+    /// accepted approximation (JS `undefined` has no SA spelling).
+    fn emitDefaultPrologue(self: *Parser, params: anytype) anyerror!void {
+        for (params) |prm| {
+            const src = prm.default_src orelse continue;
+            const miss = try self.newTemp();
+            try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ miss, prm.name });
+            const lid = self.nextLabelId();
+            const l_def = try std.fmt.allocPrint(self.allocator, "L_def_{d}", .{lid});
+            const l_have = try std.fmt.allocPrint(self.allocator, "L_have_{d}", .{lid});
+            try self.lowerer.reserveLabel(l_def);
+            try self.lowerer.reserveLabel(l_have);
+            try self.lowerer.emitBranchTo(miss, l_def, l_have);
+            try self.lowerer.emitLabel(l_def);
+            const saved_lexer = self.lexer;
+            const saved_current = self.current;
+            const saved_peek = self.peek;
+            const saved_tpl = self.template_lexer_mode;
+            const saved_ctx = self.last_arrow_ctx;
+            self.last_arrow_ctx = null;
+            self.lexer = lexer_mod.Lexer{ .source = src };
+            self.current = self.lexer.next();
+            self.peek = self.lexer.next();
+            self.template_lexer_mode = false;
+            const dv = try self.parseExpression();
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+            self.template_lexer_mode = saved_tpl;
+            try self.lowerer.emit("    {s} = {s}\n", .{ prm.name, dv });
+            self.markRebound(prm.name);
+            // A replayed arrow leaves its parent-side context allocated but
+            // unreferenced (the value is the bare `@cb`): release it, and
+            // require the arrow to be captureless (indirect `fn` calls pass a
+            // fresh empty context, which only captureless callbacks tolerate).
+            if (std.mem.startsWith(u8, dv, "@closure_callback_")) {
+                if (self.last_arrow_ctx) |actx| {
+                    if (!self.captureless_cb.contains(dv)) {
+                        self.last_arrow_ctx = saved_ctx;
+                        _ = try self.refuseAt(
+                            "error: capturing arrow as parameter default: only captureless arrows lower as `fn` values",
+                            .{},
+                            error.CapturingArrowAsFnValue,
+                        );
+                        return error.CapturingArrowAsFnValue;
+                    }
+                    const borrow = if (actx.len > 0 and actx[0] == '^') actx[1..] else actx;
+                    try self.lowerer.emit("    !{s}\n", .{borrow});
+                }
+            }
+            self.last_arrow_ctx = saved_ctx;
+            try self.lowerer.emitJumpTo(l_have);
+            try self.lowerer.emitLabel(l_have);
         }
     }
 
@@ -1328,11 +1484,39 @@ pub const Parser = struct {
                     .name = try self.allocator.dupe(u8, p.name),
                     .type_name = try self.allocator.dupe(u8, p.type_name),
                     .optional = p.optional,
+                    .default_src = if (p.default_src) |ds| try self.allocator.dupe(u8, ds) else null,
                 };
             }
             stored = arr;
         }
-        try self.class_methods.put(key, .{ .is_void = is_void, .ret = ret_owned, .params = stored });
+        // Body slice for `extends` copy-down (saved before the cursor moves
+        // past `{`; abstract signatures without a body keep null).
+        var body_src: ?[]const u8 = null;
+        if (self.current.tag == .l_brace) {
+            const bstart: usize = @as(usize, self.current.start);
+            var bdepth: usize = 0;
+            var bend: usize = bstart;
+            const bsrc = self.lexer.source;
+            var bpos: usize = bstart;
+            // Byte-scan the balanced body (strings/comments may hold braces;
+            // none of the Talgo bodies do, and a mismatch only costs a loud
+            // re-parse error, never a silent miscompile).
+            while (bpos < bsrc.len) {
+                const c = bsrc[bpos];
+                if (c == '{') bdepth += 1;
+                if (c == '}') {
+                    if (bdepth == 0) break;
+                    bdepth -= 1;
+                    if (bdepth == 0) {
+                        bend = bpos + 1;
+                        break;
+                    }
+                }
+                bpos += 1;
+            }
+            if (bend > bstart) body_src = try self.allocator.dupe(u8, bsrc[bstart..bend]);
+        }
+        try self.class_methods.put(key, .{ .is_void = is_void, .ret = ret_owned, .params = stored, .body_src = body_src });
         try self.lowerer.emit("@{s}(this: ptr", .{emit_name});
         for (params.items) |p| {
             try self.lowerer.emit(", {s}: {s}", .{ p.name, saTypeOf(p.type_name) });
@@ -1361,6 +1545,9 @@ pub const Parser = struct {
         }
         try self.advance(); // {
         try self.scope_manager.enterScope();
+        // Short-call defaults replay here (after the property stores, so a
+        // padded `0` becomes the default while a passed value is kept).
+        try self.emitDefaultPrologue(params.items);
         if (is_ctor) {
             // Constructor parameter properties (`constructor(public x: T)`):
             // the layout already holds the fields (pre-scan); bind them here
@@ -2153,7 +2340,13 @@ pub const Parser = struct {
                 _ = try self.accept(.semicolon);
                 return;
             }
+            // `const name = (...) => ...`: let the arrow pre-register `name`
+            // so its body can call itself recursively. Gated on the arrow
+            // shape so `const x = f(() => ...)` does not misbind `x`.
+            const want_bind = try self.looksLikeTopArrow();
+            if (want_bind) self.pending_arrow_bind = var_name;
             const val = try self.parseExpression();
+            self.pending_arrow_bind = null;
             // A `"..."` literal is not an SA operand: materialise the slice
             // and bind the variable to it. Emitting `s = "bob"` verbatim is
             // rejected by the verifier (UnknownRegister). Only applies to
@@ -2182,7 +2375,7 @@ pub const Parser = struct {
                 // last_arrow_ctx strings are owned (allocPrint per arrow); the
                 // alias takes over this one, so clear the slot without freeing.
                 self.last_arrow_ctx = null;
-                try self.arrow_aliases.put(key, .{ .cb = val, .ctx = ctx_move });
+                try self.arrow_aliases.put(key, .{ .cb = val, .ctx = ctx_move, .arity = self.last_arrow_arity, .required = self.last_arrow_required });
                 try self.scope_manager.declareVar(var_name, "fn", var_name, false);
                 _ = try self.accept(.semicolon);
                 return;
@@ -2273,6 +2466,7 @@ pub const Parser = struct {
             while (true) {
                 if (self.current.tag != .identifier) return false;
                 try self.advance(); // param name
+                _ = try self.accept(.question);
                 if (try self.accept(.colon)) {
                     if (self.current.tag != .identifier) return false;
                     try self.advance(); // base type name
@@ -2281,6 +2475,9 @@ pub const Parser = struct {
                         try self.advance(); // [
                         try self.advance(); // ]
                     }
+                }
+                if (try self.accept(.equal)) {
+                    try self.skipBalancedDefault();
                 }
                 if (try self.accept(.comma)) continue;
                 break;
@@ -4864,6 +5061,21 @@ pub const Parser = struct {
     fn parseArrowBody(self: *Parser, params: []const ArrowParam, ret_is_slice: bool) anyerror![]const u8 {
         const cb_id = self.nextLabelId();
         const cb_name = try std.fmt.allocPrint(self.allocator, "@closure_callback_{d}", .{cb_id});
+        // Self-recursion: `const name = (...) => ...` registered `name` as
+        // pending; bind it now (arity is known up front) so body calls
+        // resolve through the alias table instead of failing as undefined.
+        // The entry is overwritten with the real context after the body.
+        if (self.pending_arrow_bind) |bname| {
+            self.pending_arrow_bind = null;
+            var arity: u8 = 0;
+            var required: u8 = 0;
+            for (params) |pp| {
+                arity += 1;
+                if (!pp.optional) required += 1;
+            }
+            const bkey = try self.allocator.dupe(u8, bname);
+            try self.arrow_aliases.put(bkey, .{ .cb = cb_name, .ctx = "ctx", .arity = arity, .required = required, .self_call = true });
+        }
 
         // Scan body to find captured variables from outer scope
         var captures = std.ArrayList(scope_mod.Variable).init(self.allocator);
@@ -6261,6 +6473,7 @@ pub const Parser = struct {
                         if (self.current.tag != .identifier) break;
                         const pn_tok = self.current;
                         try self.advance();
+                        _ = try self.accept(.question);
                         var pt: []const u8 = "i32";
                         if (try self.accept(.colon)) {
                             const tt = self.current;
@@ -6281,6 +6494,9 @@ pub const Parser = struct {
                                 // Unknown token in type position: not an arrow.
                                 break;
                             }
+                        }
+                        if (try self.accept(.equal)) {
+                            _ = try self.skipBalancedDefault();
                         }
                         try probe.append(.{ .name = self.tokenText(pn_tok), .type_name = pt });
                         if (try self.accept(.comma)) continue;
@@ -6322,6 +6538,7 @@ pub const Parser = struct {
                             const pn_tok = self.current;
                             try self.expect(.identifier);
                             const pn = self.tokenText(pn_tok);
+                            var p_opt = try self.accept(.question);
                             var pt: []const u8 = "i32";
                             if (try self.accept(.colon)) {
                                 const tt = self.current;
@@ -6335,7 +6552,12 @@ pub const Parser = struct {
                                     try self.advance(); // ]
                                 }
                             }
-                            try real.append(.{ .name = pn, .type_name = pt });
+                            var p_def: ?[]const u8 = null;
+                            if (try self.accept(.equal)) {
+                                p_opt = true;
+                                p_def = try self.saveBalancedDefault();
+                            }
+                            try real.append(.{ .name = pn, .type_name = pt, .optional = p_opt, .default_src = p_def });
                             if (try self.accept(.comma)) continue;
                             break;
                         }
