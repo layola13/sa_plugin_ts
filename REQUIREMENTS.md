@@ -96,6 +96,8 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
   loops, width-checked), calls (`f(...arr)` expands to arity, missing pads
   0, extras drop), rest parameters (`...rest` packs trailing args, empty
   when none)
+- [x] `String.fromCharCode` via shared sci primitive (per policy, std
+  primitives live in sci, never simulated in ts)
 - [x] Declarative lib surface tables (`LibMethod`: name/sample/notes per
   Array/Map/Set/String/Math/Number); `isArrayMethodName` reads the array
   table, and a consistency test lowers every sample (drift guard)
@@ -234,7 +236,8 @@ Remaining source gaps (each verified as the first diagnostic; honest buckets,
 no silent miscompiles):
 
 - **Regex literals** (`ciphers/xor_cipher.ts`): `str.replace(/./g, cb)` has no
-  lowering; refused loudly. (`String.fromCharCode` likewise unmapped.)
+  lowering; refused loudly. (`String.fromCharCode` maps to the shared sci
+  primitive `@sa_string_from_char_code` since this batch.)
 - **Broken upstream imports** (`data_structures/set/*.ts`): `./map` does not
   exist upstream; refused loudly with the path.
 - **`lcs.ts`**: `string[]` of `s[i]` bytes + `unshift` + `join('')`. JS strings

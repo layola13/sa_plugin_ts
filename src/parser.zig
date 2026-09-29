@@ -1283,6 +1283,7 @@ pub const Parser = struct {
             .keyword_function => try self.parseFunction(),
             .keyword_if => try self.parseIf(),
             .keyword_while => try self.parseWhile(),
+            .keyword_do => try self.parseDoWhile(),
             .keyword_for => try self.parseFor(),
             .keyword_return => try self.parseReturn(),
             .keyword_switch => try self.parseSwitch(),
@@ -4443,6 +4444,58 @@ pub const Parser = struct {
         self.popLoopTargets();
     }
 
+    /// `do { ... } while (cond);`: like while, but the body runs before
+    /// the first condition check (mirrors parseWhile's label discipline).
+    fn parseDoWhile(self: *Parser) anyerror!void {
+        try self.expect(.keyword_do);
+        const label_id = self.nextLabelId();
+        const loop_label = try std.fmt.allocPrint(self.allocator, "L_dowhile_{d}", .{label_id});
+        const cond_label = try std.fmt.allocPrint(self.allocator, "L_dowhile_cond_{d}", .{label_id});
+        const end_label = try std.fmt.allocPrint(self.allocator, "L_enddowhile_{d}", .{label_id});
+        try self.lowerer.reserveLabel(loop_label);
+        try self.lowerer.reserveLabel(cond_label);
+        try self.lowerer.reserveLabel(end_label);
+        try self.lowerer.emitLabel(loop_label);
+        try self.pushLoopTargets(end_label, cond_label);
+        self.loop_depth += 1;
+        defer self.loop_depth -= 1;
+        if (self.current.tag == .l_brace) {
+            try self.advance();
+            try self.scope_manager.enterScope();
+            while (self.current.tag != .r_brace and self.current.tag != .eof) {
+                try self.parseStatement();
+            }
+            try self.exitScopeReleasingLocals();
+            try self.advance();
+        } else {
+            try self.scope_manager.enterScope();
+            try self.parseStatement();
+            try self.exitScopeReleasingLocals();
+        }
+        // `continue` lands on the check below (`break` goes to the end
+        // via the loop targets). A terminated body needs no fallthrough.
+        if (!self.lowerer.isTerminated()) {
+            try self.lowerer.emitJumpTo(cond_label);
+        }
+        try self.lowerer.emitLabel(cond_label);
+        try self.expect(.keyword_while);
+        try self.expect(.l_paren);
+        const cond = try self.parseExpression();
+        try self.expect(.r_paren);
+        _ = try self.accept(.semicolon);
+        if (std.mem.eql(u8, cond, "1") or std.mem.eql(u8, cond, "true")) {
+            try self.lowerer.emitJumpTo(loop_label);
+        } else if (std.mem.eql(u8, cond, "0") or std.mem.eql(u8, cond, "false")) {
+            // Falls through to the end.
+        } else {
+            // True repeats, false exits (two explicit targets; the
+            // while-style if-false helper would fall through wrongly).
+            try self.lowerer.emitBranchTo(try self.condReg(cond), loop_label, end_label);
+        }
+        try self.lowerer.emitLabel(end_label);
+        self.popLoopTargets();
+    }
+
     /// Parse the increment clause of a C-style `for` header.
     ///
     /// An assignment (`i = i + 2`, `i = i - 1`) is a statement shape, not an
@@ -4778,11 +4831,80 @@ pub const Parser = struct {
             try self.advance(); // skip identifier
 
             const is_of = self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "of");
+            const is_in = self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "in");
 
             // Restore state
             self.lexer = saved_lexer;
             self.current = saved_current;
             self.peek = saved_peek;
+
+            if (is_in) {
+                // `for (const k in arr)`: index iteration. JS yields string
+                // keys; the subset yields i32 indices. Arrays and strings
+                // only (both are {ptr,len} slices); objects have no key
+                // enumeration over static layouts and refuse loudly.
+                if (is_const) {
+                    try self.advance(); // const
+                } else {
+                    try self.advance(); // let
+                }
+                const key_name_tok = self.current;
+                try self.expect(.identifier);
+                const key_name = self.tokenText(key_name_tok);
+                try self.advance(); // in (identifier)
+                const target = try self.parseExpression();
+                if (self.scope_manager.lookup(target)) |tv| {
+                    if (!isArrayType(tv.type_name) and !std.mem.eql(u8, tv.type_name, "string")) {
+                        _ = try self.refuseAt(
+                            "error: for-in needs an array (objects have no key enumeration)",
+                            .{},
+                            error.ForInNotIterable,
+                        );
+                        return error.ForInNotIterable;
+                    }
+                }
+                try self.expect(.r_paren);
+                const in_id = self.nextLabelId();
+                const in_loop = try std.fmt.allocPrint(self.allocator, "L_forin_{d}", .{in_id});
+                const in_end = try std.fmt.allocPrint(self.allocator, "L_endforin_{d}", .{in_id});
+                try self.lowerer.reserveLabel(in_loop);
+                try self.lowerer.reserveLabel(in_end);
+                const in_len = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ in_len, target });
+                const in_idx = try self.newTemp();
+                try self.lowerer.emit("    {s} = 0\n", .{in_idx});
+                try self.lowerer.emitLabel(in_loop);
+                const in_cmp = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ in_cmp, in_idx, in_len });
+                _ = try self.emitBranchIfFalse(in_cmp, in_end);
+                try self.pushLoopTargets(in_end, in_loop);
+                self.loop_depth += 1;
+                defer self.loop_depth -= 1;
+                try self.scope_manager.enterScope();
+                try self.scope_manager.declareVar(key_name, "i32", key_name, false);
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ key_name, in_idx });
+                if (self.current.tag == .l_brace) {
+                    try self.advance();
+                    try self.scope_manager.enterScope();
+                    while (self.current.tag != .r_brace and self.current.tag != .eof) { try self.parseStatement(); }
+                    try self.exitScopeReleasingLocals();
+                    try self.advance();
+                } else {
+                    try self.scope_manager.enterScope();
+                    try self.parseStatement();
+                    try self.exitScopeReleasingLocals();
+                }
+                try self.scope_manager.exitScope(self.lowerer);
+                const in_inc = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ in_inc, in_idx });
+                try self.lowerer.emit("    !{s}\n", .{in_idx});
+                try self.lowerer.emit("    {s} = {s}\n", .{ in_idx, in_inc });
+                self.scope_manager.markConsumed(in_inc);
+                try self.lowerer.emitJumpTo(in_loop);
+                try self.lowerer.emitLabel(in_end);
+                self.popLoopTargets();
+                return;
+            }
 
             if (is_of) {
                 // Parse as for-of
@@ -6727,6 +6849,7 @@ pub const Parser = struct {
     };
 
     pub const string_surface: []const LibMethod = &.{
+        .{ .name = "fromCharCode", .sample = "(65)", .recv = "String", .notes = "shared sci primitive, low byte" },
         .{ .name = "charAt", .sample = "(0)", .recv = "str", .notes = "1-char slice" },
         .{ .name = "charCodeAt", .sample = "(0)", .recv = "str", .notes = "byte value" },
         .{ .name = "slice", .sample = "(0, 1)", .recv = "str", .notes = "zero-copy sub-slice" },
@@ -10909,6 +11032,21 @@ pub const Parser = struct {
                     continue;
                 }
             }
+            // `x satisfies T`: type-checker-only assertion, erases.
+            // Handled before the precedence break (identifiers bind
+            // loosest, so parseInfix would never see it). Only when a type
+            // starts next, so a bare variable named `satisfies` in value
+            // position still resolves as a variable.
+            if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "satisfies")) {
+                const nt = self.peek.tag;
+                if (nt == .identifier or nt == .keyword_void or nt == .keyword_null or
+                    nt == .keyword_undefined or nt == .l_bracket or nt == .l_paren)
+                {
+                    try self.advance(); // satisfies
+                    _ = try self.parseTypeName();
+                    continue;
+                }
+            }
             const prec = getPrecedence(self.current.tag);
             if (@intFromEnum(prec) <= @intFromEnum(min_prec)) break;
             // ASI: a `++`/`--` on the next line is a new statement, not a
@@ -12692,6 +12830,31 @@ pub const Parser = struct {
                         return error.NumberIsIntegerFloat;
                     }
                     return "1";
+                } else if (std.mem.eql(u8, left, "String") and std.mem.eql(u8, member_name, "fromCharCode") and self.scope_manager.lookup(left) == null) {
+                    // `String.fromCharCode(n)` maps to the shared primitive
+                    // `@sa_string_from_char_code` (sci sa_std; low byte
+                    // only, exact inverse of byte `charCodeAt`). The handle
+                    // reads back exactly like `concatSlices`' tail.
+                    try self.expect(.l_paren);
+                    const code = try self.parseExpression();
+                    try self.expect(.r_paren);
+                    try self.lowerer.emitImport("sa_std/string.sai");
+                    try self.lowerer.emitImport("sa_std/fmt.sai");
+                    const hbuf = try self.newTemp();
+                    try self.lowerer.emit("    {s} = call @sa_string_from_char_code({s})\n", .{ hbuf, code });
+                    const hptr = try self.newTemp();
+                    try self.lowerer.emit("    {s} = call @sa_fmt_buffer_data({s})\n", .{ hptr, hbuf });
+                    const hlen = try self.newTemp();
+                    try self.lowerer.emit("    {s} = call @sa_fmt_buffer_len({s})\n", .{ hlen, hbuf });
+                    const hout = try self.newTemp();
+                    try self.lowerer.emit("    {s} = alloc 16\n", .{hout});
+                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ hout, hptr });
+                    try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ hout, hlen });
+                    try self.releaseOwnedIfLive(hptr);
+                    try self.releaseOwnedIfLive(hlen);
+                    try self.releaseOwnedIfLive(hbuf);
+                    try self.retagTemp(hout, "string");
+                    return hout;
                 } else if (std.mem.eql(u8, left, "Math") and self.scope_manager.lookup(left) == null) {
                     // `Math.floor(e)` / `Math.round(e)`: the subset's numbers
                     // are i32, and the floor/round of an integer is itself, so
@@ -13237,6 +13400,11 @@ pub const Parser = struct {
         // so `this.stack.pop() as T` and `v as number` lower as `v`.
         if (tag == .keyword_as) {
             try self.advance();
+            // `x as const`: const-assertion erases (no runtime effect).
+            if (self.current.tag == .keyword_const) {
+                try self.advance();
+                return left;
+            }
             _ = try self.parseTypeName();
             return left;
         }

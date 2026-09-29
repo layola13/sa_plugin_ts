@@ -18,6 +18,7 @@ pub const Token = struct {
         keyword_if,
         keyword_else,
         keyword_while,
+        keyword_do,
         keyword_return,
         keyword_import,
         keyword_from,
@@ -550,6 +551,7 @@ fn getKeywordTag(text: []const u8) Token.Tag {
     if (std.mem.eql(u8, text, "if")) return .keyword_if;
     if (std.mem.eql(u8, text, "else")) return .keyword_else;
     if (std.mem.eql(u8, text, "while")) return .keyword_while;
+    if (std.mem.eql(u8, text, "do")) return .keyword_do;
     if (std.mem.eql(u8, text, "return")) return .keyword_return;
     if (std.mem.eql(u8, text, "import")) return .keyword_import;
     if (std.mem.eql(u8, text, "from")) return .keyword_from;
