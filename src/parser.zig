@@ -6807,10 +6807,12 @@ pub const Parser = struct {
         .{ .name = "push", .sample = "(1)", .recv = "a", .notes = "append; returns new length" },
         .{ .name = "pop", .sample = "()", .recv = "a", .notes = "remove last; returns it (0 when empty)" },
         .{ .name = "fill", .sample = "(0)", .recv = "a", .notes = "per-element stores; returns the array" },
+        .{ .name = "copyWithin", .sample = "(0, 2)", .recv = "a", .notes = "in-place range copy; returns the array" },
         .{ .name = "indexOf", .sample = "(2)", .recv = "a", .notes = "first index or -1" },
         .{ .name = "splice", .sample = "(0, 1)", .recv = "a", .notes = "remove range; returns 0" },
         .{ .name = "slice", .sample = "(0, 1)", .recv = "a", .notes = "deep-copy range" },
         .{ .name = "reduce", .sample = "((x, y) => x + y, 0)", .recv = "a", .notes = "fold with init" },
+        .{ .name = "reduceRight", .sample = "((x, y) => x + y, 0)", .recv = "a", .notes = "right fold with init" },
         .{ .name = "map", .sample = "((x) => x)", .recv = "a", .notes = "fresh mapped array" },
         .{ .name = "filter", .sample = "((x) => x)", .recv = "a", .notes = "fresh filtered array" },
         .{ .name = "forEach", .sample = "((x) => x)", .recv = "a", .notes = "side effects; returns 0" },
@@ -6825,6 +6827,10 @@ pub const Parser = struct {
         .{ .name = "unshift", .sample = "(0)", .recv = "a", .notes = "prepend via push-then-rotate" },
         .{ .name = "every", .sample = "((x) => x)", .recv = "a", .notes = "all-predicate to 1/0" },
         .{ .name = "some", .sample = "((x) => x)", .recv = "a", .notes = "any-predicate to 1/0" },
+        .{ .name = "with", .sample = "(0, 9)", .recv = "a", .notes = "copy with one slot replaced" },
+        .{ .name = "toReversed", .sample = "()", .recv = "a", .notes = "reversed copy" },
+        .{ .name = "toSorted", .sample = "()", .recv = "a", .notes = "sorted copy; comparator form takes (a, b) =>" },
+        .{ .name = "toSpliced", .sample = "(0, 1)", .recv = "a", .notes = "spliced copy" },
     };
 
     pub const map_surface: []const LibMethod = &.{
@@ -6886,8 +6892,611 @@ pub const Parser = struct {
         }
         return false;
     }
+    /// Normalize one argument to a string slice register: quoted literals
+    /// materialise, string-typed values pass through, anything else goes
+    /// through the integer/stringify conversion.
+    fn parseStringArg(self: *Parser) anyerror![]const u8 {
+        const a = try self.parseExpression();
+        if (a.len >= 2 and (a[0] == '"' or a[0] == '\'') and a[a.len - 1] == a[0]) {
+            return try self.materializeStringChunk(a[1 .. a.len - 1]);
+        }
+        if (self.scope_manager.lookup(a)) |v| {
+            if (std.mem.eql(u8, v.type_name, "string")) return a;
+        }
+        return try self.lowerStringConv(a);
+    }
+
+    /// Widen an integer value to u64 for extern params taking counts and
+    /// lengths (`zext` is verified; immediates and u64 registers pass
+    /// through untouched).
+    fn asU64Arg(self: *Parser, val: []const u8) anyerror![]const u8 {
+        if (self.scope_manager.lookup(val)) |v| {
+            if (std.mem.eql(u8, v.type_name, "u64")) return val;
+        } else {
+            var numeric = val.len > 0;
+            var k: usize = 0;
+            if (val.len > 0 and val[0] == '-') k = 1;
+            while (k < val.len) : (k += 1) {
+                if (val[k] < '0' or val[k] > '9') {
+                    numeric = false;
+                    break;
+                }
+            }
+            if (numeric) return val;
+        }
+        const t = try self.newTemp();
+        try self.lowerer.emit("    {s} = zext {s}\n", .{ t, val });
+        return t;
+    }
+
+    /// Pack a string-handle (from `@sa_string_*` returning u64) into a
+    /// fresh 16-byte slice, mirroring `concatSlices`' tail.
+    fn packStringHandle(self: *Parser, hbuf: []const u8) anyerror![]const u8 {
+        const hptr = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_buffer_data({s})\n", .{ hptr, hbuf });
+        const hlen = try self.newTemp();
+        try self.lowerer.emit("    {s} = call @sa_fmt_buffer_len({s})\n", .{ hlen, hbuf });
+        const hout = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{hout});
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ hout, hptr });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ hout, hlen });
+        try self.releaseOwnedIfLive(hptr);
+        try self.releaseOwnedIfLive(hlen);
+        try self.releaseOwnedIfLive(hbuf);
+        try self.retagTemp(hout, "string");
+        return hout;
+    }
+
     /// Cursor must be on `(`; consumes the full call. Returns a temp holding
     /// the new length / found index / popped value, or "0" for splice.
+    /// Clamp namespace for substring-style index math: max(0, min(v, ln)).
+    /// All arithmetic stays in one width domain (callers pass i32 names or
+    /// u64 names consistently; mixed callers convert first).
+    const ClampIndex = struct {
+        fn run(parser: *Parser, v: []const u8, ln: []const u8) anyerror![]const u8 {
+            const lo = try parser.newTemp();
+            const c0 = try parser.newTemp();
+            try parser.lowerer.emit("    {s} = slt {s}, 0\n", .{ c0, v });
+            const lid = parser.nextLabelId();
+            const lneg = try std.fmt.allocPrint(parser.allocator, "L_cl_neg_{d}", .{lid});
+            const lpos = try std.fmt.allocPrint(parser.allocator, "L_cl_pos_{d}", .{lid});
+            const lend = try std.fmt.allocPrint(parser.allocator, "L_cl_end_{d}", .{lid});
+            try parser.lowerer.reserveLabel(lneg);
+            try parser.lowerer.reserveLabel(lpos);
+            try parser.lowerer.reserveLabel(lend);
+            try parser.lowerer.emitBranchTo(c0, lneg, lpos);
+            try parser.lowerer.emitLabel(lneg);
+            try parser.lowerer.emit("    {s} = 0\n", .{lo});
+            try parser.lowerer.emitJumpTo(lend);
+            try parser.lowerer.emitLabel(lpos);
+            const hi = try parser.newTemp();
+            try parser.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ hi, v, ln });
+            const hid = parser.nextLabelId();
+            const hbig = try std.fmt.allocPrint(parser.allocator, "L_cl_big_{d}", .{hid});
+            const hok = try std.fmt.allocPrint(parser.allocator, "L_cl_ok_{d}", .{hid});
+            try parser.lowerer.reserveLabel(hbig);
+            try parser.lowerer.reserveLabel(hok);
+            try parser.lowerer.emitBranchTo(hi, hbig, hok);
+            try parser.lowerer.emitLabel(hbig);
+            try parser.lowerer.emit("    {s} = add {s}, 0\n", .{ lo, ln });
+            try parser.lowerer.emitJumpTo(lend);
+            try parser.lowerer.emitLabel(hok);
+            try parser.lowerer.emit("    {s} = add {s}, 0\n", .{ lo, v });
+            try parser.lowerer.emitJumpTo(lend);
+            try parser.lowerer.emitLabel(lend);
+            return lo;
+        }
+    };
+
+    /// String method call (`left` is string-typed). Shared sci primitives
+    /// (`@sa_string_*`) do the heavy lifting; this function marshals slices
+    /// and packs results. Regex forms, `split` (needs an array bridge) and
+    /// anything else fall to `error.UnknownMethod` loudly.
+    fn lowerStringMethodCall(self: *Parser, left: []const u8, member_name: []const u8) anyerror![]const u8 {
+        try self.lowerer.emitImport("sa_std/string.sai");
+        try self.lowerer.emitImport("sa_std/fmt.sai");
+        const sptr = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sptr, left });
+        const slen = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen, left });
+        // Shared indexOf call shape (includes() desugars over it).
+        const callIndexOf = struct {
+            fn run(parser: *Parser, sp: []const u8, sl: []const u8, needle: []const u8, from: []const u8) anyerror![]const u8 {
+                const nptr = try parser.newTemp();
+                try parser.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ nptr, needle });
+                const nlen = try parser.newTemp();
+                try parser.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ nlen, needle });
+                const wfrom = try parser.asU64Arg(from);
+                const out = try parser.newTemp();
+                try parser.lowerer.emit("    {s} = call @sa_string_index_of({s}, {s}, {s}, {s}, {s})\n", .{ out, sp, sl, nptr, nlen, wfrom });
+                try parser.retagTemp(out, "i64");
+                return out;
+            }
+        };
+        if (std.mem.eql(u8, member_name, "indexOf")) {
+            try self.expect(.l_paren);
+            const needle = try self.parseStringArg();
+            var from: []const u8 = "0";
+            if (try self.accept(.comma)) {
+                from = try self.parseExpression();
+            }
+            try self.expect(.r_paren);
+            return try callIndexOf.run(self, sptr, slen, needle, from);
+        }
+        if (std.mem.eql(u8, member_name, "lastIndexOf")) {
+            try self.expect(.l_paren);
+            const needle = try self.parseStringArg();
+            var from: ?[]const u8 = null;
+            if (try self.accept(.comma)) {
+                from = try self.parseExpression();
+            }
+            try self.expect(.r_paren);
+            const nptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ nptr, needle });
+            const nlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ nlen, needle });
+            // Omitted `from` means +Infinity, i.e. the end (documented).
+            const wfrom = if (from) |f| try self.asU64Arg(f) else slen;
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_last_index_of({s}, {s}, {s}, {s}, {s})\n", .{ out, sptr, slen, nptr, nlen, wfrom });
+            try self.retagTemp(out, "i64");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "startsWith")) {
+            try self.expect(.l_paren);
+            const needle = try self.parseStringArg();
+            try self.expect(.r_paren);
+            const nptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ nptr, needle });
+            const nlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ nlen, needle });
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_starts_with({s}, {s}, {s}, {s})\n", .{ out, sptr, slen, nptr, nlen });
+            try self.retagTemp(out, "i32");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "endsWith")) {
+            try self.expect(.l_paren);
+            const needle = try self.parseStringArg();
+            try self.expect(.r_paren);
+            const nptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ nptr, needle });
+            const nlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ nlen, needle });
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_ends_with({s}, {s}, {s}, {s})\n", .{ out, sptr, slen, nptr, nlen });
+            try self.retagTemp(out, "i32");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "includes")) {
+            // Desugared over indexOf (`>= 0`); no extra primitive needed.
+            try self.expect(.l_paren);
+            const needle = try self.parseStringArg();
+            try self.expect(.r_paren);
+            const idx = try callIndexOf.run(self, sptr, slen, needle, "0");
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ out, idx });
+            try self.retagTemp(out, "i32");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "toLowerCase")) {
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            const h = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_to_lower_ascii({s}, {s})\n", .{ h, sptr, slen });
+            return try self.packStringHandle(h);
+        }
+        if (std.mem.eql(u8, member_name, "toUpperCase")) {
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            const h = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_to_upper_ascii({s}, {s})\n", .{ h, sptr, slen });
+            return try self.packStringHandle(h);
+        }
+        if (std.mem.eql(u8, member_name, "repeat")) {
+            try self.expect(.l_paren);
+            const count = try self.parseExpression();
+            try self.expect(.r_paren);
+            // Negative counts throw RangeError in JS; the subset has no
+            // catchable throw, so a negative count panics (documented,
+            // same as `throw` semantics here).
+            const wcount = try self.asU64Arg(count);
+            const cneg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ cneg, count });
+            const neg_id = self.nextLabelId();
+            const neg_trap = try std.fmt.allocPrint(self.allocator, "L_rp_neg_{d}", .{neg_id});
+            const neg_ok = try std.fmt.allocPrint(self.allocator, "L_rp_ok_{d}", .{neg_id});
+            try self.lowerer.reserveLabel(neg_trap);
+            try self.lowerer.reserveLabel(neg_ok);
+            try self.lowerer.emitBranchTo(cneg, neg_trap, neg_ok);
+            try self.lowerer.emitLabel(neg_trap);
+            try self.lowerer.emit("    panic(1)\n", .{});
+            try self.lowerer.emitLabel(neg_ok);
+            const h = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_repeat({s}, {s}, {s})\n", .{ h, sptr, slen, wcount });
+            return try self.packStringHandle(h);
+        }
+        if (std.mem.eql(u8, member_name, "padStart") or std.mem.eql(u8, member_name, "padEnd")) {
+            const at_start = std.mem.eql(u8, member_name, "padStart");
+            try self.expect(.l_paren);
+            const target = try self.parseExpression();
+            var pad: []const u8 = "";
+            if (try self.accept(.comma)) {
+                pad = try self.parseStringArg();
+            } else {
+                pad = try self.materializeStringChunk(" ");
+            }
+            try self.expect(.r_paren);
+            const pptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ pptr, pad });
+            const plen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ plen, pad });
+            const wtarget = try self.asU64Arg(target);
+            const h = try self.newTemp();
+            if (at_start) {
+                try self.lowerer.emit("    {s} = call @sa_string_pad_start({s}, {s}, {s}, {s}, {s})\n", .{ h, sptr, slen, wtarget, pptr, plen });
+            } else {
+                try self.lowerer.emit("    {s} = call @sa_string_pad_end({s}, {s}, {s}, {s}, {s})\n", .{ h, sptr, slen, wtarget, pptr, plen });
+            }
+            return try self.packStringHandle(h);
+        }
+        if (std.mem.eql(u8, member_name, "replace") or std.mem.eql(u8, member_name, "replaceAll")) {
+            // Literal-pattern only (regex patterns have no engine and stay
+            // loud at the lexer/parser level before reaching here).
+            try self.expect(.l_paren);
+            const search = try self.parseStringArg();
+            try self.expect(.comma);
+            const repl = try self.parseStringArg();
+            try self.expect(.r_paren);
+            const sptr2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sptr2, search });
+            const slen2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen2, search });
+            const rptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ rptr, repl });
+            const rlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ rlen, repl });
+            const all: u8 = if (std.mem.eql(u8, member_name, "replaceAll")) 1 else 0;
+            const h = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_replace({s}, {s}, {s}, {s}, {s}, {s}, {d})\n", .{ h, sptr, slen, sptr2, slen2, rptr, rlen, all });
+            return try self.packStringHandle(h);
+        }
+        if (std.mem.eql(u8, member_name, "codePointAt")) {
+            try self.expect(.l_paren);
+            const idx = try self.parseExpression();
+            try self.expect(.r_paren);
+            const widx = try self.asU64Arg(idx);
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_string_code_point_at({s}, {s}, {s})\n", .{ out, sptr, slen, widx });
+            try self.retagTemp(out, "u32");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "trim") or std.mem.eql(u8, member_name, "trimStart") or std.mem.eql(u8, member_name, "trimEnd")) {
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            // ASCII-only trim (documented deviation from Unicode trim).
+            const start = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_str_trim_ascii_start_index({s}, {s})\n", .{ start, sptr, slen });
+            const endl = try self.newTemp();
+            try self.lowerer.emit("    {s} = call @sa_str_trim_ascii_end_len({s}, {s})\n", .{ endl, sptr, slen });
+            const rstart = try self.newTemp();
+            const rend = try self.newTemp();
+            if (std.mem.eql(u8, member_name, "trimStart")) {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rstart, start });
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rend, slen });
+            } else if (std.mem.eql(u8, member_name, "trimEnd")) {
+                try self.lowerer.emit("    {s} = 0\n", .{rstart});
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rend, endl });
+            } else {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rstart, start });
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rend, endl });
+            }
+            // All-whitespace input yields end < start; clamp the length
+            // at zero (else the u64 wraps huge and downstream reads run
+            // out of bounds).
+            const rneg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ rneg, rend, rstart });
+            const rslot = try self.joinSlot();
+            const rlabels = try self.joinLabels("trlen");
+            try self.lowerer.emitBranchTo(rneg, rlabels[0], rlabels[1]);
+            try self.lowerer.emitLabel(rlabels[0]);
+            try self.lowerer.emit("    store {s} + 0, 0 as ptr\n", .{rslot});
+            try self.lowerer.emitJumpTo(rlabels[2]);
+            try self.lowerer.emitLabel(rlabels[1]);
+            const rlen2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ rlen2, rend, rstart });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ rslot, rlen2 });
+            try self.lowerer.emitJumpTo(rlabels[2]);
+            try self.lowerer.emitLabel(rlabels[2]);
+            const rlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as u64\n", .{ rlen, rslot });
+            self.scope_manager.markConsumed(rlen2);
+            const rdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ rdata, sptr, rstart });
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 16\n", .{out});
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ out, rdata });
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ out, rlen });
+            try self.retagTemp(out, "string");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "at")) {
+            // Negative counts from the end (like Array.at); out-of-bounds
+            // yields an empty slice (documented undefined-mapping). Index
+            // math stays in i32 (string lengths fit).
+            try self.expect(.l_paren);
+            const idx = try self.parseExpression();
+            try self.expect(.r_paren);
+            const slen32 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as i32\n", .{ slen32, left });
+            const adj = try self.newTemp();
+            const neg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ neg, idx });
+            const aid = self.nextLabelId();
+            const aneg = try std.fmt.allocPrint(self.allocator, "L_at_neg_{d}", .{aid});
+            const apos = try std.fmt.allocPrint(self.allocator, "L_at_pos_{d}", .{aid});
+            const adone = try std.fmt.allocPrint(self.allocator, "L_at_done_{d}", .{aid});
+            try self.lowerer.reserveLabel(aneg);
+            try self.lowerer.reserveLabel(apos);
+            try self.lowerer.reserveLabel(adone);
+            try self.lowerer.emitBranchTo(neg, aneg, apos);
+            try self.lowerer.emitLabel(aneg);
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ adj, slen32, idx });
+            try self.lowerer.emitJumpTo(adone);
+            try self.lowerer.emitLabel(apos);
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ adj, idx });
+            try self.lowerer.emitJumpTo(adone);
+            try self.lowerer.emitLabel(adone);
+            const oklo = try self.newTemp();
+            try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ oklo, adj });
+            const okhi = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ okhi, adj, slen32 });
+            const ok = try self.newTemp();
+            try self.lowerer.emit("    {s} = and {s}, {s}\n", .{ ok, oklo, okhi });
+            // In-bounds yields the 1-char slice, else an empty slice. Both
+            // pointer and length join through slots (a single header is
+            // built after the join; per-arm allocs confuse the exit walk).
+            const pslot = try self.joinSlot();
+            const lslot = try self.joinSlot();
+            const alabels = try self.joinLabels("atres");
+            try self.lowerer.emitBranchTo(ok, alabels[0], alabels[1]);
+            try self.lowerer.emitLabel(alabels[0]);
+            const cptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cptr, sptr, adj });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ pslot, cptr });
+            try self.lowerer.emit("    store {s} + 0, 1 as u64\n", .{ lslot });
+            try self.lowerer.emitJumpTo(alabels[2]);
+            try self.lowerer.emitLabel(alabels[1]);
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ pslot, sptr });
+            try self.lowerer.emit("    store {s} + 0, 0 as u64\n", .{ lslot });
+            try self.lowerer.emitJumpTo(alabels[2]);
+            try self.lowerer.emitLabel(alabels[2]);
+            const rptr = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ rptr, pslot });
+            const rlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as u64\n", .{ rlen, lslot });
+            const res = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 16\n", .{res});
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ res, rptr });
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ res, rlen });
+            try self.retagTemp(res, "string");
+            return res;
+        }
+        if (std.mem.eql(u8, member_name, "concat")) {
+            // Variadic fold over the existing binary slice concat.
+            try self.expect(.l_paren);
+            var acc = left;
+            while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                const part = try self.parseStringArg();
+                acc = try self.concatSlices(acc, part);
+                _ = try self.accept(.comma);
+            }
+            try self.expect(.r_paren);
+            return acc;
+        }
+        if (std.mem.eql(u8, member_name, "substr") or std.mem.eql(u8, member_name, "substring")) {
+            // Clamped zero-copy slice. substr(start[, length]): negative
+            // start counts from the end once, clamped at 0; omitted length
+            // runs to the end. substring(a[, b]): negatives clamp to 0,
+            // swapped when a > b (JS), end defaults to len.
+            const is_substr = std.mem.eql(u8, member_name, "substr");
+            try self.expect(.l_paren);
+            const a0 = try self.parseExpression();
+            var has_b = false;
+            var b0: []const u8 = "0";
+            if (try self.accept(.comma)) {
+                b0 = try self.parseExpression();
+                has_b = true;
+            }
+            try self.expect(.r_paren);
+            const slen32 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as i32\n", .{ slen32, left });
+            var s_idx: []const u8 = "";
+            var e_idx: []const u8 = "";
+            if (is_substr) {
+                // Negative start counts from the end once.
+                const neg = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ neg, a0 });
+                const nid = self.nextLabelId();
+                const nneg = try std.fmt.allocPrint(self.allocator, "L_sb_neg_{d}", .{nid});
+                const npos = try std.fmt.allocPrint(self.allocator, "L_sb_pos_{d}", .{nid});
+                const nend = try std.fmt.allocPrint(self.allocator, "L_sb_end_{d}", .{nid});
+                try self.lowerer.reserveLabel(nneg);
+                try self.lowerer.reserveLabel(npos);
+                try self.lowerer.reserveLabel(nend);
+                const nslot = try self.joinSlot();
+                const nlabels = try self.joinLabels("sbneg");
+                _ = nlabels;
+                try self.lowerer.emitBranchTo(neg, nneg, npos);
+                try self.lowerer.emitLabel(nneg);
+                const shifted = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ shifted, slen32, a0 });
+                const sneg = try ClampIndex.run(self, shifted, slen32);
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ nslot, sneg });
+                try self.lowerer.emitJumpTo(nend);
+                try self.lowerer.emitLabel(npos);
+                const spos = try ClampIndex.run(self, a0, slen32);
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ nslot, spos });
+                try self.lowerer.emitJumpTo(nend);
+                try self.lowerer.emitLabel(nend);
+                const ns = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ ns, nslot });
+                s_idx = ns;
+                if (has_b) {
+                    const raw = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ raw, s_idx, b0 });
+                    const rcl = try ClampIndex.run(self, raw, slen32);
+                    // Negative length clamps to empty (end above start).
+                    const rlt = try self.newTemp();
+                    try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ rlt, rcl, s_idx });
+                    const ge_id = self.nextLabelId();
+                    const ge_lo = try std.fmt.allocPrint(self.allocator, "L_sb_lo_{d}", .{ge_id});
+                    const ge_hi = try std.fmt.allocPrint(self.allocator, "L_sb_hi_{d}", .{ge_id});
+                    const ge_en = try std.fmt.allocPrint(self.allocator, "L_sb_en_{d}", .{ge_id});
+                    try self.lowerer.reserveLabel(ge_lo);
+                    try self.lowerer.reserveLabel(ge_hi);
+                    try self.lowerer.reserveLabel(ge_en);
+                    const geslot = try self.joinSlot();
+                    try self.lowerer.emitBranchTo(rlt, ge_lo, ge_hi);
+                    try self.lowerer.emitLabel(ge_lo);
+                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ geslot, s_idx });
+                    try self.lowerer.emitJumpTo(ge_en);
+                    try self.lowerer.emitLabel(ge_hi);
+                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ geslot, rcl });
+                    try self.lowerer.emitJumpTo(ge_en);
+                    try self.lowerer.emitLabel(ge_en);
+                    const ge = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ ge, geslot });
+                    e_idx = ge;
+                } else {
+                    e_idx = try ClampIndex.run(self, slen32, slen32);
+                }
+            } else {
+                s_idx = try ClampIndex.run(self, a0, slen32);
+                if (has_b) {
+                    e_idx = try ClampIndex.run(self, b0, slen32);
+                } else {
+                    e_idx = try ClampIndex.run(self, slen32, slen32);
+                }
+                // Swap when s_idx > e_idx (JS substring swaps).
+                const sw = try self.newTemp();
+                try self.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ sw, s_idx, e_idx });
+                const wid = self.nextLabelId();
+                const wswap = try std.fmt.allocPrint(self.allocator, "L_ss_swap_{d}", .{wid});
+                const wkeep = try std.fmt.allocPrint(self.allocator, "L_ss_keep_{d}", .{wid});
+                const wend = try std.fmt.allocPrint(self.allocator, "L_ss_end_{d}", .{wid});
+                try self.lowerer.reserveLabel(wswap);
+                try self.lowerer.reserveLabel(wkeep);
+                try self.lowerer.reserveLabel(wend);
+                const js = try self.joinSlot();
+                const je = try self.joinSlot();
+                try self.lowerer.emitBranchTo(sw, wswap, wkeep);
+                try self.lowerer.emitLabel(wswap);
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ js, e_idx });
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ je, s_idx });
+                try self.lowerer.emitJumpTo(wend);
+                try self.lowerer.emitLabel(wkeep);
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ js, s_idx });
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ je, e_idx });
+                try self.lowerer.emitJumpTo(wend);
+                try self.lowerer.emitLabel(wend);
+                const ls = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ ls, js });
+                const le = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ le, je });
+                s_idx = ls;
+                e_idx = le;
+            }
+            const rlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ rlen, e_idx, s_idx });
+            const rdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ rdata, sptr, s_idx });
+            const out = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 16\n", .{out});
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ out, rdata });
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ out, rlen });
+            try self.retagTemp(out, "string");
+            return out;
+        }
+        if (std.mem.eql(u8, member_name, "split")) {
+            return self.refuseAt(
+                "error: String.split needs an array bridge (a string[] result cannot be built here)",
+                .{},
+                error.SplitNeedsArrayBridge,
+            );
+        }
+        return error.UnknownMethod;
+    }
+
+    /// Deep-copy an array header + buffer into a fresh header (for
+    /// non-mutating `toReversed`/`toSorted`/`toSpliced`/`with`). Element
+    /// width follows the source array.
+    fn cloneArray(self: *Parser, left: []const u8) anyerror![]const u8 {
+        var elem_type: []const u8 = "i32";
+        if (self.scope_manager.lookup(left)) |av| {
+            elem_type = elementTypeOf(av.type_name);
+        }
+        var esz: u32 = 4;
+        var eal: u32 = 4;
+        try getTypeSizeAndAlign(elem_type, &esz, &eal);
+        const sa_elem = saTypeOf(elem_type);
+        const len = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
+        const sdata = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sdata, left });
+        const dest = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+        const nby = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nby, len, esz });
+        const ddata = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc {s}\n", .{ ddata, nby });
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, ddata });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, len });
+        try self.retagTemp(dest, "i32[]");
+        if (self.scope_manager.lookup(left)) |av2| {
+            // Preserve the source element type on the copy.
+            if (self.scope_manager.lookup(dest)) |dv| {
+                self.allocator.free(dv.type_name);
+                dv.type_name = try self.allocator.dupe(u8, av2.type_name);
+            }
+        }
+        const cid = self.nextLabelId();
+        const c_top = try std.fmt.allocPrint(self.allocator, "L_clone_top_{d}", .{cid});
+        const c_body = try std.fmt.allocPrint(self.allocator, "L_clone_body_{d}", .{cid});
+        const c_end = try std.fmt.allocPrint(self.allocator, "L_clone_end_{d}", .{cid});
+        try self.lowerer.reserveLabel(c_top);
+        try self.lowerer.reserveLabel(c_body);
+        try self.lowerer.reserveLabel(c_end);
+        const ci = try self.newTemp();
+        try self.lowerer.emit("    {s} = 0\n", .{ci});
+        try self.lowerer.emitLabel(c_top);
+        const cc = try self.newTemp();
+        try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cc, ci, len });
+        try self.lowerer.emitBranchTo(cc, c_body, c_end);
+        try self.lowerer.emitLabel(c_body);
+        const co = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ co, ci, esz });
+        const ca1 = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ca1, sdata, co });
+        const cv = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cv, ca1, sa_elem });
+        const ca2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ca2, ddata, co });
+        try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ca2, cv, sa_elem });
+        const ci2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, 1\n", .{ ci2, ci });
+        try self.lowerer.emit("    {s} = {s}\n", .{ ci, ci2 });
+        self.scope_manager.markConsumed(ci2);
+        try self.lowerer.emitJumpTo(c_top);
+        try self.lowerer.emitLabel(c_end);
+        self.scope_manager.markConsumed(co);
+        self.scope_manager.markConsumed(ca1);
+        self.scope_manager.markConsumed(cv);
+        self.scope_manager.markConsumed(ca2);
+        self.scope_manager.markConsumed(cc);
+        return dest;
+    }
+
     fn lowerArrayMethodCall(self: *Parser, left: []const u8, member_name: []const u8) anyerror![]const u8 {
         if (std.mem.eql(u8, member_name, "push")) {
             try self.expect(.l_paren);
@@ -6969,6 +7578,174 @@ pub const Parser = struct {
             self.scope_manager.markConsumed(fc);
             self.scope_manager.markConsumed(fo);
             self.scope_manager.markConsumed(fa);
+            return left;
+        }
+        if (std.mem.eql(u8, member_name, "copyWithin")) {
+            // `arr.copyWithin(target[, start[, end]])`: copy `[start,end)`
+            // onto `target` in place, return the array. Indices clamp via
+            // `clampToLen`; `count = min(end-start, len-target)`; a
+            // non-positive count is a no-op. Overlap-safe by direction:
+            // forward when `target < start`, else backward (a slot is
+            // never read after being overwritten).
+            try self.expect(.l_paren);
+            const target_v = try self.parseExpression();
+            var cw_has_start = false;
+            var cw_has_end = false;
+            var cw_start_v: []const u8 = "0";
+            var cw_end_v: []const u8 = "0";
+            if (try self.accept(.comma)) {
+                cw_start_v = try self.parseExpression();
+                cw_has_start = true;
+                if (try self.accept(.comma)) {
+                    cw_end_v = try self.parseExpression();
+                    cw_has_end = true;
+                }
+            }
+            try self.expect(.r_paren);
+            var cw_elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                cw_elem_type = elementTypeOf(av.type_name);
+            }
+            var cw_esz: u32 = 4;
+            var cw_eal: u32 = 4;
+            try getTypeSizeAndAlign(cw_elem_type, &cw_esz, &cw_eal);
+            const cw_sa_elem = saTypeOf(cw_elem_type);
+            const cw_len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ cw_len, left });
+            const cw_data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ cw_data, left });
+            const cw_t = try self.newTemp();
+            try self.clampToLen(cw_t, target_v, cw_len);
+            const cw_st = try self.newTemp();
+            if (cw_has_start) {
+                try self.clampToLen(cw_st, cw_start_v, cw_len);
+            } else {
+                try self.lowerer.emit("    {s} = 0\n", .{cw_st});
+            }
+            const cw_en = try self.newTemp();
+            if (cw_has_end) {
+                try self.clampToLen(cw_en, cw_end_v, cw_len);
+            } else {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ cw_en, cw_len });
+            }
+            const cw_span = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ cw_span, cw_en, cw_st });
+            const cw_room = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ cw_room, cw_len, cw_t });
+            const cw_id = self.nextLabelId();
+            const cw_min_span = try std.fmt.allocPrint(self.allocator, "L_cw_minspan_{d}", .{cw_id});
+            const cw_min_room = try std.fmt.allocPrint(self.allocator, "L_cw_minroom_{d}", .{cw_id});
+            const cw_cnt = try std.fmt.allocPrint(self.allocator, "L_cw_cnt_{d}", .{cw_id});
+            const cw_run = try std.fmt.allocPrint(self.allocator, "L_cw_run_{d}", .{cw_id});
+            const cw_skip = try std.fmt.allocPrint(self.allocator, "L_cw_skip_{d}", .{cw_id});
+            const cw_finit = try std.fmt.allocPrint(self.allocator, "L_cw_finit_{d}", .{cw_id});
+            const cw_ftop = try std.fmt.allocPrint(self.allocator, "L_cw_ftop_{d}", .{cw_id});
+            const cw_fbody = try std.fmt.allocPrint(self.allocator, "L_cw_fbody_{d}", .{cw_id});
+            const cw_fend = try std.fmt.allocPrint(self.allocator, "L_cw_fend_{d}", .{cw_id});
+            const cw_btop = try std.fmt.allocPrint(self.allocator, "L_cw_btop_{d}", .{cw_id});
+            const cw_bbody = try std.fmt.allocPrint(self.allocator, "L_cw_bbody_{d}", .{cw_id});
+            const cw_bend = try std.fmt.allocPrint(self.allocator, "L_cw_bend_{d}", .{cw_id});
+            try self.lowerer.reserveLabel(cw_min_span);
+            try self.lowerer.reserveLabel(cw_min_room);
+            try self.lowerer.reserveLabel(cw_cnt);
+            try self.lowerer.reserveLabel(cw_run);
+            try self.lowerer.reserveLabel(cw_skip);
+            try self.lowerer.reserveLabel(cw_finit);
+            try self.lowerer.reserveLabel(cw_ftop);
+            try self.lowerer.reserveLabel(cw_fbody);
+            try self.lowerer.reserveLabel(cw_fend);
+            try self.lowerer.reserveLabel(cw_btop);
+            try self.lowerer.reserveLabel(cw_bbody);
+            try self.lowerer.reserveLabel(cw_bend);
+            const cw_count = try self.newTemp();
+            const cw_pick = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cw_pick, cw_span, cw_room });
+            try self.lowerer.emitBranchTo(cw_pick, cw_min_span, cw_min_room);
+            try self.lowerer.emitLabel(cw_min_span);
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ cw_count, cw_span });
+            try self.lowerer.emitJumpTo(cw_cnt);
+            try self.lowerer.emitLabel(cw_min_room);
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ cw_count, cw_room });
+            try self.lowerer.emitJumpTo(cw_cnt);
+            try self.lowerer.emitLabel(cw_cnt);
+            const cw_go = try self.newTemp();
+            try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ cw_go, cw_count });
+            try self.lowerer.emitBranchTo(cw_go, cw_run, cw_skip);
+            try self.lowerer.emitLabel(cw_run);
+            const cw_fwd = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cw_fwd, cw_t, cw_st });
+            try self.lowerer.emitBranchTo(cw_fwd, cw_finit, cw_btop);
+            // Forward loop.
+            const cw_i = try self.newTemp();
+            try self.lowerer.emitLabel(cw_finit);
+            try self.lowerer.emit("    {s} = 0\n", .{cw_i});
+            try self.lowerer.emitJumpTo(cw_ftop);
+            try self.lowerer.emitLabel(cw_ftop);
+            const cw_fc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cw_fc, cw_i, cw_count });
+            try self.lowerer.emitBranchTo(cw_fc, cw_fbody, cw_fend);
+            try self.lowerer.emitLabel(cw_fbody);
+            const cw_si = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_si, cw_st, cw_i });
+            const cw_soff = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cw_soff, cw_si, cw_esz });
+            const cw_saddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_saddr, cw_data, cw_soff });
+            const cw_cur = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cw_cur, cw_saddr, cw_sa_elem });
+            const cw_di = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_di, cw_t, cw_i });
+            const cw_doff = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cw_doff, cw_di, cw_esz });
+            const cw_daddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_daddr, cw_data, cw_doff });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ cw_daddr, cw_cur, cw_sa_elem });
+            const cw_fnext = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ cw_fnext, cw_i });
+            try self.lowerer.emit("    {s} = {s}\n", .{ cw_i, cw_fnext });
+            self.scope_manager.markConsumed(cw_fnext);
+            try self.lowerer.emitJumpTo(cw_ftop);
+            try self.lowerer.emitLabel(cw_fend);
+            try self.lowerer.emitJumpTo(cw_skip);
+            // Backward loop (`count > 0` here, so `count - 1` cannot wrap).
+            try self.lowerer.emitLabel(cw_btop);
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ cw_i, cw_count });
+            const cw_btop2 = try std.fmt.allocPrint(self.allocator, "L_cw_btop2_{d}", .{cw_id});
+            try self.lowerer.reserveLabel(cw_btop2);
+            try self.lowerer.emitLabel(cw_btop2);
+            const cw_bc = try self.newTemp();
+            try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ cw_bc, cw_i });
+            try self.lowerer.emitBranchTo(cw_bc, cw_bbody, cw_bend);
+            try self.lowerer.emitLabel(cw_bbody);
+            const cw_si2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_si2, cw_st, cw_i });
+            const cw_soff2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cw_soff2, cw_si2, cw_esz });
+            const cw_saddr2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_saddr2, cw_data, cw_soff2 });
+            const cw_cur2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cw_cur2, cw_saddr2, cw_sa_elem });
+            const cw_di2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_di2, cw_t, cw_i });
+            const cw_doff2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cw_doff2, cw_di2, cw_esz });
+            const cw_daddr2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cw_daddr2, cw_data, cw_doff2 });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ cw_daddr2, cw_cur2, cw_sa_elem });
+            const cw_bnext = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ cw_bnext, cw_i });
+            try self.lowerer.emit("    {s} = {s}\n", .{ cw_i, cw_bnext });
+            self.scope_manager.markConsumed(cw_bnext);
+            try self.lowerer.emitJumpTo(cw_btop2);
+            try self.lowerer.emitLabel(cw_bend);
+            try self.lowerer.emitLabel(cw_skip);
+            self.scope_manager.markConsumed(cw_si);
+            self.scope_manager.markConsumed(cw_soff);
+            self.scope_manager.markConsumed(cw_saddr);
+            self.scope_manager.markConsumed(cw_cur);
+            self.scope_manager.markConsumed(cw_di);
+            self.scope_manager.markConsumed(cw_doff);
+            self.scope_manager.markConsumed(cw_daddr);
             return left;
         }
         if (std.mem.eql(u8, member_name, "indexOf")) {
@@ -7548,7 +8325,8 @@ pub const Parser = struct {
             try self.lowerer.emitLabel(l_end);
             return left;
         }
-        if (std.mem.eql(u8, member_name, "reduce")) {
+        if (std.mem.eql(u8, member_name, "reduce") or std.mem.eql(u8, member_name, "reduceRight")) {
+            const is_rright = std.mem.eql(u8, member_name, "reduceRight");
             // `arr.reduce(cb[, init])`: fold-with-init desugared to an index
             // loop (NOT sa_std vec macros: those want bare `fn(u64,u64)` and
             // a Vec layout, while our arrays are `{ptr,len}` slices and our
@@ -7581,6 +8359,12 @@ pub const Parser = struct {
                     red_arity = aarg.arity;
                     red_self_call = aarg.self_call;
                 }
+            } else if (is_rright) {
+                return self.refuseAt(
+                    "error: Array.reduceRight callback must be an arrow function or a named function",
+                    .{},
+                    error.ConstructorsNotSupported,
+                );
             } else {
                 return self.refuseAt(
                     "error: Array.reduce callback must be an arrow function or a named function",
@@ -7619,7 +8403,11 @@ pub const Parser = struct {
                 } else {
                     try self.lowerer.emit("    {s} = {s}\n", .{ acc, init_val });
                 }
-                try self.lowerer.emit("    {s} = 0\n", .{i});
+                if (is_rright) {
+                    try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ i, len });
+                } else {
+                    try self.lowerer.emit("    {s} = 0\n", .{i});
+                }
             } else {
                 const nid = self.nextLabelId();
                 const l_empty = try std.fmt.allocPrint(self.allocator, "L_red_empty_{d}", .{nid});
@@ -7633,13 +8421,31 @@ pub const Parser = struct {
                 try self.lowerer.emitTerm("    panic(1)\n", .{});
                 try self.lowerer.emitLabel(l_has);
                 const seed = try self.newTemp();
-                try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ seed, data, sa_elem });
+                if (is_rright) {
+                    // Seed from the last element.
+                    const sidx = try self.newTemp();
+                    try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ sidx, len });
+                    const soff = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ soff, sidx, esz });
+                    const saddr = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ saddr, data, soff });
+                    try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ seed, saddr, sa_elem });
+                } else {
+                    try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ seed, data, sa_elem });
+                }
                 // Fresh-temp move (NOT emitMove: acc has no value yet, so a
                 // release-first rebind would emit `!acc` before its
                 // definition).
                 try self.lowerer.emit("    {s} = {s}\n", .{ acc, seed });
                 self.scope_manager.markConsumed(seed);
-                try self.lowerer.emit("    {s} = 1\n", .{i});
+                if (is_rright) {
+                    // Define `i` directly with an ALU op: a copy-bind
+                    // (`i = tmp`) aliases the source and trips
+                    // RegisterRedefinition at the loop-step rebind.
+                    try self.lowerer.emit("    {s} = sub {s}, 2\n", .{ i, len });
+                } else {
+                    try self.lowerer.emit("    {s} = 1\n", .{i});
+                }
             }
             const id = self.nextLabelId();
             const l_top = try std.fmt.allocPrint(self.allocator, "L_red_top_{d}", .{id});
@@ -7650,7 +8456,15 @@ pub const Parser = struct {
             try self.lowerer.reserveLabel(l_end);
             try self.lowerer.emitLabel(l_top);
             const c = try self.newTemp();
-            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, len });
+            if (is_rright) {
+                const rc1 = try self.newTemp();
+                try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ rc1, i });
+                const rc2 = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ rc2, i, len });
+                try self.lowerer.emit("    {s} = and {s}, {s}\n", .{ c, rc1, rc2 });
+            } else {
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, len });
+            }
             try self.lowerer.emitBranchTo(c, l_body, l_end);
             try self.lowerer.emitLabel(l_body);
             const off = try self.newTemp();
@@ -7667,6 +8481,13 @@ pub const Parser = struct {
             var arg_buf = std.ArrayList(u8).init(self.allocator);
             defer arg_buf.deinit();
             if (red_arity > 4) {
+                if (is_rright) {
+                    return self.refuseAt(
+                        "error: Array.reduceRight callback takes too many parameters",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
                 return self.refuseAt(
                     "error: Array.reduce callback takes too many parameters",
                     .{},
@@ -7703,7 +8524,11 @@ pub const Parser = struct {
             try self.emitMove(acc, v);
             self.loop_depth -= 1;
             const inext = try self.newTemp();
-            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+            if (is_rright) {
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ inext, i });
+            } else {
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+            }
             try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
             self.scope_manager.markConsumed(inext);
             try self.lowerer.emitJumpTo(l_top);
@@ -7727,7 +8552,8 @@ pub const Parser = struct {
         }
         if (std.mem.eql(u8, member_name, "forEach") or std.mem.eql(u8, member_name, "some") or
             std.mem.eql(u8, member_name, "every") or std.mem.eql(u8, member_name, "find") or
-            std.mem.eql(u8, member_name, "findIndex") or std.mem.eql(u8, member_name, "includes"))
+            std.mem.eql(u8, member_name, "findIndex") or std.mem.eql(u8, member_name, "findLast") or
+            std.mem.eql(u8, member_name, "findLastIndex") or std.mem.eql(u8, member_name, "includes"))
         {
             // Predicate loops (lcm `some`, edmonds `find`): mirror `map`'s
             // callback convention (arrow/alias, plain/ctx/self, arity<=3
@@ -7738,8 +8564,9 @@ pub const Parser = struct {
             const is_foreach = std.mem.eql(u8, member_name, "forEach");
             const is_some = std.mem.eql(u8, member_name, "some");
             const is_every = std.mem.eql(u8, member_name, "every");
-            const is_find = std.mem.eql(u8, member_name, "find");
-            const is_findidx = std.mem.eql(u8, member_name, "findIndex");
+            const is_find = std.mem.eql(u8, member_name, "find") or std.mem.eql(u8, member_name, "findLast");
+            const is_findidx = std.mem.eql(u8, member_name, "findIndex") or std.mem.eql(u8, member_name, "findLastIndex");
+            const is_reverse = std.mem.eql(u8, member_name, "findLast") or std.mem.eql(u8, member_name, "findLastIndex");
             try self.expect(.l_paren);
             var cb: ?[]const u8 = null;
             var pctx: ?[]const u8 = null;
@@ -7823,11 +8650,24 @@ pub const Parser = struct {
             try self.lowerer.reserveLabel(p_next);
             try self.lowerer.reserveLabel(p_end);
             const pi = try self.newTemp();
-            try self.lowerer.emit("    {s} = 0\n", .{pi});
-            try self.retagTemp(pi, "u64");
+            if (is_reverse) {
+                // Start at len-1. Empty arrays wrap u64, so the loop
+                // condition checks both bounds (sge 0 AND slt len).
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ pi, plen });
+            } else {
+                try self.lowerer.emit("    {s} = 0\n", .{pi});
+            }
             try self.lowerer.emitLabel(p_top);
             const pcc = try self.newTemp();
-            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ pcc, pi, plen });
+            if (is_reverse) {
+                const pc1 = try self.newTemp();
+                try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ pc1, pi });
+                const pc2 = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ pc2, pi, plen });
+                try self.lowerer.emit("    {s} = and {s}, {s}\n", .{ pcc, pc1, pc2 });
+            } else {
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ pcc, pi, plen });
+            }
             try self.lowerer.emitBranchTo(pcc, p_body, p_end);
             try self.lowerer.emitLabel(p_body);
             const po = try self.newTemp();
@@ -7903,7 +8743,11 @@ pub const Parser = struct {
             }
             try self.lowerer.emitLabel(p_next);
             const pi2 = try self.newTemp();
-            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ pi2, pi });
+            if (is_reverse) {
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ pi2, pi });
+            } else {
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ pi2, pi });
+            }
             try self.lowerer.emit("    {s} = {s}\n", .{ pi, pi2 });
             self.scope_manager.markConsumed(pi2);
             try self.lowerer.emitJumpTo(p_top);
@@ -8385,6 +9229,689 @@ pub const Parser = struct {
             self.scope_manager.markConsumed(ca);
             self.scope_manager.markConsumed(cb);
             return left;
+        }
+        if (std.mem.eql(u8, member_name, "toReversed")) {
+            // `arr.toReversed()`: fresh reversed copy (clone + in-place
+            // swap on the copy; the source is never touched).
+            try self.expect(.l_paren);
+            try self.expect(.r_paren);
+            const dest = try self.cloneArray(left);
+            var elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, dest });
+            const data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, dest });
+            const half = try self.newTemp();
+            try self.lowerer.emit("    {s} = div {s}, 2\n", .{ half, len });
+            const id = self.nextLabelId();
+            const l_top = try std.fmt.allocPrint(self.allocator, "L_trev_top_{d}", .{id});
+            const l_body = try std.fmt.allocPrint(self.allocator, "L_trev_body_{d}", .{id});
+            const l_end = try std.fmt.allocPrint(self.allocator, "L_trev_end_{d}", .{id});
+            try self.lowerer.reserveLabel(l_top);
+            try self.lowerer.reserveLabel(l_body);
+            try self.lowerer.reserveLabel(l_end);
+            const i = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{i});
+            try self.lowerer.emitLabel(l_top);
+            const c = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ c, i, half });
+            try self.lowerer.emitBranchTo(c, l_body, l_end);
+            try self.lowerer.emitLabel(l_body);
+            const j = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ j, len });
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ j, j, i });
+            const a_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ a_off, i, esz });
+            const a_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ a_addr, data, a_off });
+            const b_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ b_off, j, esz });
+            const b_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ b_addr, data, b_off });
+            const ca = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ ca, a_addr, sa_elem });
+            const cbv = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cbv, b_addr, sa_elem });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ a_addr, cbv, sa_elem });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ b_addr, ca, sa_elem });
+            const inext = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+            try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
+            self.scope_manager.markConsumed(inext);
+            try self.lowerer.emitJumpTo(l_top);
+            try self.lowerer.emitLabel(l_end);
+            self.scope_manager.markConsumed(j);
+            self.scope_manager.markConsumed(a_off);
+            self.scope_manager.markConsumed(a_addr);
+            self.scope_manager.markConsumed(b_off);
+            self.scope_manager.markConsumed(b_addr);
+            self.scope_manager.markConsumed(ca);
+            self.scope_manager.markConsumed(cbv);
+            return dest;
+        }
+        if (std.mem.eql(u8, member_name, "toSorted")) {
+            // `arr.toSorted([cmp])`: clone + insertion sort on the copy.
+            // Comparator convention mirrors `sort` (plain/ctx/self,
+            // 1-2 params, negative means first-before-second).
+            try self.expect(.l_paren);
+            var sort_cb: ?[]const u8 = null;
+            var sort_ctx: ?[]const u8 = null;
+            var sort_plain = false;
+            var sort_self = false;
+            var sort_arity: u8 = 2;
+            if (self.current.tag != .r_paren) {
+                const saved_hint = self.arrow_elem_hint;
+                defer self.arrow_elem_hint = saved_hint;
+                if (self.scope_manager.lookup(left)) |hv| {
+                    const he = elementTypeOf(hv.type_name);
+                    if (self.layout_table.find(baseTypeOf(he)) != null) self.arrow_elem_hint = he;
+                }
+                const sm = try self.parseExpression();
+                if (std.mem.startsWith(u8, sm, "@")) {
+                    sort_cb = sm;
+                    const raw = self.last_arrow_ctx orelse "^ctx";
+                    sort_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                    sort_arity = self.last_arrow_arity;
+                } else if (self.arrow_aliases.get(sm)) |saarg| {
+                    sort_cb = saarg.cb;
+                    if (saarg.plain) {
+                        sort_plain = true;
+                    } else {
+                        const raw = saarg.ctx;
+                        sort_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                        sort_arity = saarg.arity;
+                        sort_self = saarg.self_call;
+                    }
+                } else {
+                    return self.refuseAt(
+                        "error: Array.toSorted callback must be an arrow function or a named function",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                if (sort_arity == 0 or sort_arity > 2) {
+                    return self.refuseAt(
+                        "error: Array.toSorted comparator takes one or two parameters",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            try self.expect(.r_paren);
+            var sort_elem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |sav| {
+                sort_elem = elementTypeOf(sav.type_name);
+            }
+            if (sort_cb == null) {
+                const numeric = std.mem.eql(u8, sort_elem, "i32") or std.mem.eql(u8, sort_elem, "u32") or
+                    std.mem.eql(u8, sort_elem, "number") or std.mem.eql(u8, sort_elem, "boolean") or
+                    std.mem.eql(u8, sort_elem, "i64") or std.mem.eql(u8, sort_elem, "u64");
+                if (!numeric) {
+                    return self.refuseAt(
+                        "error: Array.toSorted without a comparator only lowers for numeric arrays",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            const dest = try self.cloneArray(left);
+            var sesz: u32 = 4;
+            var seal: u32 = 4;
+            try getTypeSizeAndAlign(sort_elem, &sesz, &seal);
+            const ssa = saTypeOf(sort_elem);
+            const slen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen, dest });
+            const sdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sdata, dest });
+            const sid = self.nextLabelId();
+            const s_top = try std.fmt.allocPrint(self.allocator, "L_tsort_top_{d}", .{sid});
+            const s_body = try std.fmt.allocPrint(self.allocator, "L_tsort_body_{d}", .{sid});
+            const s_itop = try std.fmt.allocPrint(self.allocator, "L_tsort_itop_{d}", .{sid});
+            const s_ichk = try std.fmt.allocPrint(self.allocator, "L_tsort_ichk_{d}", .{sid});
+            const s_ibody = try std.fmt.allocPrint(self.allocator, "L_tsort_ibody_{d}", .{sid});
+            const s_iend = try std.fmt.allocPrint(self.allocator, "L_tsort_iend_{d}", .{sid});
+            const s_end = try std.fmt.allocPrint(self.allocator, "L_tsort_end_{d}", .{sid});
+            try self.lowerer.reserveLabel(s_top);
+            try self.lowerer.reserveLabel(s_body);
+            try self.lowerer.reserveLabel(s_itop);
+            try self.lowerer.reserveLabel(s_ichk);
+            try self.lowerer.reserveLabel(s_ibody);
+            try self.lowerer.reserveLabel(s_iend);
+            try self.lowerer.reserveLabel(s_end);
+            const si = try self.newTemp();
+            try self.lowerer.emit("    {s} = 1\n", .{si});
+            try self.lowerer.emitLabel(s_top);
+            const sc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ sc, si, slen });
+            try self.lowerer.emitBranchTo(sc, s_body, s_end);
+            try self.lowerer.emitLabel(s_body);
+            const sk_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sk_off, si, sesz });
+            const sk_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sk_addr, sdata, sk_off });
+            const skey = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ skey, sk_addr, ssa });
+            const sj = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ sj, si });
+            try self.lowerer.emitLabel(s_itop);
+            const sjneg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ sjneg, sj });
+            try self.lowerer.emitBranchTo(sjneg, s_iend, s_ichk);
+            try self.lowerer.emitLabel(s_ichk);
+            const saj_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ saj_off, sj, sesz });
+            const saj_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ saj_addr, sdata, saj_off });
+            const saj = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ saj, saj_addr, ssa });
+            const sshift = try self.newTemp();
+            if (sort_cb) |scb| {
+                const sres = try self.newTemp();
+                if (sort_plain) {
+                    if (sort_arity == 2) {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ sres, scb[1..], saj, skey });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s})\n", .{ sres, scb[1..], saj });
+                    }
+                } else {
+                    if (sort_arity == 2) {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s}, {s})\n", .{ sres, scb[1..], saj, skey, sort_ctx.? });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ sres, scb[1..], saj, sort_ctx.? });
+                    }
+                }
+                try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ sshift, sres });
+            } else {
+                try self.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ sshift, saj, skey });
+            }
+            try self.lowerer.emitBranchTo(sshift, s_ibody, s_iend);
+            try self.lowerer.emitLabel(s_ibody);
+            const sn_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ sn_off, sj });
+            const sn_by = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sn_by, sn_off, sesz });
+            const sn_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sn_addr, sdata, sn_by });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ sn_addr, saj, ssa });
+            const sj2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ sj2, sj });
+            try self.lowerer.emit("    {s} = {s}\n", .{ sj, sj2 });
+            self.scope_manager.markConsumed(sj2);
+            try self.lowerer.emitJumpTo(s_itop);
+            try self.lowerer.emitLabel(s_iend);
+            const sd_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ sd_off, sj });
+            const sd_by = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sd_by, sd_off, sesz });
+            const sd_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sd_addr, sdata, sd_by });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ sd_addr, skey, ssa });
+            const si2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ si2, si });
+            try self.lowerer.emit("    {s} = {s}\n", .{ si, si2 });
+            self.scope_manager.markConsumed(si2);
+            try self.lowerer.emitJumpTo(s_top);
+            try self.lowerer.emitLabel(s_end);
+            self.scope_manager.markConsumed(sk_off);
+            self.scope_manager.markConsumed(sk_addr);
+            self.scope_manager.markConsumed(skey);
+            self.scope_manager.markConsumed(saj_off);
+            self.scope_manager.markConsumed(saj_addr);
+            self.scope_manager.markConsumed(saj);
+            self.scope_manager.markConsumed(sshift);
+            if (sort_cb != null and !sort_plain and !sort_self) try self.lowerer.emit("    !{s}\n", .{sort_ctx.?});
+            self.last_arrow_ctx = null;
+            return dest;
+        }
+        if (std.mem.eql(u8, member_name, "with")) {
+            // `arr.with(i, v)`: copy with slot `i` replaced. Negative `i`
+            // counts from the end; out-of-bounds panics (JS RangeError, and
+            // `throw` lowers to `panic` here).
+            try self.expect(.l_paren);
+            const idx = try self.parseExpression();
+            try self.expect(.comma);
+            const val = try self.parseExpression();
+            try self.expect(.r_paren);
+            var elem_type: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
+            const dest = try self.cloneArray(left);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, dest });
+            const data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, dest });
+            const neg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ neg, idx });
+            const wid = self.nextLabelId();
+            const w_neg = try std.fmt.allocPrint(self.allocator, "L_with_neg_{d}", .{wid});
+            const w_pos = try std.fmt.allocPrint(self.allocator, "L_with_pos_{d}", .{wid});
+            const w_go = try std.fmt.allocPrint(self.allocator, "L_with_go_{d}", .{wid});
+            const w_trap = try std.fmt.allocPrint(self.allocator, "L_with_trap_{d}", .{wid});
+            const w_ok = try std.fmt.allocPrint(self.allocator, "L_with_ok_{d}", .{wid});
+            try self.lowerer.reserveLabel(w_neg);
+            try self.lowerer.reserveLabel(w_pos);
+            try self.lowerer.reserveLabel(w_go);
+            try self.lowerer.reserveLabel(w_trap);
+            try self.lowerer.reserveLabel(w_ok);
+            const slot = try self.joinSlot();
+            try self.lowerer.emitBranchTo(neg, w_neg, w_pos);
+            try self.lowerer.emitLabel(w_neg);
+            const adj = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ adj, len, idx });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, adj });
+            try self.lowerer.emitJumpTo(w_go);
+            try self.lowerer.emitLabel(w_pos);
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, idx });
+            try self.lowerer.emitJumpTo(w_go);
+            try self.lowerer.emitLabel(w_go);
+            const norm = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ norm, slot });
+            const oklo = try self.newTemp();
+            try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ oklo, norm });
+            const okhi = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ okhi, norm, len });
+            const ok = try self.newTemp();
+            try self.lowerer.emit("    {s} = and {s}, {s}\n", .{ ok, oklo, okhi });
+            try self.lowerer.emitBranchTo(ok, w_ok, w_trap);
+            try self.lowerer.emitLabel(w_trap);
+            try self.lowerer.emitTerm("    panic(1)\n", .{});
+            try self.lowerer.emitLabel(w_ok);
+            const off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off, norm, esz });
+            const daddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, data, off });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ daddr, val, sa_elem });
+            return dest;
+        }
+        if (std.mem.eql(u8, member_name, "toSpliced")) {
+            // `arr.toSpliced(start[, deleteCount[, ...items]])`: spliced
+            // copy. `start` clamps via `clampToLen` (negative folds);
+            // omitted `deleteCount` removes to the end; an explicit count
+            // clamps to `[0, len-start]`. Result is
+            // `prefix + items + suffix` in a fresh header.
+            try self.expect(.l_paren);
+            var has_start = false;
+            var has_del = false;
+            var start_v: []const u8 = "0";
+            var del_v: []const u8 = "0";
+            var items = std.ArrayList([]const u8).init(self.allocator);
+            defer items.deinit();
+            if (self.current.tag != .r_paren) {
+                start_v = try self.parseExpression();
+                has_start = true;
+                if (try self.accept(.comma)) {
+                    if (self.current.tag != .r_paren) {
+                        del_v = try self.parseExpression();
+                        has_del = true;
+                        while (try self.accept(.comma)) {
+                            if (self.current.tag == .r_paren) break;
+                            try items.append(try self.parseExpression());
+                        }
+                    }
+                }
+            }
+            try self.expect(.r_paren);
+            var elem_type: []const u8 = "i32";
+            var arr_type: []const u8 = "i32[]";
+            if (self.scope_manager.lookup(left)) |av| {
+                arr_type = av.type_name;
+                elem_type = elementTypeOf(av.type_name);
+            }
+            var esz: u32 = 4;
+            var eal: u32 = 4;
+            try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
+            const len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
+            const src_data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ src_data, left });
+            const st = try self.newTemp();
+            if (has_start) {
+                try self.clampToLen(st, start_v, len);
+            } else {
+                try self.lowerer.emit("    {s} = 0\n", .{st});
+            }
+            const rem = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ rem, len, st });
+            const del = try self.newTemp();
+            if (has_del) {
+                const tid = self.nextLabelId();
+                const t_neg = try std.fmt.allocPrint(self.allocator, "L_tsp_neg_{d}", .{tid});
+                const t_nneg = try std.fmt.allocPrint(self.allocator, "L_tsp_nneg_{d}", .{tid});
+                const t_big = try std.fmt.allocPrint(self.allocator, "L_tsp_big_{d}", .{tid});
+                const t_keep = try std.fmt.allocPrint(self.allocator, "L_tsp_keep_{d}", .{tid});
+                const t_done = try std.fmt.allocPrint(self.allocator, "L_tsp_done_{d}", .{tid});
+                try self.lowerer.reserveLabel(t_neg);
+                try self.lowerer.reserveLabel(t_nneg);
+                try self.lowerer.reserveLabel(t_big);
+                try self.lowerer.reserveLabel(t_keep);
+                try self.lowerer.reserveLabel(t_done);
+                const isneg = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ isneg, del_v });
+                try self.lowerer.emitBranchTo(isneg, t_neg, t_nneg);
+                try self.lowerer.emitLabel(t_neg);
+                try self.lowerer.emit("    {s} = 0\n", .{del});
+                try self.lowerer.emitJumpTo(t_done);
+                try self.lowerer.emitLabel(t_nneg);
+                const over = try self.newTemp();
+                try self.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ over, del_v, rem });
+                try self.lowerer.emitBranchTo(over, t_big, t_keep);
+                try self.lowerer.emitLabel(t_big);
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ del, rem });
+                try self.lowerer.emitJumpTo(t_done);
+                try self.lowerer.emitLabel(t_keep);
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ del, del_v });
+                try self.lowerer.emitJumpTo(t_done);
+                try self.lowerer.emitLabel(t_done);
+            } else {
+                // Omitted count removes to the end (no-arg `toSpliced()`
+                // copies everything: start defaults to 0 and `rem` is the
+                // full length, so `del = rem` would empty it; match the
+                // spec shape and let the zero-arg case yield an empty
+                // array like `splice` does).
+                if (has_start) {
+                    try self.lowerer.emit("    {s} = add {s}, 0\n", .{ del, rem });
+                } else {
+                    try self.lowerer.emit("    {s} = 0\n", .{del});
+                }
+            }
+            const nins: u64 = @intCast(items.items.len);
+            const kept = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ kept, len, del });
+            const nlen = try self.newTemp();
+            if (nins == 0) {
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ nlen, kept });
+            } else {
+                try self.lowerer.emit("    {s} = add {s}, {d}\n", .{ nlen, kept, nins });
+            }
+            const dest = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+            const nbytes = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nbytes, nlen, esz });
+            const dst_data = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc {s}\n", .{ dst_data, nbytes });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, dst_data });
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, nlen });
+            try self.retagTemp(dest, arr_type);
+            const suf = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ suf, st, del });
+            const pid = self.nextLabelId();
+            const p_top = try std.fmt.allocPrint(self.allocator, "L_tsp_ptop_{d}", .{pid});
+            const p_body = try std.fmt.allocPrint(self.allocator, "L_tsp_pbody_{d}", .{pid});
+            const p_end = try std.fmt.allocPrint(self.allocator, "L_tsp_pend_{d}", .{pid});
+            const s_top = try std.fmt.allocPrint(self.allocator, "L_tsp_stop_{d}", .{pid});
+            const s_body = try std.fmt.allocPrint(self.allocator, "L_tsp_sbody_{d}", .{pid});
+            const s_end = try std.fmt.allocPrint(self.allocator, "L_tsp_send_{d}", .{pid});
+            try self.lowerer.reserveLabel(p_top);
+            try self.lowerer.reserveLabel(p_body);
+            try self.lowerer.reserveLabel(p_end);
+            try self.lowerer.reserveLabel(s_top);
+            try self.lowerer.reserveLabel(s_body);
+            try self.lowerer.reserveLabel(s_end);
+            // Prefix `[0, st)`.
+            const pi = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{pi});
+            try self.lowerer.emitLabel(p_top);
+            const pc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ pc, pi, st });
+            try self.lowerer.emitBranchTo(pc, p_body, p_end);
+            try self.lowerer.emitLabel(p_body);
+            const po = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ po, pi, esz });
+            const pa1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ pa1, src_data, po });
+            const pv = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ pv, pa1, sa_elem });
+            const pa2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ pa2, dst_data, po });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ pa2, pv, sa_elem });
+            const pn = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ pn, pi });
+            try self.lowerer.emit("    {s} = {s}\n", .{ pi, pn });
+            self.scope_manager.markConsumed(pn);
+            try self.lowerer.emitJumpTo(p_top);
+            try self.lowerer.emitLabel(p_end);
+            // Inserted items at `[st, st+nins)`.
+            for (items.items, 0..) |it, k| {
+                const ioff = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {d}\n", .{ ioff, st, k });
+                const iby = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ iby, ioff, esz });
+                const iaddr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ iaddr, dst_data, iby });
+                try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ iaddr, it, sa_elem });
+            }
+            // Suffix `[suf, len)` shifted by `nins - del`.
+            const shift = try self.newTemp();
+            if (nins == 0) {
+                try self.lowerer.emit("    {s} = sub 0, {s}\n", .{ shift, del });
+            } else {
+                const dv = try self.newTemp();
+                try self.lowerer.emit("    {s} = sub {d}, {s}\n", .{ dv, nins, del });
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ shift, dv });
+            }
+            const sj = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ sj, suf });
+            try self.lowerer.emitLabel(s_top);
+            const sc2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ sc2, sj, len });
+            try self.lowerer.emitBranchTo(sc2, s_body, s_end);
+            try self.lowerer.emitLabel(s_body);
+            const soff = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ soff, sj, esz });
+            const saddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ saddr, src_data, soff });
+            const sval = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ sval, saddr, sa_elem });
+            const dj = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ dj, sj, shift });
+            const doff = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ doff, dj, esz });
+            const daddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, dst_data, doff });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ daddr, sval, sa_elem });
+            const sn = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ sn, sj });
+            try self.lowerer.emit("    {s} = {s}\n", .{ sj, sn });
+            self.scope_manager.markConsumed(sn);
+            try self.lowerer.emitJumpTo(s_top);
+            try self.lowerer.emitLabel(s_end);
+            self.scope_manager.markConsumed(po);
+            self.scope_manager.markConsumed(pa1);
+            self.scope_manager.markConsumed(pv);
+            self.scope_manager.markConsumed(pa2);
+            self.scope_manager.markConsumed(pc);
+            self.scope_manager.markConsumed(soff);
+            self.scope_manager.markConsumed(saddr);
+            self.scope_manager.markConsumed(sval);
+            self.scope_manager.markConsumed(dj);
+            self.scope_manager.markConsumed(doff);
+            self.scope_manager.markConsumed(daddr);
+            self.scope_manager.markConsumed(sc2);
+            return dest;
+        }
+        if (std.mem.eql(u8, member_name, "at")) {
+            // `arr.at(i)`: negative counts from the end; out-of-bounds
+            // yields 0 (subset undefined-mapping, like checked reads).
+            try self.expect(.l_paren);
+            const idx = try self.parseExpression();
+            try self.expect(.r_paren);
+            var at_elem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                at_elem = elementTypeOf(av.type_name);
+            }
+            var at_sz: u32 = 4;
+            var at_al: u32 = 4;
+            try getTypeSizeAndAlign(at_elem, &at_sz, &at_al);
+            const at_sa = saTypeOf(at_elem);
+            const at_neg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ at_neg, idx });
+            const at_id = self.nextLabelId();
+            const at_n = try std.fmt.allocPrint(self.allocator, "L_atn_{d}", .{at_id});
+            const at_p = try std.fmt.allocPrint(self.allocator, "L_atp_{d}", .{at_id});
+            const at_e = try std.fmt.allocPrint(self.allocator, "L_ate_{d}", .{at_id});
+            try self.lowerer.reserveLabel(at_n);
+            try self.lowerer.reserveLabel(at_p);
+            try self.lowerer.reserveLabel(at_e);
+            const at_slot = try self.joinSlot();
+            try self.lowerer.emitBranchTo(at_neg, at_n, at_p);
+            try self.lowerer.emitLabel(at_n);
+            // Negative: adj = len + idx (may stay negative -> OOB -> 0).
+            // len is u64; use i64-domain arithmetic via fresh temps is
+            // overkill: lengths fit i32, so fold through i32 temps.
+            const at_l32 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as i32\n", .{ at_l32, left });
+            const at_a1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ at_a1, at_l32, idx });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ at_slot, at_a1 });
+            try self.lowerer.emitJumpTo(at_e);
+            try self.lowerer.emitLabel(at_p);
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ at_slot, idx });
+            try self.lowerer.emitJumpTo(at_e);
+            try self.lowerer.emitLabel(at_e);
+            const at_i = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ at_i, at_slot });
+            const at_v = try self.newTemp();
+            try self.emitCheckedIndexLoad(at_v, left, at_i, at_sz, at_sa);
+            self.scope_manager.markConsumed(at_l32);
+            if (self.scope_manager.lookup(at_v)) |atv| {
+                self.allocator.free(atv.type_name);
+                atv.type_name = try self.allocator.dupe(u8, at_elem);
+            }
+            return at_v;
+        }
+        if (std.mem.eql(u8, member_name, "lastIndexOf")) {
+            // Mirror indexOf scanning downward. `from` defaults to len-1;
+            // negative counts from the end; still-negative yields -1 (the
+            // loop guard skips immediately).
+            try self.expect(.l_paren);
+            const needle = try self.parseExpression();
+            var from: ?[]const u8 = null;
+            if (try self.accept(.comma)) {
+                from = try self.parseExpression();
+            }
+            try self.expect(.r_paren);
+            var li_elem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |av| {
+                li_elem = elementTypeOf(av.type_name);
+            }
+            var li_sz: u32 = 4;
+            var li_al: u32 = 4;
+            try getTypeSizeAndAlign(li_elem, &li_sz, &li_al);
+            const li_sa = saTypeOf(li_elem);
+            const li_len = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ li_len, left });
+            const li_data = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ li_data, left });
+            const li_out = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{li_out});
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ li_out, li_out });
+            const li_start = try self.newTemp();
+            if (from) |f| {
+                const fneg = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ fneg, f });
+                const fid = self.nextLabelId();
+                const fneg_l = try std.fmt.allocPrint(self.allocator, "L_li_neg_{d}", .{fid});
+                const fpos_l = try std.fmt.allocPrint(self.allocator, "L_li_pos_{d}", .{fid});
+                const fend_l = try std.fmt.allocPrint(self.allocator, "L_li_end_{d}", .{fid});
+                try self.lowerer.reserveLabel(fneg_l);
+                try self.lowerer.reserveLabel(fpos_l);
+                try self.lowerer.reserveLabel(fend_l);
+                const fslot = try self.joinSlot();
+                try self.lowerer.emitBranchTo(fneg, fneg_l, fpos_l);
+                try self.lowerer.emitLabel(fneg_l);
+                const fadj = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ fadj, li_len, f });
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ fslot, fadj });
+                try self.lowerer.emitJumpTo(fend_l);
+                try self.lowerer.emitLabel(fpos_l);
+                const fbig = try self.newTemp();
+                try self.lowerer.emit("    {s} = sge {s}, {s}\n", .{ fbig, f, li_len });
+                const fb2 = self.nextLabelId();
+                const fb_big = try std.fmt.allocPrint(self.allocator, "L_li_big_{d}", .{fb2});
+                const fb_ok = try std.fmt.allocPrint(self.allocator, "L_li_ok_{d}", .{fb2});
+                try self.lowerer.reserveLabel(fb_big);
+                try self.lowerer.reserveLabel(fb_ok);
+                try self.lowerer.emitBranchTo(fbig, fb_big, fb_ok);
+                try self.lowerer.emitLabel(fb_big);
+                const fcap = try self.newTemp();
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ fcap, li_len });
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ fslot, fcap });
+                try self.lowerer.emitJumpTo(fend_l);
+                try self.lowerer.emitLabel(fb_ok);
+                try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ fslot, f });
+                try self.lowerer.emitJumpTo(fend_l);
+                try self.lowerer.emitLabel(fend_l);
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ li_start, fslot });
+            } else {
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ li_start, li_len });
+            }
+            const lid = self.nextLabelId();
+            const l_top = try std.fmt.allocPrint(self.allocator, "L_lidx_top_{d}", .{lid});
+            const l_body = try std.fmt.allocPrint(self.allocator, "L_lidx_body_{d}", .{lid});
+            const l_next = try std.fmt.allocPrint(self.allocator, "L_lidx_next_{d}", .{lid});
+            const l_found = try std.fmt.allocPrint(self.allocator, "L_lidx_found_{d}", .{lid});
+            const l_end = try std.fmt.allocPrint(self.allocator, "L_lidx_end_{d}", .{lid});
+            try self.lowerer.reserveLabel(l_top);
+            try self.lowerer.reserveLabel(l_body);
+            try self.lowerer.reserveLabel(l_next);
+            try self.lowerer.reserveLabel(l_found);
+            try self.lowerer.reserveLabel(l_end);
+            // Empty array: len-1 underflows u64, so skip straight to
+            // the end (out stays -1).
+            const li_empty = try self.newTemp();
+            try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ li_empty, li_len });
+            const li_eid = self.nextLabelId();
+            const li_eskip = try std.fmt.allocPrint(self.allocator, "L_lidx_eskip_{d}", .{li_eid});
+            try self.lowerer.reserveLabel(li_eskip);
+            try self.lowerer.emitBranchTo(li_empty, l_end, li_eskip);
+            try self.lowerer.emitLabel(li_eskip);
+            const li = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ li, li_start });
+            try self.lowerer.emitLabel(l_top);
+            const lc = try self.newTemp();
+            try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ lc, li });
+            try self.lowerer.emitBranchTo(lc, l_body, l_end);
+            try self.lowerer.emitLabel(l_body);
+            const loff = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ loff, li, li_sz });
+            const laddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ laddr, li_data, loff });
+            const lcur = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ lcur, laddr, li_sa });
+            const leq = try self.newTemp();
+            try self.lowerer.emit("    {s} = eq {s}, {s}\n", .{ leq, lcur, needle });
+            try self.lowerer.emitBranchTo(leq, l_found, l_next);
+            try self.lowerer.emitLabel(l_found);
+            const lhit = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ lhit, li });
+            try self.emitMove(li_out, lhit);
+            try self.lowerer.emitJumpTo(l_end);
+            try self.lowerer.emitLabel(l_next);
+            const ldec = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ ldec, li });
+            try self.lowerer.emit("    !{s}\n", .{li});
+            try self.lowerer.emit("    {s} = {s}\n", .{ li, ldec });
+            self.scope_manager.markConsumed(ldec);
+            try self.lowerer.emitJumpTo(l_top);
+            try self.lowerer.emitLabel(l_end);
+            self.scope_manager.markConsumed(loff);
+            self.scope_manager.markConsumed(laddr);
+            self.scope_manager.markConsumed(lcur);
+            self.scope_manager.markConsumed(leq);
+            return li_out;
         }
         if (std.mem.eql(u8, member_name, "join")) {
             // `arr.join(sep)`: concatenate string elements with separator.
@@ -11195,6 +12722,54 @@ pub const Parser = struct {
         return .{ l_true, l_false, l_end };
     }
 
+    /// Clamp an index register into `[0, len]` (JS `copyWithin`/negative-
+    /// index semantics): `x < 0` folds to `max(len + x, 0)`, else
+    /// `min(x, len)`. `len` is only copied (`add x, 0`), never consumed.
+    /// `out` is defined once per arm (the `at()` join precedent).
+    fn clampToLen(self: *Parser, out: []const u8, x: []const u8, len: []const u8) anyerror!void {
+        const id = self.nextLabelId();
+        const l_neg = try std.fmt.allocPrint(self.allocator, "L_cl_neg_{d}", .{id});
+        const l_pos = try std.fmt.allocPrint(self.allocator, "L_cl_pos_{d}", .{id});
+        const l_keep = try std.fmt.allocPrint(self.allocator, "L_cl_keep_{d}", .{id});
+        const l_zero = try std.fmt.allocPrint(self.allocator, "L_cl_zero_{d}", .{id});
+        const l_keepx = try std.fmt.allocPrint(self.allocator, "L_cl_keepx_{d}", .{id});
+        const l_cap = try std.fmt.allocPrint(self.allocator, "L_cl_cap_{d}", .{id});
+        const l_done = try std.fmt.allocPrint(self.allocator, "L_cl_done_{d}", .{id});
+        try self.lowerer.reserveLabel(l_neg);
+        try self.lowerer.reserveLabel(l_pos);
+        try self.lowerer.reserveLabel(l_keep);
+        try self.lowerer.reserveLabel(l_zero);
+        try self.lowerer.reserveLabel(l_keepx);
+        try self.lowerer.reserveLabel(l_cap);
+        try self.lowerer.reserveLabel(l_done);
+        const is_neg = try self.newTemp();
+        try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ is_neg, x });
+        try self.lowerer.emitBranchTo(is_neg, l_neg, l_pos);
+        try self.lowerer.emitLabel(l_neg);
+        const folded = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ folded, len, x });
+        const nonneg = try self.newTemp();
+        try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ nonneg, folded });
+        try self.lowerer.emitBranchTo(nonneg, l_keep, l_zero);
+        try self.lowerer.emitLabel(l_keep);
+        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ out, folded });
+        try self.lowerer.emitJumpTo(l_done);
+        try self.lowerer.emitLabel(l_zero);
+        try self.lowerer.emit("    {s} = 0\n", .{out});
+        try self.lowerer.emitJumpTo(l_done);
+        try self.lowerer.emitLabel(l_pos);
+        const fits = try self.newTemp();
+        try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ fits, x, len });
+        try self.lowerer.emitBranchTo(fits, l_keepx, l_cap);
+        try self.lowerer.emitLabel(l_keepx);
+        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ out, x });
+        try self.lowerer.emitJumpTo(l_done);
+        try self.lowerer.emitLabel(l_cap);
+        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ out, len });
+        try self.lowerer.emitJumpTo(l_done);
+        try self.lowerer.emitLabel(l_done);
+    }
+
     /// `a?.field` (cursor on `.`): null-guarded property access. A null
     /// receiver stores zero without touching memory; otherwise the same
     /// load the plain `.` path emits runs. Arms join through a slot.
@@ -13104,6 +14679,11 @@ pub const Parser = struct {
                     }
                     try self.expect(.r_paren);
                     return try self.lowerStringConv(left);
+                } else if (self.isStringOperand(left)) {
+                    // New string methods (indexOf/trim/at/...): existing
+                    // charAt/charCodeAt/slice/toString/length branches above
+                    // keep priority; anything unhandled there lands here.
+                    return try self.lowerStringMethodCall(left, member_name);
                 } else if (self.isArrayVar(left)) {
                     return try self.lowerArrayMethodCall(left, member_name);
                 } else if (self.isArrowParamName(left) and self.isArrayMethodName(member_name)) {
