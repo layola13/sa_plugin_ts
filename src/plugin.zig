@@ -260,6 +260,16 @@ fn lowerSource(
         return err;
     };
 
+    // Surface collected diagnostics: `Parser.errors` is appended along
+    // error-recovery paths (unknown methods, desyncs) that still emit
+    // partial output. Without this they are silent fragments (exit 0 with
+    // a broken `.sai`); the verify scripts bucket on the `error:LINE:COL:`
+    // channel, so print in that exact shape. Execution continues: the
+    // output may still assemble when the error was recovered.
+    for (p.errors.items) |e| {
+        try stderr.print("error:{d}:{d}: {s}\n", .{ e.line, e.col, e.message });
+    }
+
     const sa_code = low.toOwnedSlice() catch |err| {
         plugin_api.emitLog(ctx, .err, "failed to emit SA-ASM output");
         try stderr.print("error[SA-TS]: failed to emit output: {}\n", .{err});

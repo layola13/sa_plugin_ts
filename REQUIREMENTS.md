@@ -278,3 +278,23 @@ released, and a release is only emitted where the definition dominates it
 others, any other block dominates only itself). Releasing a temporary defined in
 one arm of a branch, at the merge point, fails — that is the same missing-phi
 problem above, not a separate bug.
+
+### Move-after-read in loops (host-side issue, 2026-09-29)
+
+`x = y` moves `y`. When a loop body moves a loop-carried scalar into another
+variable and then reads the source again (`currentIdx = nextIdx` followed by
+`nextIdx += stepSize`, as in Talgo `jump_search`), no plugin-side lowering
+passes the verifier. Exhausted in order, each verified against `sa check`:
+
+- scalar copy (`t = add x, 0`, `sub x, 0`, independent-zero `add x, z`);
+- copy through a `@ts_copy_i32` call boundary (calls consume i32 params too);
+- move-then-move-back and move-forward peepholes (rerouting still lands on
+  a move-transitive alias).
+
+The verifier threads moves through **all** of these back to the source, so
+the later read is `UseAfterMove` in every shape. TS assignment semantics need
+the source to stay live while SA value-ownership forbids two live names for
+one value; only a true (opaque) copy satisfies both. Request for the `sci`
+host: recognise an explicit copy form (or document which emitted shape, if
+any, is opaque to move threading) so loop-carried `x = y; ... y ...` lowers.
+Until then such files fail `sa check` with `UseAfterMove` (loud, not silent).

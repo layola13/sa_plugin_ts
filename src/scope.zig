@@ -46,6 +46,12 @@ pub const Variable = struct {
     /// only itself. Releasing a register defined in a sibling branch, at a
     /// merge point, fails with "register is not declared in the current scope".
     def_block: u32 = 0,
+    /// Compiler temporary (`newTemp`): `!temp` inside a block that already
+    /// read it trips InvalidOperand in the backend, while `!named-var` in
+    /// the same position verifies (params do it on exit). Rebinds therefore
+    /// only kill the old value for named variables; temps rely on the
+    /// function-exit walk.
+    is_temp: bool = false,
     /// The variable was declared with an array type (`T[]`) or initialized
     /// with an array literal / `new Array(n)` / array-returning call, so it
     /// holds a `{ptr, len}` slice header. Scalar `number` and `number[]`
