@@ -48,12 +48,22 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 ## 5. Additional Features Implemented
 - [x] Comparison operators: `==`, `!=`, `<`, `>`, `<=`, `>=`
 - [x] Logical operators: `&&`, `||`, `!`
-- [x] Arithmetic: `%`, unary `-`
+- [x] Arithmetic: `%`, unary `-`, `**` (integer pow loop), prefix `++i`/`--i`
+- [x] Compound assignment: `+= -= *= /= %=` and `<<= >>= >>>= &= |= ^=` on
+  scalars, indexed elements and `for` increment clauses
 - [x] Control flow: if/else, while, for (C-style), for-of, switch/case/default, break/continue, return
-- [x] Arrays: literal `[1,2,3]`, indexing `arr[i]`, assignment `arr[i] = val` — including the annotated form `let arr: i32[] = [...]`
-- [x] Enum definitions with auto-numbered variants
+- [x] Arrays: literal `[1,2,3]`, indexing `arr[i]`, assignment `arr[i] = val`,
+  `arr[i]++`/`arr[i]--` with write-back, 2D `mat[i][j]` reads/stores,
+  `sort()`/`sort(cmp)` (insertion sort), `unshift` (push-then-rotate),
+  `concat`, `forEach`/`some`/`every`/`find`/`findIndex`/`includes`,
+  `structuredClone` (recursive deep copy) — including the annotated form
+  `let arr: i32[] = [...]`
+- [x] Enum definitions with auto-numbered variants; `Enum.Member` folds to
+  its ordinal as a value
 - [x] Type aliases
-- [x] Generic type parameters (Array<T>, Map<K,V>, Box<T>)
+- [x] Generic type parameters (Array<T>, Map<K,V>, Box<T>); erased `<T>`
+  prefixes on functions and arrows; tuple annotations (`[A, B][][]`) erase
+  to slice shapes
 - [x] Arrow function closures with parameters and static defunctionalization
   (`(x: T) =>`, `(a, b) =>`, bare `x =>`, block and expression bodies;
   out-of-line callbacks with per-arrow context registers; `let f = arrow`
@@ -70,6 +80,29 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
   existing forms (`/` on integers stays `div`, `%` stays `srem`). Unary `-` on
   a float lowers to `fneg`. There is no `frem` in SA-ASM, so `%` with a float
   side is refused loudly with a located diagnostic instead of emitting `srem`)
+- [x] `Math.abs` (branch), `Math.pow` (loop), `Math.ceil/floor/round/trunc`
+  (integer identity; float via `fptosi`/`sitofp` with sign adjust),
+  `Math.log10` (digit loop), `Math.random` (deterministic LCG, documented),
+  `Math.max/min(...arr)` spread reduction, `Math.PI/E` folds
+- [x] Destructuring: `[a, b] = [b, a]` swaps (incl. indexed and 2D targets),
+  `for (const [a, b] of mat)`, `([a, b]) =>` arrow params (flat i32 pairs)
+- [x] Optional index `a?.[i]` (null-guarded checked load, Bun/esbuild
+  shape) and the `?.`-digit rule (`a?.5:b` lexes as ternary plus a
+  leading-dot float literal, also Bun's rule)
+- [x] Optional call `f?.(args)` on callable names/aliases (direct dispatch;
+  runtime values refuse loudly — functions are not first-class values, same
+  as plain `cb(v)` on parameters)
+- [x] Spread: array literals (`[...a, x, ...b]` via length-sum plus copy
+  loops, width-checked), calls (`f(...arr)` expands to arity, missing pads
+  0, extras drop), rest parameters (`...rest` packs trailing args, empty
+  when none)
+- [x] Declarative lib surface tables (`LibMethod`: name/sample/notes per
+  Array/Map/Set/String/Math/Number); `isArrayMethodName` reads the array
+  table, and a consistency test lowers every sample (drift guard)
+- [x] `export default` and `export { a, b }` re-export lists (no codegen);
+  `export enum` / `export type`
+- [x] Postfix `++`/`--` obeys the JS no-LineTerminator rule (a `++` on the
+  next line starts a new statement)
 - [x] Double-quoted string literals bound to variables (`const s = "bob"`
   materialises the slice; the raw `"..."` is not an SA operand)
 - [x] `s.length` property (aliased to the builtin string layout's `len`
@@ -84,12 +117,13 @@ Implement a high-performance, AOT (Ahead-of-Time) lowering plugin for a strict s
 - [x] Standard plugin_api.zig ABI compliance
 - [x] Parser error recovery (collects multiple errors, skips to sync points)
 - [x] SIMD-optimized whitespace/comment scanning
-- [x] Benchmark suite (40 tests total, including a runtime table whose 23 expectations are verified against Node: lower, `sa build`, run, assert exit status)
+- [x] Benchmark suite (72 tests total, including a runtime table whose 23 expectations are verified against Node: lower, `sa build`, run, assert exit status)
 - [x] SA-ASM validity regression tests, plus an end-to-end check that runs `sa build` on lowered output
-- [x] TypeScript demo corpus: 260 demos under `demos/`, verified by
+- [x] TypeScript demo corpus: 279 demos under `demos/`, verified by
       `tools/verify_demos.sh` (each demo is lowered and then assembled with the
-      real `sa build`). Currently 262 verified against Node, 0 refused, 0 fail
-      (including `263_async_await` and `264_async_chain`).
+      real `sa build`). Currently 279 verified against Node, 0 refused, 0 fail
+      (including `263_async_await` and `264_async_chain`; `265_prefix_inc`
+      through `280_spread_call_rest` cover the constructs below).
 - [x] `new` expressions (minimal): `new Map()` lowers to the real
   `sa_std/btree_map.sa` backend (`call @sa_btree_map_new()`); `new Array(n)` /
   `new Array<T>(n)` with an integer-literal length lowers to the 16-byte
@@ -188,9 +222,74 @@ mistake is not repeated.
   types, `new Map` with arguments, non-literal `new Array` lengths) are still
   refused loudly with a located diagnostic instead of miscompiled.
 
+### TheAlgorithms/TypeScript sweep (2026-09-29)
+
+Cloned `https://github.com/TheAlgorithms/TypeScript` (207 files) and ran
+`sa ts lower` over every file. Algorithm sources (`src`, excluding `test/`
+dirs, `*.test.ts` jest harnesses and `jest.config.ts`): **98/105 lower clean
+(93.3%)**. Test/config files: 30/102 clean — expected, they need the jest
+runtime (`describe`/`it`/`expect`), which is out of scope by design.
+
+Remaining source gaps (each verified as the first diagnostic; honest buckets,
+no silent miscompiles):
+
+- **Regex literals** (`ciphers/xor_cipher.ts`): `str.replace(/./g, cb)` has no
+  lowering; refused loudly. (`String.fromCharCode` likewise unmapped.)
+- **Broken upstream imports** (`data_structures/set/*.ts`): `./map` does not
+  exist upstream; refused loudly with the path.
+- **`lcs.ts`**: `string[]` of `s[i]` bytes + `unshift` + `join('')`. JS strings
+  are 1-char-string sequences; the subset indexes bytes (`u8`). Storing bytes
+  as slices would miscompile, so `unshift` of a non-string into `string[]`
+  refuses loudly by design.
+- **`prim.ts`** (lowers clean; runtime needs upstream R1 fixed):
+  call-site monomorphization-lite binds `T := Edge` from
+  `new PriorityQueue((e: Edge) => ...)` (closure signatures recorded per
+  callback, unified against the ctor's `fn`-param types, propagated through
+  `let` binds, substituted into bare-variable method returns). Multi-variable
+  or ambiguous bindings leave the instance generic (loud downstream).
+- **Generators** (`fibonacci.ts`, `primes.ts`, `ugly_numbers.ts`): `function*`
+  / `yield` lowers to no SA-ASM shape; refused loudly.
+
+### Upstream SA-backend issues found via differential work (with repros)
+
+Both reproduce on hand-written inputs independent of the plugin; `sa check`
+accepts the emitted SA-ASM in each case (`Lowerer` output is valid):
+
+- **R1 — `@import` + 2+ vtables mistypes `call_indirect` as void**
+  (`fn13.ts`: a class with two `fn`-field closures plus one `Array(n).fill`
+  pulling `sa_std/core/mem.sa`). Dropped from `void` to build failure at the
+  LLVM backend only. Workaround in-plugin: array zeroing and `fill` now lower
+  to inline element loops, so algorithmic sources emit zero `@import`s in the
+  common case.
+- **R2 — indirect-call arity with no same-arity vtable mistypes as void**
+  (heap `PriorityQueue.keys_index` 1-arg calls with only 2-arg closures
+  decayed in-module). Full `heap.ts` + `dijkstra.ts` lower clean but the linked
+  module does not assemble; minimal single-class cases (`fn1`–`fn12`) all
+  assemble and run byte-identical to Node.
+- **Runtime-differential evidence**: `bellmanFord` harness exits 20
+  (`5140 & 0xFF`, Node-agreed), `kruskal` harness exits 3 (MST weight,
+  Node-agreed), `dijkstra` harness exits 20 (Node-agreed, with and without
+  `--dce full`), `MinHeap` insert/extract exits 3 (Node-agreed). `prim`
+  lowers clean (monomorphization verified via demo 277); asymmetric-graph
+  harness exits 5 (Node-agreed directed semantics).
+- **Known deviation — no virtual dispatch**: overridden methods dispatch
+  statically, so subclass state synced inside overrides goes stale when base
+  methods trigger them (`Heap_sinkDown` calls `@Heap_swap`, never
+  `@PriorityQueue_swap`, leaving `keys` stale). `prim` on the symmetric
+  graph yields 5 where Node (Kruskal ground truth) yields 3; heaps without
+  overrides (`MinHeap`) verify exactly. Virtual dispatch is future work.
+
+### Known gaps (with repros)
+- **Float arms through join slots**: `c ? 0.5 : 7` (and `c?.5:7`, same
+  shape) loses float-ness — the merge loads by the true arm's type and a
+  literal arm carries none, so downstream integer ops read float bits.
+  Pre-existing (plain ternaries fail identically); demo 281 asserts integer
+  outcomes only. Fixing needs two-phase merge typing (both arms known
+  before either store), which the branch emission order does not allow.
+
 ### Found by the demo corpus, still open
 
-Verified counts from `tools/verify_demos.sh`: 260 assemble and match Node, 0 are
+Verified counts from `tools/verify_demos.sh`: 279 assemble and match Node, 0 are
 refused with a located diagnostic, and **0 fail**. Every demo now lands in a good
 bucket, so no unresolved defect is left in the corpus.
 

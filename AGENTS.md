@@ -14,7 +14,7 @@ This file covers the entire `sa_plugin_ts` plugin project.
 
 ### Build
 - `zig build` produces `libsa_plugin_ts.so`. Use the default (Debug) build: raw optimized builds (`-Doptimize=ReleaseSmall/Safe/Fast` without `SA_PLUGIN_DEV=1`) still crash at load with a host `lock` segfault; this reproduces on the pristine tree without any CLI changes, so it is a pre-existing defect, not a regression from the `test`/`build-exe` work. `build.zig` mirrors sa_plugin_sla's compilation plumbing verbatim: `effectiveOptimizeForDevInstall` (ReleaseFast + `SA_PLUGIN_DEV=1` forces Debug, so `sa plugin install --dev` installs the tested Debug artifact), `test-filter` build option, `linkHostSystemLibs` (ws2_32/iphlpapi on Windows) on lib + tests, and `sap.json` installed to `lib/sap.json`.
-- `zig build test` runs all 40 tests (all pass; the runtime table holds 23 node-verified expectations).
+- `zig build test` runs all 72 tests (all pass; the runtime table holds 23 node-verified expectations).
 - `tools/verify_e2e.sh` lowers a corpus of TypeScript and runs `sa build` on the
   result. Run this after any change to emission: the Zig tests only assert on
   substrings and cannot catch an instruction the assembler rejects.
@@ -71,7 +71,7 @@ to assemble.
   afterwards, and `Variable.is_released` keeps the walks idempotent.
 
 ### Source Layout
-- `src/plugin.zig` — Plugin entry, descriptor, C-ABI exports, CLI handler (`lower`/`check`/`build`/`build-exe`/`test`/`init`/`skills`/`help`), 39 tests (38 substring/structural + 1 runtime table with 23 node-verified expectations: lower in-process, `sa build`, run, assert exit status). `[file]` is optional with `sa.mod` workspace fallback (`-p name`/`-p=name`/`--package=name`); `test`/`build-exe` lower to a temp `.sai` and delegate to `sa` (`sa test` / `sa build-exe <tmp.sai>`, extra args passed straight through, `--jobs auto` appended) via `resolveSaExecutable` (SA_EXE > SCI_ROOT dev layout > host dir > PATH), like `sa_plugin_sla`; needs `link_libc` (see `build.zig`) for `Child.spawn` env inheritance. `init` scaffolds `sa.mod` + `src/main.ts` + `.gitignore` and never overwrites.
+- `src/plugin.zig` — Plugin entry, descriptor, C-ABI exports, CLI handler (`lower`/`check`/`build`/`build-exe`/`test`/`init`/`skills`/`help`), 72 tests (71 substring/structural + 1 runtime table with 23 node-verified expectations: lower in-process, `sa build`, run, assert exit status). `[file]` is optional with `sa.mod` workspace fallback (`-p name`/`-p=name`/`--package=name`); `test`/`build-exe` lower to a temp `.sai` and delegate to `sa` (`sa test` / `sa build-exe <tmp.sai>`, extra args passed straight through, `--jobs auto` appended) via `resolveSaExecutable` (SA_EXE > SCI_ROOT dev layout > host dir > PATH), like `sa_plugin_sla`; needs `link_libc` (see `build.zig`) for `Child.spawn` env inheritance. `init` scaffolds `sa.mod` + `src/main.ts` + `.gitignore` and never overwrites.
 - `src/lexer.zig` — 30+ keywords, zero-copy scanning, SIMD-optimized whitespace skip, line:col tracking, template literal chunk scanning.
 - `src/parser.zig` — Pratt expression parser, LayoutTable, ScopeManager, stdlib mapping (static + dynamic), arrow closures with parameters, generic type parameters, for-of iteration, template literals, module import/export (WASM arity-matched externs, WIT refusal), error recovery.
 - `src/lowerer.zig` — SA-ASM emitter. Records a CFG (`edges`, filled by

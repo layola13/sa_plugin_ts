@@ -66,8 +66,12 @@ pub const Token = struct {
         minus_minus,
         minus_equal,
         star,
+        star_star,
+        star_equal,
         slash,
+        slash_equal,
         percent,
+        percent_equal,
         amp_amp,
         pipe_pipe,
         pipe,
@@ -142,6 +146,16 @@ pub const Lexer = struct {
                     self.pos += 2;
                     self.col += 2;
                     return .{ .tag = .ellipsis, .start = start, .len = 3, .line = start_line, .col = start_col };
+                }
+                // Leading-dot float (`.5`): Bun/esbuild rule, also what makes
+                // `a?.5:b` lex as ternary-`?` plus a number (the `?.` chain
+                // probe only accepts identifier/`(`/`[` after the dot).
+                if (self.pos < self.source.len and std.ascii.isDigit(self.source[self.pos])) {
+                    while (self.pos < self.source.len and std.ascii.isDigit(self.source[self.pos])) {
+                        self.pos += 1;
+                        self.col += 1;
+                    }
+                    return .{ .tag = .number, .start = start, .len = self.pos - start, .line = start_line, .col = start_col };
                 }
                 return .{ .tag = .dot, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
@@ -220,9 +234,35 @@ pub const Lexer = struct {
                 }
                 return .{ .tag = .minus, .start = start, .len = 1, .line = start_line, .col = start_col };
             },
-            '*' => return .{ .tag = .star, .start = start, .len = 1, .line = start_line, .col = start_col },
-            '/' => return .{ .tag = .slash, .start = start, .len = 1, .line = start_line, .col = start_col },
-            '%' => return .{ .tag = .percent, .start = start, .len = 1, .line = start_line, .col = start_col },
+            '*' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '*') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .star_star, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .star_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                return .{ .tag = .star, .start = start, .len = 1, .line = start_line, .col = start_col };
+            },
+            '/' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .slash_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                return .{ .tag = .slash, .start = start, .len = 1, .line = start_line, .col = start_col };
+            },
+            '%' => {
+                if (self.pos < self.source.len and self.source[self.pos] == '=') {
+                    self.pos += 1;
+                    self.col += 1;
+                    return .{ .tag = .percent_equal, .start = start, .len = 2, .line = start_line, .col = start_col };
+                }
+                return .{ .tag = .percent, .start = start, .len = 1, .line = start_line, .col = start_col };
+            },
             '<' => {
                 if (self.pos < self.source.len and self.source[self.pos] == '=') {
                     self.pos += 1;

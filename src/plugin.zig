@@ -1701,7 +1701,7 @@ test "sa_plugin_ts lowers new Array(n) to a zeroed slice" {
     try std.testing.expect(std.mem.indexOf(u8, result, "+ 8, 3 as u64") != null);
 }
 
-test "sa_plugin_ts lowers new Array(size) with a register length via mem_set" {
+test "sa_plugin_ts lowers new Array(size) with a register length via an inline zero loop" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1723,15 +1723,16 @@ test "sa_plugin_ts lowers new Array(size) with a register length via mem_set" {
     try p.parse();
 
     const dyn = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
-    // Dynamic bytes + register-sized alloc + mem_set zeroing ...
+    // Dynamic bytes + register-sized alloc + inline zero loop (no mem_set:
+    // imports alongside vtables mistype indirect calls downstream) ...
     try std.testing.expect(std.mem.indexOf(u8, dyn, "= mul n, 4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dyn, "call @sa_mem_set(&") != null);
-    try std.testing.expect(std.mem.indexOf(u8, dyn, "sa_std/core/mem.sa") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "store ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, dyn, "sa_std/core/mem.sa") == null);
     // ... and the slice header records the register length.
     try std.testing.expect(std.mem.indexOf(u8, dyn, "+ 8, n as u64") != null);
 }
 
-test "sa_plugin_ts lowers chained Array(n).fill(1) on a construction temp" {
+test "sa_plugin_ts lowers chained Array(n).fill(1) on a construction temp with element stores" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -1753,8 +1754,9 @@ test "sa_plugin_ts lowers chained Array(n).fill(1) on a construction temp" {
     try p.parse();
 
     const chained = try std.mem.concat(arena_allocator, u8, &.{ low.header.items, low.output.items });
-    // Zeroing (construction) and refill (fill) both go through mem_set ...
-    try std.testing.expect(std.mem.indexOf(u8, chained, "call @sa_mem_set(&") != null);
+    // Zeroing (construction) and refill (fill) both lower to element stores
+    // (byte memset is wrong for multi-byte values like Infinity-folded ints).
+    try std.testing.expect(std.mem.indexOf(u8, chained, "store ") != null);
     // ... and the let binds the filled array (no dropped call).
     try std.testing.expect(std.mem.indexOf(u8, chained, "load ") != null);
 }
@@ -3618,6 +3620,61 @@ test "sa_plugin_ts lowers class ctor/new/method calls via trait downgrade" {
     try std.testing.expect(std.mem.indexOf(u8, result, "call @Point_ctor(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "call @Point_sum(") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "store this + 0, x as i32") != null);
+}
+
+test "lib surface methods all dispatch to an implementation" {
+    // Drift guard for parser.LibMethod tables: every listed method must
+    // engage an implementation branch. Any error other than UnknownMethod
+    // / UnknownField proves engagement (e.g. a type refusal); only a
+    // missing branch fails the test.
+    const allocator = std.testing.allocator;
+    const tables = [_][]const parser.Parser.LibMethod{
+        parser.Parser.array_surface,
+        parser.Parser.map_surface,
+        parser.Parser.set_surface,
+        parser.Parser.string_surface,
+        parser.Parser.math_surface,
+        parser.Parser.number_surface,
+    };
+    const prologue =
+        \\function main(): i32 {
+        \\  const a: number[] = [3, 1, 2];
+        \\  const s: string[] = ["x", "y"];
+        \\  const b: number[] = [4, 5];
+        \\  const m = new Map();
+        \\  m.set("k", 1);
+        \\  const st = new Set<number>();
+        \\  st.add(1);
+        \\  const str = "abc";
+        \\  const sep = ",";
+        \\
+    ;
+    for (tables) |table| {
+        for (table) |entry| {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const arena_allocator = arena.allocator();
+            const source = try std.fmt.allocPrint(arena_allocator,
+                "{s}  const r_{s} = {s}.{s}{s};\n  return 0;\n}}\n",
+                .{ prologue, entry.name, entry.recv, entry.name, entry.sample });
+            var low = lowerer.Lowerer.init(arena_allocator);
+            defer low.deinit();
+            var p = try parser.Parser.init(arena_allocator, source, &low);
+            defer p.deinit();
+            // Fatal path: UnknownMethod/UnknownField abort parse.
+            p.parse() catch |err| {
+                try std.testing.expect(err != error.UnknownMethod);
+                try std.testing.expect(err != error.UnknownField);
+                continue;
+            };
+            // Recovery path: statement-level recovery swallows the error
+            // and continues, so also scan the collected diagnostics.
+            for (p.errors.items) |e| {
+                try std.testing.expect(std.mem.indexOf(u8, e.message, "UnknownMethod") == null);
+                try std.testing.expect(std.mem.indexOf(u8, e.message, "UnknownField") == null);
+            }
+        }
+    }
 }
 
 test "sa_plugin_ts lowers native Map methods to sa_btree_map calls" {

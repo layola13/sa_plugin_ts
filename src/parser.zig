@@ -72,6 +72,7 @@ pub const LayoutTable = struct {
 pub const EnumDef = struct {
     name: []const u8,
     variants: std.ArrayList([]const u8),
+    values: std.ArrayList(i64),
 
     pub fn deinit(self: *EnumDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -79,6 +80,7 @@ pub const EnumDef = struct {
             allocator.free(v);
         }
         self.variants.deinit();
+        self.values.deinit();
     }
 };
 
@@ -88,6 +90,23 @@ pub const ParseError = struct {
     message: []const u8,
 };
 
+pub const CbSig = struct {
+    params: [][]const u8,
+    pub fn deinit(self: *CbSig, allocator: std.mem.Allocator) void {
+        for (self.params) |t| allocator.free(t);
+        allocator.free(self.params);
+    }
+};
+
+pub const GenericBinding = struct {
+    param: []const u8,
+    concrete: []const u8,
+    pub fn deinit(self: *GenericBinding, allocator: std.mem.Allocator) void {
+        allocator.free(self.param);
+        allocator.free(self.concrete);
+    }
+};
+
 pub const ArrowParam = struct {
     name: []const u8,
     type_name: []const u8,
@@ -95,6 +114,16 @@ pub const ArrowParam = struct {
     optional: bool = false,
     /// Duplicated source slice of a `= default` initializer (see StoredParam).
     default_src: ?[]const u8 = null,
+    /// Array-destructured param (`([a, b]) => ...` in forEach/find):
+    /// `name` is the synthesized element register; the two names below
+    /// bind to element slots 0/1 in the callback prologue.
+    destructure: ?Destructure = null,
+
+    pub const Destructure = struct {
+        first: []const u8,
+        second: []const u8,
+        has_second: bool,
+    };
 };
 
 pub const MethodParam = struct {
@@ -208,6 +237,14 @@ pub const Parser = struct {
     /// Names (`@closure_callback_N`) of captureless callbacks, callable
     /// through a bare function pointer with an empty context.
     captureless_cb: std.StringHashMap(void) = undefined,
+    /// Closure signatures for call-site generic inference (`new
+    /// PriorityQueue((e: Edge) => ...)` binds `T := Edge`): callback name
+    /// -> parameter type list (return omitted; unused for inference).
+    cb_sigs: std.StringHashMap(CbSig) = undefined,
+    /// Per-instance single type-variable bindings (`pq` -> `T=Edge`).
+    /// Only single-variable inference is attempted (covers `Heap<T>`-style
+    /// containers); anything ambiguous leaves the instance generic.
+    generic_instances: std.StringHashMap(GenericBinding) = undefined,
     /// Nesting depth of loop bodies currently being parsed.
     ///
     /// A register bound inside a loop is re-assigned each iteration, so it must
@@ -256,9 +293,26 @@ pub const Parser = struct {
     /// on an array-returning function indexes correctly instead of
     /// defaulting to `i32` (wild pointers on `c[0][0]`).
     fn_ret: std.StringHashMap([]const u8) = undefined,
+    /// Declared total parameter count per plain function name (for spread
+    /// call expansion `f(...arr)`; aliases carry arity in `arrow_aliases`).
+    fn_arity: std.StringHashMap(u8) = undefined,
+    /// Rest parameter index per plain function name (`...rest` must be
+    /// last); call sites pack trailing args into a fresh array for it.
+    fn_rest: std.StringHashMap(u8) = undefined,
+    /// Rest element type per plain function name (from `...rest: T[]`;
+    /// defaults to `i32`), so packing stores at the right width.
+    fn_rest_elem: std.StringHashMap([]const u8) = undefined,
     /// Element type stashed by the `Array<T>` generic-call prefix (see
     /// `parseInfix`); consumed once by the `Array(n)` branch below.
     array_call_elem: ?[]const u8 = null,
+    /// Start line of the previously consumed token (for the JS
+    /// [no LineTerminator here] rule on postfix `++`/`--`).
+    prev_line: u32 = 1,
+    /// Element type hint for unannotated inline-arrow params (e.g. the
+    /// `(a, b)` of `edges.sort((a, b) => a.w - b.w)` on `Edge[]`): set by
+    /// higher-order call sites whose receiver element is a struct/interface,
+    /// consulted by the arrow probe when a param lacks an annotation.
+    arrow_elem_hint: ?[]const u8 = null,
     /// Whether the innermost arrow callback declares `-> i32`. Saved and
     /// restored around each arrow body so nested arrows do not clobber it.
     arrow_value_cb: bool = false,
@@ -365,10 +419,13 @@ pub const Parser = struct {
         parser_inst.class_traits = std.StringHashMap(void).init(allocator);
         parser_inst.class_parent = std.StringHashMap([]const u8).init(allocator);
         parser_inst.method_emit_owner = std.StringHashMap([]const u8).init(allocator);
-        parser_inst.field_inits = std.StringHashMap([]const u8).init(allocator);        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);
+        parser_inst.field_inits = std.StringHashMap([]const u8).init(allocator);        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);        parser_inst.cb_sigs = std.StringHashMap(CbSig).init(allocator);        parser_inst.generic_instances = std.StringHashMap(GenericBinding).init(allocator);
         parser_inst.imported_files = std.StringHashMap(void).init(allocator);
         parser_inst.arrow_param_names = std.ArrayList([]const u8).init(allocator);
         parser_inst.fn_ret = std.StringHashMap([]const u8).init(allocator);
+        parser_inst.fn_arity = std.StringHashMap(u8).init(allocator);
+        parser_inst.fn_rest = std.StringHashMap(u8).init(allocator);
+        parser_inst.fn_rest_elem = std.StringHashMap([]const u8).init(allocator);
 
         // Pre-register `async function` signatures (name -> inner value
         // type) so forward calls still tag future-typed results: demos put
@@ -452,6 +509,22 @@ pub const Parser = struct {
             self.allocator.free(e.key_ptr.*);
         }
         self.arrow_aliases.deinit();
+        var fait = self.fn_arity.iterator();
+        while (fait.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.fn_arity.deinit();
+        var frit = self.fn_rest.iterator();
+        while (frit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.fn_rest.deinit();
+        var freit = self.fn_rest_elem.iterator();
+        while (freit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            self.allocator.free(e.value_ptr.*);
+        }
+        self.fn_rest_elem.deinit();
         var wsit = self.wasm_syms.iterator();
         while (wsit.next()) |e| {
             self.allocator.free(e.key_ptr.*);
@@ -476,9 +549,22 @@ pub const Parser = struct {
             e.deinit(self.allocator);
         }
         self.enums.deinit();
+        var csit = self.cb_sigs.iterator();
+        while (csit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.allocator);
+        }
+        self.cb_sigs.deinit();
+        var giit = self.generic_instances.iterator();
+        while (giit.next()) |e| {
+            self.allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit(self.allocator);
+        }
+        self.generic_instances.deinit();
     }
 
     fn advance(self: *Parser) anyerror!void {
+        self.prev_line = self.current.line;
         self.current = self.peek;
         if (self.template_lexer_mode) {
             self.peek = self.lexer.nextTemplateChunk();
@@ -550,6 +636,72 @@ pub const Parser = struct {
     /// (keeps the old 4-byte scalar behavior as fallback).
     fn elementTypeOf(arr_type: []const u8) []const u8 {
         return stripOneArray(arr_type) orelse "i32";
+    }
+
+    /// Base of a possibly-generic type (`PriorityQueue<Edge>` -> `PriorityQueue`):
+    /// layouts and method tables register under the base name (generics are
+    /// erased), so every layout/method lookup normalizes through this.
+    fn baseTypeOf(t: []const u8) []const u8 {
+        if (std.mem.indexOf(u8, t, "<")) |i| return t[0..i];
+        return t;
+    }
+
+    /// A bare generic variable (`T`, `K`, `V`): single uppercase letter.
+    fn isBareTypeVar(t: []const u8) bool {
+        const b = baseTypeOf(t);
+        // Strip one array layer for `T[]`-style uses.
+        var core = b;
+        if (core.len >= 2 and core[core.len - 2] == '[' and core[core.len - 1] == ']')
+            core = core[0 .. core.len - 2];
+        return core.len == 1 and core[0] >= 'A' and core[0] <= 'Z';
+    }
+
+    /// Whether `t` names something concrete (primitive, string, or a
+    /// registered layout), for generic inference at `new` sites.
+    fn isConcreteType(self: *Parser, t: []const u8) bool {
+        const b = baseTypeOf(t);
+        const prims = [_][]const u8{
+            "i32", "u32", "i64", "u64", "f32", "f64", "number", "boolean",
+            "string", "void", "ptr", "u8", "i8", "u16", "i16",
+        };
+        for (prims) |pm| {
+            if (std.mem.eql(u8, b, pm)) return true;
+        }
+        if (self.layout_table.find(b) != null) return true;
+        return false;
+    }
+
+    /// Collect identifier-ish tokens from a type text, skipping keywords.
+    fn collectTypeIdents(self: *Parser, text: []const u8, out: *std.ArrayList([]const u8)) anyerror!void {
+        _ = self;
+        var i: usize = 0;
+        while (i < text.len) {
+            const c = text[i];
+            if ((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or c == '_') {
+                var j = i + 1;
+                while (j < text.len) {
+                    const d = text[j];
+                    if ((d >= 'A' and d <= 'Z') or (d >= 'a' and d <= 'z') or (d >= '0' and d <= '9') or d == '_') {
+                        j += 1;
+                    } else break;
+                }
+                const w = text[i..j];
+                // Parameter names (`a` in `(a: T)`): skipped via the
+                // following colon so streams align by TYPE position.
+                var k = j;
+                while (k < text.len and (text[k] == ' ' or text[k] == '\t')) : (k += 1) {}
+                const is_pname = k < text.len and text[k] == ':';
+                const skip = is_pname or std.mem.eql(u8, w, "number") or std.mem.eql(u8, w, "string") or
+                    std.mem.eql(u8, w, "boolean") or std.mem.eql(u8, w, "void") or
+                    std.mem.eql(u8, w, "fn") or std.mem.eql(u8, w, "this") or
+                    std.mem.eql(u8, w, "true") or std.mem.eql(u8, w, "false") or
+                    std.mem.eql(u8, w, "null") or std.mem.eql(u8, w, "undefined");
+                if (!skip) try out.append(w);
+                i = j;
+            } else {
+                i += 1;
+            }
+        }
     }
 
     fn getTypeSizeAndAlign(type_name: []const u8, size: *u32, align_val: *u32) anyerror!void {
@@ -887,7 +1039,14 @@ pub const Parser = struct {
         const Target = union(enum) {
             ident: []const u8,
             member: struct { base: []const u8, off: u32, sa_ty: []const u8 },
-            indexed: struct { header: []const u8, sa_elem: []const u8, esz: u32, index: []const u8 },
+            indexed: struct {
+                header: []const u8,
+                sa_elem: []const u8,
+                esz: u32,
+                index: []const u8,
+                elem_ty: []const u8,
+                index2: ?[]const u8,
+            },
         };
         try self.expect(.l_bracket);
         var targets = std.ArrayList(Target).init(self.allocator);
@@ -924,7 +1083,7 @@ pub const Parser = struct {
                     std.debug.print("error:{d}:{d}: property access on undefined variable '{s}'\n", .{ stok.line, stok.col, base });
                     return error.UndefinedVariable;
                 };
-                const layout = self.layout_table.find(lv.type_name) orelse return error.TypeIsNotAnInterface;
+                const layout = self.layout_table.find(baseTypeOf(lv.type_name)) orelse return error.TypeIsNotAnInterface;
                 var found = false;
                 for (layout.fields.items) |fld| {
                     if (std.mem.eql(u8, fld.name, seg.?)) {
@@ -960,7 +1119,15 @@ pub const Parser = struct {
                 var esz: u32 = 4;
                 var eal: u32 = 4;
                 try getTypeSizeAndAlign(elem, &esz, &eal);
-                try targets.append(.{ .indexed = .{ .header = header, .sa_elem = saTypeOf(elem), .esz = esz, .index = index } });
+                // Chained target `mat[i][j]` (gaussian pivot swap): a second
+                // index resolves through the inner slice header.
+                var index2: ?[]const u8 = null;
+                if (self.current.tag == .l_bracket) {
+                    try self.advance();
+                    index2 = try self.parseExpression();
+                    try self.expect(.r_bracket);
+                }
+                try targets.append(.{ .indexed = .{ .header = header, .sa_elem = saTypeOf(elem), .esz = esz, .index = index, .elem_ty = elem, .index2 = index2 } });
             } else if (seg) |_| {
                 // Plain member target: `this.x`.
                 const dot = std.mem.indexOf(u8, base, ".") orelse return error.UndefinedVariable;
@@ -1041,7 +1208,23 @@ pub const Parser = struct {
                     try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off, ix.index, ix.esz });
                     const addr = try self.newTemp();
                     try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr, data, off });
-                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr, t, ix.sa_elem });
+                    if (ix.index2) |ix2| {
+                        const inner = elementTypeOf(ix.elem_ty);
+                        var iisz: u32 = 4;
+                        var iial: u32 = 4;
+                        try getTypeSizeAndAlign(inner, &iisz, &iial);
+                        const ihdr = try self.newTemp();
+                        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ihdr, addr });
+                        const idata = try self.newTemp();
+                        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ idata, ihdr });
+                        const ioff = try self.newTemp();
+                        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ ioff, ix2, iisz });
+                        const iaddr = try self.newTemp();
+                        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ iaddr, idata, ioff });
+                        try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ iaddr, t, saTypeOf(inner) });
+                    } else {
+                        try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr, t, ix.sa_elem });
+                    }
                 },
             }
         }
@@ -1049,6 +1232,27 @@ pub const Parser = struct {
 
     fn parseStatement(self: *Parser) anyerror!void {
         switch (self.current.tag) {
+            .plus_plus, .minus_minus => {
+                // Prefix `++i;` / `--i;` as a full statement (tarjan).
+                const is_inc = self.current.tag == .plus_plus;
+                try self.advance();
+                const ntok = self.current;
+                try self.expect(.identifier);
+                const nname = self.tokenText(ntok);
+                _ = try self.accept(.semicolon);
+                const ntmp = try self.newTemp();
+                try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ ntmp, if (is_inc) "add" else "sub", nname });
+                try self.releaseOwnedIfLive(nname);
+                if (self.scope_manager.lookup(nname)) |nllv| {
+                    if (!nllv.is_heap_allocated and !nllv.is_consumed and !nllv.is_released) {
+                        try self.lowerer.emit("    !{s}\n", .{nname});
+                        nllv.is_released = true;
+                    }
+                }
+                try self.lowerer.emit("    {s} = {s}\n", .{ nname, ntmp });
+                self.scope_manager.markConsumed(ntmp);
+                self.markRebound(nname);
+            },
             .l_bracket => try self.parseArrayDestructure(),
             .l_brace => {
                 try self.expect(.l_brace);
@@ -1139,6 +1343,9 @@ pub const Parser = struct {
                 // Check for export keyword
                 if (std.mem.eql(u8, self.currentText(), "export")) {
                     try self.advance(); // skip export
+                    if (std.mem.eql(u8, self.currentText(), "default")) {
+                        try self.advance(); // skip default (edmondsKarp)
+                    }
                     // `export abstract class`: the modifier sits between.
                     while (self.current.tag == .keyword_abstract) try self.advance();
                     // Parse the exported declaration
@@ -1150,6 +1357,27 @@ pub const Parser = struct {
                         try self.parseInterface();
                     } else if (self.current.tag == .keyword_class) {
                         try self.parseClass();
+                    } else if (self.current.tag == .keyword_enum) {
+                        try self.parseEnum();
+                    } else if (self.current.tag == .keyword_type) {
+                        try self.parseTypeAlias();
+                    } else if (self.current.tag == .l_brace) {
+                        // `export { a, b }` / `export { X as Y }`: re-export
+                        // list, no codegen (symbols already declared).
+                        try self.advance(); // {
+                        while (self.current.tag != .r_brace and self.current.tag != .eof) {
+                            if (self.current.tag == .identifier) {
+                                try self.advance();
+                            } else if (self.current.tag == .keyword_as) {
+                                try self.advance();
+                            } else if (self.current.tag == .comma) {
+                                try self.advance();
+                            } else {
+                                try self.advance();
+                            }
+                        }
+                        try self.expect(.r_brace);
+                        _ = try self.accept(.semicolon);
                     } else {
                         try self.parseIdentifierStatement();
                     }
@@ -1175,6 +1403,60 @@ pub const Parser = struct {
 
     /// Parse a type name that may include generic parameters like Array<i32>
     fn parseTypeName(self: *Parser) anyerror![]const u8 {
+        // Tuple type (`[A, B]`, `[number, number][][]`): TheAlgorithms uses
+        // tuples for edges/pairs and tuple-union returns. Erase to a slice
+        // shape so indexing/retagging keeps working: inner tuple counts as
+        // one array level plus any trailing `[]` pairs.
+        if (self.current.tag == .l_bracket) {
+            try self.advance(); // [
+            const inner_start: usize = self.current.start;
+            var depth: usize = 1;
+            while (depth > 0 and self.current.tag != .eof) {
+                if (self.current.tag == .l_bracket) depth += 1;
+                if (self.current.tag == .r_bracket) depth -= 1;
+                try self.advance();
+            }
+            // Heterogeneous tuple (`[Edge[], number]`, kruskal's return):
+            // array literals store such mixes in 8-byte slots (first-elem
+            // rule tags them `ptr[]`), so erase to `ptr`-based shape for a
+            // matching 8-byte read stride. Homogeneous pairs keep the old
+            // `i32` shapes.
+            const inner = self.lexer.source[inner_start..self.current.start];
+            const hetero = std.mem.indexOf(u8, inner, "[") != null;
+            var pairs: usize = 1; // the tuple itself is one array level
+            while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                try self.advance();
+                try self.advance();
+                pairs += 1;
+            }
+            if (hetero) {
+                if (pairs == 1) return "ptr[]";
+                if (pairs == 2) return "ptr[][]";
+                return "ptr[][][]";
+            }
+            // Union tail (`[Edge[], number] | null`): skip arms.
+            while (self.current.tag == .pipe) {
+                try self.advance();
+                if (self.current.tag == .l_bracket) {
+                    try self.advance();
+                    var d2: usize = 1;
+                    while (d2 > 0 and self.current.tag != .eof) {
+                        if (self.current.tag == .l_bracket) d2 += 1;
+                        if (self.current.tag == .r_bracket) d2 -= 1;
+                        try self.advance();
+                    }
+                } else if (self.current.tag == .identifier or self.current.tag == .keyword_void or self.current.tag == .keyword_null or self.current.tag == .keyword_undefined) {
+                    try self.advance();
+                } else break;
+                while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                    try self.advance();
+                    try self.advance();
+                }
+            }
+            if (pairs == 1) return "i32[]";
+            if (pairs == 2) return "i32[][]";
+            return "i32[][][]";
+        }
         // Accept keyword type atoms (`void`/`null`/`undefined`) as well as
         // identifiers (`number`, `string`, `K`, ...).
         var type_name: []const u8 = "i32";
@@ -1621,6 +1903,35 @@ pub const Parser = struct {
                 if (self.current.tag == .keyword_void) {
                     try self.advance();
                     p_type = "void";
+                } else if (self.current.tag == .l_paren) {
+                    // Function-typed param (`compare: (a: T) => boolean`):
+                    // keep the raw signature text (not the erased `"fn"`)
+                    // so call-site generic inference can unify inner types.
+                    // Emission is unchanged (`saTypeOf` maps both to `ptr`).
+                    const fstart: usize = self.current.start;
+                    try self.advance(); // (
+                    var fdepth: usize = 1;
+                    while (fdepth > 0 and self.current.tag != .eof) {
+                        if (self.current.tag == .l_paren) fdepth += 1;
+                        if (self.current.tag == .r_paren) fdepth -= 1;
+                        try self.advance();
+                    }
+                    if (try self.accept(.arrow)) {
+                        if (self.current.tag == .l_bracket) {
+                            try self.advance();
+                            var ftd: usize = 1;
+                            while (ftd > 0 and self.current.tag != .eof) {
+                                if (self.current.tag == .l_bracket) ftd += 1;
+                                if (self.current.tag == .r_bracket) ftd -= 1;
+                                try self.advance();
+                            }
+                        } else if (self.current.tag == .identifier or self.current.tag == .keyword_void) {
+                            try self.advance();
+                        }
+                        try self.skipGenericArgs();
+                    }
+                    const fend: usize = self.current.start;
+                    p_type = self.lexer.source[fstart..fend];
                 } else {
                     p_type = try self.parseTypeName();
                 }
@@ -1875,6 +2186,10 @@ pub const Parser = struct {
             if (bend > bstart) body_src = try self.allocator.dupe(u8, bsrc[bstart..bend]);
         }
         try self.class_methods.put(key, .{ .is_void = is_void, .ret = ret_owned, .params = stored, .body_src = body_src });
+        // An override replaces a copy-down alias: drop the stale emit owner
+        // or `new Child(...)` / `child.m(...)` dispatches to the parent body
+        // with the wrong arity (PriorityQueue ctor -> Heap_ctor).
+        _ = self.method_emit_owner.remove(key);
         try self.lowerer.emit("@{s}(this: ptr", .{emit_name});
         for (params.items) |p| {
             try self.lowerer.emit(", {s}: {s}", .{ p.name, saTypeOf(p.type_name) });
@@ -2721,6 +3036,7 @@ pub const Parser = struct {
         try self.expect(.l_brace);
 
         var variants = std.ArrayList([]const u8).init(self.allocator);
+        var values = std.ArrayList(i64).init(self.allocator);
         var val: i64 = 0;
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
             const v_tok = self.current;
@@ -2738,17 +3054,112 @@ pub const Parser = struct {
 
             // Emit as constant
             try self.lowerer.emit("    #def {s}.{s} = {d}\n", .{ name, v_name, val });
+            try values.append(val);
             val += 1;
             _ = try self.accept(.comma);
         }
         try self.expect(.r_brace);
 
-        try self.enums.append(.{ .name = try self.allocator.dupe(u8, name), .variants = variants });
+        try self.enums.append(.{ .name = try self.allocator.dupe(u8, name), .variants = variants, .values = values });
     }
 
     // ==========================================
     // Let / Const
     // ==========================================
+
+    /// Unify one ctor `fn`-param type against one closure signature for
+    /// call-site generic inference. Returns false on conflict (abandon).
+    fn unifyGenericPair(self: *Parser, ctor_ty: []const u8, cb_types: [][]const u8, var_name: *?[]const u8, concrete: *?[]const u8) anyerror!bool {
+        var cids = std.ArrayList([]const u8).init(self.allocator);
+        defer cids.deinit();
+        try self.collectTypeIdents(ctor_ty, &cids);
+        var oids = std.ArrayList([]const u8).init(self.allocator);
+        defer oids.deinit();
+        for (cb_types) |ct| {
+            try self.collectTypeIdents(ct, &oids);
+        }
+        // Positional alignment of the identifier streams.
+        const n = @min(cids.items.len, oids.items.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const c = cids.items[i];
+            const o = oids.items[i];
+            if (isBareTypeVar(c) and self.isConcreteType(baseTypeOf(o))) {
+                const b = baseTypeOf(o);
+                if (var_name.*) |vn| {
+                    if (!std.mem.eql(u8, vn, c)) return false;
+                    if (!std.mem.eql(u8, concrete.*.?, b)) return false;
+                } else {
+                    var_name.* = c;
+                    concrete.* = b;
+                }
+            } else if (isBareTypeVar(o) and self.isConcreteType(baseTypeOf(c))) {
+                const b = baseTypeOf(c);
+                if (var_name.*) |vn| {
+                    if (!std.mem.eql(u8, vn, o)) return false;
+                    if (!std.mem.eql(u8, concrete.*.?, b)) return false;
+                } else {
+                    var_name.* = o;
+                    concrete.* = b;
+                }
+            } else if (!std.mem.eql(u8, baseTypeOf(c), baseTypeOf(o))) {
+                // Two different concretes (ignoring case-only param-name
+                // differences like `a` vs `x`): not necessarily a conflict
+                // (parameter names differ legitimately), so only conflictt
+                // when both sides look like types (capitalized/layout-known).
+                const cup = c.len > 0 and c[0] >= 'A' and c[0] <= 'Z';
+                const oup = o.len > 0 and o[0] >= 'A' and o[0] <= 'Z';
+                if (cup and oup) return false;
+            }
+        }
+        return true;
+    }
+
+    /// Infer single-variable generic bindings for a `new C(...)` instance
+    /// from closure arguments and record them for method-return substitution.
+    fn inferInstanceGenerics(self: *Parser, type_name: []const u8, ctor_key: []const u8, ctor_args: anytype, dest: []const u8) anyerror!void {
+        _ = type_name;
+        const csig = self.class_methods.get(ctor_key) orelse return;
+        const cparams = csig.params orelse return;
+        var var_name: ?[]const u8 = null;
+        var concrete: ?[]const u8 = null;
+        for (ctor_args.items, 0..) |ca, cai| {
+            if (cai >= cparams.len) break;
+            const ptn = cparams[cai].type_name;
+            if (std.mem.indexOf(u8, ptn, "=>") == null) continue;
+            const cbn = ca.cb orelse continue;
+            const sig = self.cb_sigs.get(cbn) orelse continue;
+            if (!try self.unifyGenericPair(ptn, sig.params, &var_name, &concrete)) return;
+        }
+        const vn = var_name orelse return;
+        const cc = concrete orelse return;
+        const dk = try self.allocator.dupe(u8, dest);
+        if (self.generic_instances.get(dk) != null) {
+            self.allocator.free(dk);
+            return;
+        }
+        try self.generic_instances.put(dk, .{
+            .param = try self.allocator.dupe(u8, vn),
+            .concrete = try self.allocator.dupe(u8, cc),
+        });
+    }
+
+    /// Substitute a bare-variable method return through the receiver's
+    /// instance bindings (`extract(): T` on a `T=Edge` instance -> `Edge`).
+    fn substInstanceGeneric(self: *Parser, recv_var: []const u8, ret: []const u8) []const u8 {
+        // Resolve through moves: the instance may live under its bound name.
+        var key: []const u8 = recv_var;
+        if (self.scope_manager.lookup(recv_var)) |lv| {
+            key = lv.reg;
+        }
+        if (self.generic_instances.get(key)) |b| {
+            if (std.mem.eql(u8, ret, b.param)) return b.concrete;
+        }
+        if (self.generic_instances.get(recv_var)) |b| {
+            if (std.mem.eql(u8, ret, b.param)) return b.concrete;
+        }
+        return ret;
+    }
 
     /// Parse `{ field: value, ... }` with the cursor on `{` as a value of the
     /// interface `type_name`: allocate a fresh register, store each field
@@ -2958,14 +3369,53 @@ pub const Parser = struct {
 
             var values = std.ArrayList([]const u8).init(self.allocator);
             defer values.deinit();
+            var spread_flags = std.ArrayList(bool).init(self.allocator);
+            defer spread_flags.deinit();
+            var has_spread = false;
 
             while (self.current.tag != .r_bracket and self.current.tag != .eof) {
-                const val = try self.parseExpression();
-                try values.append(val);
+                if (try self.accept(.ellipsis)) {
+                    const arr = try self.parseExpression();
+                    try values.append(arr);
+                    try spread_flags.append(true);
+                    has_spread = true;
+                } else {
+                    const val = try self.parseExpression();
+                    try values.append(val);
+                    try spread_flags.append(false);
+                }
                 _ = try self.accept(.comma);
             }
             try self.expect(.r_bracket);
 
+            if (has_spread) {
+                // Spread in an annotated initializer (`let b: number[] =
+                // [...a, x]`): the annotation is authoritative, so every
+                // part must match its width class first; the shared
+                // lowering then infers the same width from the parts.
+                const ann_elem = stripOneArray(arr_type) orelse "i32";
+                const ann_wide = isArrayType(ann_elem) or std.mem.eql(u8, ann_elem, "string") or
+                    std.mem.eql(u8, saTypeOf(ann_elem), "ptr");
+                for (values.items, spread_flags.items) |v, sp| {
+                    const vt = if (self.scope_manager.lookup(v)) |vv| vv.type_name else "i32";
+                    const et = if (sp) elementTypeOf(vt) else vt;
+                    const vw = isArrayType(et) or std.mem.eql(u8, et, "string") or
+                        std.mem.eql(u8, saTypeOf(et), "ptr");
+                    // Literals (`5`, `"s"`) carry no reliable type: only
+                    // check looked-up names (literals fold into i32 slots
+                    // unless the annotation is wide, handled below).
+                    if (self.scope_manager.lookup(v) != null and vw != ann_wide) {
+                        _ = try self.refuseAt(
+                            "error: spread initializer mismatches its annotation",
+                            .{},
+                            error.SpreadWidthMismatch,
+                        );
+                        return error.SpreadWidthMismatch;
+                    }
+                }
+                const tmp = try self.lowerSpreadLiteral(values.items, spread_flags.items);
+                try self.bindLetValue(var_name, type_name, tmp);
+            } else {
             const elem_count = @as(u32, @intCast(values.items.len));
 
             // A TypeScript array is lowered to an SA slice: a 16-byte header
@@ -3008,6 +3458,7 @@ pub const Parser = struct {
             }
             try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ var_name, data_reg });
             try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ var_name, elem_count });
+            }
         } else {
             // Top-level `const f = (args) => body`: lower as a plain named
             // SA function, not a closure callback (whose parent-side context
@@ -3130,6 +3581,28 @@ pub const Parser = struct {
     /// Bind an already-evaluated expression value to a `let` name: future
     /// check, type inference, scalar copy-vs-move, declaration and emission.
     /// Shared by `parseLet` and the multi-declaration loop below.
+    /// Inherit generic instance bindings across a fresh variable bind
+    /// (`const pq = new PriorityQueue(...)` carries `T=Edge` from the
+    /// construction temp to the bound name).
+    fn propagateInstanceBinding(self: *Parser, dst_name: []const u8, src_val: []const u8) anyerror!void {
+        var bk: ?[]const u8 = null;
+        if (self.scope_manager.lookup(src_val)) |sv| {
+            bk = sv.reg;
+        }
+        const look = bk orelse src_val;
+        if (self.generic_instances.get(look)) |b| {
+            const nk = try self.allocator.dupe(u8, dst_name);
+            if (self.generic_instances.get(nk) == null) {
+                try self.generic_instances.put(nk, .{
+                    .param = try self.allocator.dupe(u8, b.param),
+                    .concrete = try self.allocator.dupe(u8, b.concrete),
+                });
+            } else {
+                self.allocator.free(nk);
+            }
+        }
+    }
+
     fn bindLetValue(self: *Parser, var_name: []const u8, type_name: ?[]const u8, val: []const u8) anyerror!void {
         var t_name: []const u8 = "i32";
         if (type_name) |ann| {
@@ -3173,6 +3646,7 @@ pub const Parser = struct {
             if (copy_scalar) {
                 try self.lowerer.emit("    {s} = add {s}, 0\n", .{ var_name, val });
                 try self.scope_manager.declareVar(var_name, t_name, var_name, is_heap);
+                try self.propagateInstanceBinding(var_name, val);
                 return;
             }
             const is_move = src_is_var;
@@ -3185,6 +3659,7 @@ pub const Parser = struct {
             // released -- that is what `or is_move` records, and the SA verifier
             // rejects a function that leaves a declared register live at exit.
             try self.scope_manager.declareVar(var_name, t_name, var_name, is_heap or is_move);
+            try self.propagateInstanceBinding(var_name, val);
 
             try self.lowerer.emit("    {s} = {s}\n", .{ var_name, val });
     }
@@ -3198,6 +3673,16 @@ pub const Parser = struct {
     /// Restores all lexer state via defer; safe before the real parse.
     fn looksLikeTopArrow(self: *Parser) anyerror!bool {
         if (self.current.tag == .identifier and self.peek.tag == .arrow) return true;
+        if (self.current.tag == .less) {
+            // Leading `<T>` type params: skip balanced and expect `(`.
+            try self.advance();
+            var ldepth: usize = 1;
+            while (ldepth > 0 and self.current.tag != .eof) {
+                if (self.current.tag == .less) ldepth += 1;
+                if (self.current.tag == .greater) ldepth -= 1;
+                try self.advance();
+            }
+        }
         if (self.current.tag != .l_paren) return false;
         const saved_lexer = self.lexer;
         const saved_current = self.current;
@@ -3216,12 +3701,47 @@ pub const Parser = struct {
                 try self.advance(); // param name
                 _ = try self.accept(.question);
                 if (try self.accept(.colon)) {
-                    if (self.current.tag != .identifier) return false;
-                    try self.advance(); // base type name
-                    try self.skipGenericArgs();
-                    while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
-                        try self.advance(); // [
-                        try self.advance(); // ]
+                    if (self.current.tag == .l_bracket) {
+                        // tuple type: skip balanced [...]
+                        try self.advance();
+                        var td: usize = 1;
+                        while (td > 0 and self.current.tag != .eof) {
+                            if (self.current.tag == .l_bracket) td += 1;
+                            if (self.current.tag == .r_bracket) td -= 1;
+                            try self.advance();
+                        }
+                        while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                            try self.advance();
+                            try self.advance();
+                        }
+                    } else {
+                        if (self.current.tag != .identifier and self.current.tag != .keyword_void and self.current.tag != .keyword_null and self.current.tag != .keyword_undefined) return false;
+                        try self.advance(); // base type name
+                        try self.skipGenericArgs();
+                        while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                            try self.advance(); // [
+                            try self.advance(); // ]
+                        }
+                    }
+                    // union tail after param type
+                    while (self.current.tag == .pipe) {
+                        try self.advance();
+                        if (self.current.tag == .l_bracket) {
+                            try self.advance();
+                            var td2: usize = 1;
+                            while (td2 > 0 and self.current.tag != .eof) {
+                                if (self.current.tag == .l_bracket) td2 += 1;
+                                if (self.current.tag == .r_bracket) td2 -= 1;
+                                try self.advance();
+                            }
+                        } else if (self.current.tag == .identifier or self.current.tag == .keyword_void or self.current.tag == .keyword_null or self.current.tag == .keyword_undefined) {
+                            try self.advance();
+                        } else break;
+                        try self.skipGenericArgs();
+                        while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                            try self.advance();
+                            try self.advance();
+                        }
                     }
                 }
                 if (try self.accept(.equal)) {
@@ -3237,8 +3757,21 @@ pub const Parser = struct {
         // union remainder (`: number | null`): skip `| U` arms.
         if (self.current.tag == .colon) {
             try self.advance(); // :
-            if (self.current.tag != .identifier and self.current.tag != .keyword_void and self.current.tag != .keyword_null and self.current.tag != .keyword_undefined) return false;
-            try self.advance(); // return type name
+            if (self.current.tag == .l_bracket) {
+                try self.advance();
+                var rd: usize = 1;
+                while (rd > 0 and self.current.tag != .eof) {
+                    if (self.current.tag == .l_bracket) rd += 1;
+                    if (self.current.tag == .r_bracket) rd -= 1;
+                    try self.advance();
+                }
+                while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                    try self.advance();
+                    try self.advance();
+                }
+            } else {
+                if (self.current.tag != .identifier and self.current.tag != .keyword_void and self.current.tag != .keyword_null and self.current.tag != .keyword_undefined) return false;
+                try self.advance(); // return type name
             try self.skipGenericArgs();
             while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
                 try self.advance(); // [
@@ -3254,6 +3787,7 @@ pub const Parser = struct {
                     try self.advance();
                 }
             }
+            } // end else (non-tuple return)
         }
         return self.current.tag == .arrow;
     }
@@ -3271,6 +3805,24 @@ pub const Parser = struct {
 
         var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
+        // Leading type params (`<T>(arr: T[]) =>`): erased, skip.
+        if (self.current.tag == .less) {
+            const sl = self.lexer;
+            const sc = self.current;
+            const sp = self.peek;
+            try self.advance();
+            var tdepth: usize = 1;
+            while (tdepth > 0 and self.current.tag != .eof) {
+                if (self.current.tag == .less) tdepth += 1;
+                if (self.current.tag == .greater) tdepth -= 1;
+                try self.advance();
+            }
+            if (self.current.tag != .l_paren) {
+                self.lexer = sl;
+                self.current = sc;
+                self.peek = sp;
+            }
+        }
         if (self.current.tag == .identifier and self.peek.tag == .arrow) {
             // Single untyped param `x =>`.
             const pn_tok = self.current;
@@ -3286,25 +3838,7 @@ pub const Parser = struct {
                     const pn = self.tokenText(pn_tok);
                     var pt: []const u8 = "i32";
                     if (try self.accept(.colon)) {
-                        const tt = self.current;
-                        try self.expect(.identifier);
-                        pt = self.tokenText(tt);
-                        try self.skipGenericArgs();
-                        var arr_pairs: u32 = 0;
-                        while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
-                            try self.advance(); // [
-                            try self.advance(); // ]
-                            arr_pairs += 1;
-                        }
-                        if (arr_pairs > 0) {
-                            const buf = try self.allocator.alloc(u8, pt.len + arr_pairs * 2);
-                            @memcpy(buf[0..pt.len], pt);
-                            for (0..arr_pairs) |k| {
-                                buf[pt.len + k * 2] = '[';
-                                buf[pt.len + k * 2 + 1] = ']';
-                            }
-                            pt = buf;
-                        }
+                        pt = try self.parseTypeName();
                     }
                     // Default values (`start: number = 0`, `end = array.length - 1`):
                     // the subset always passes explicitly (Talgo recursion does),
@@ -3327,6 +3861,9 @@ pub const Parser = struct {
             if (self.current.tag == .keyword_void) {
                 try self.advance();
                 ret_ann = "void";
+            } else if (self.current.tag == .l_bracket) {
+                ret_ann = try self.parseTypeName();
+                ret_is_slice = true;
             } else {
                 const rt_tok = self.current;
                 try self.expect(.identifier);
@@ -3453,12 +3990,46 @@ pub const Parser = struct {
         try self.expect(.identifier);
         const func_name = self.tokenText(func_name_tok);
 
+        // Generic params (`function shellSort<T>(...)`): erased, skip.
+        if (self.current.tag == .less) {
+            try self.advance();
+            var gdepth: usize = 1;
+            while (gdepth > 0 and self.current.tag != .eof) {
+                if (self.current.tag == .less) gdepth += 1;
+                if (self.current.tag == .greater) gdepth -= 1;
+                try self.advance();
+            }
+        }
+
         try self.expect(.l_paren);
 
         var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
+        var rest_idx: ?u8 = null;
 
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
+            // Rest parameter (`...rest: T[]`, must be last): callers pack
+            // trailing args into a fresh array for it (see the call path).
+            if (try self.accept(.ellipsis)) {
+                const p_name_tok = self.current;
+                try self.expect(.identifier);
+                const p_name = self.tokenText(p_name_tok);
+                var p_type: []const u8 = "i32[]";
+                if (try self.accept(.colon)) {
+                    p_type = try self.parseTypeName();
+                }
+                try params.append(.{ .name = p_name, .type_name = p_type });
+                if (self.current.tag != .r_paren) {
+                    _ = try self.refuseAt(
+                        "error: rest parameter must be last",
+                        .{},
+                        error.RestNotLast,
+                    );
+                    return error.RestNotLast;
+                }
+                rest_idx = @intCast(params.items.len - 1);
+                break;
+            }
             const p_name_tok = self.current;
             try self.expect(.identifier);
             const p_name = self.tokenText(p_name_tok);
@@ -3477,6 +4048,29 @@ pub const Parser = struct {
             _ = try self.accept(.comma);
         }
         try self.expect(.r_paren);
+        // Record arity + rest index for spread/rest call handling.
+        {
+            const n = params.items.len;
+            if (n <= 255) {
+                const akey = try self.allocator.dupe(u8, func_name);
+                if (self.fn_arity.get(akey) == null) {
+                    try self.fn_arity.put(akey, @intCast(n));
+                } else {
+                    self.allocator.free(akey);
+                }
+                if (rest_idx) |ri| {
+                    const rkey = try self.allocator.dupe(u8, func_name);
+                    if (self.fn_rest.get(rkey) == null) {
+                        try self.fn_rest.put(rkey, ri);
+                        const rp = params.items[ri];
+                        const relem = stripOneArray(rp.type_name) orelse "i32";
+                        try self.fn_rest_elem.put(try self.allocator.dupe(u8, func_name), try self.allocator.dupe(u8, relem));
+                    } else {
+                        self.allocator.free(rkey);
+                    }
+                }
+            }
+        }
 
         // Optional return type annotation: `function f(): i32 { ... }`
         //
@@ -3912,6 +4506,35 @@ pub const Parser = struct {
             }
         }
         if (!std.mem.eql(u8, name, src)) {
+            // Instance generic bindings ride register moves: a fresh bind
+            // (`const pq = new ...`) inherits the value's bindings, while a
+            // rebind drops them (stale predictions miscompile).
+            if (self.scope_manager.lookup(name) == null) {
+                var src_key: ?[]const u8 = null;
+                if (self.scope_manager.lookup(src)) |sv| {
+                    src_key = sv.reg;
+                }
+                const bk = src_key orelse src;
+                if (self.generic_instances.get(bk)) |b| {
+                    const nk = try self.allocator.dupe(u8, name);
+                    // Fresh names never collide; be safe anyway.
+                    if (self.generic_instances.get(nk) == null) {
+                        try self.generic_instances.put(nk, .{
+                            .param = try self.allocator.dupe(u8, b.param),
+                            .concrete = try self.allocator.dupe(u8, b.concrete),
+                        });
+                    } else {
+                        self.allocator.free(nk);
+                    }
+                }
+            } else {
+                // Rebind: drop stale bindings (best-effort soundness).
+                if (self.generic_instances.fetchRemove(name)) |kv| {
+                    self.allocator.free(kv.key);
+                    var bb = kv.value;
+                    bb.deinit(self.allocator);
+                }
+            }
             try self.releaseOwnedIfLive(name);
             // Rebinding a live named variable needs the old value dead
             // first (RegisterRedefinition otherwise). Temps are excluded:
@@ -3994,12 +4617,149 @@ pub const Parser = struct {
             try self.emitMove(name, val);
             return;
         }
+        // Compound increment: `j += i`, `i -= 2`, `i *= k`, `gap >>= 1`
+        // (sieve / dblfact / shell_sort). Compute `name = name op val`.
+        if (self.current.tag == .identifier) {
+            const saved_lexer = self.lexer;
+            const saved_cur = self.current;
+            const saved_peek = self.peek;
+            try self.advance(); // name
+            const ot = self.current.tag;
+            const is_simple = ot == .plus_equal or ot == .minus_equal or
+                ot == .star_equal or ot == .slash_equal or ot == .percent_equal;
+            const is_shift = ot == .less_less or ot == .greater_greater or
+                ot == .greater_greater_greater or ot == .ampersand or
+                ot == .pipe or ot == .caret;
+            if (is_simple or is_shift) {
+                const iname = self.tokenText(saved_cur);
+                try self.advance(); // op
+                if (is_shift) _ = try self.accept(.equal);
+                const ival = try self.parseExpression();
+                const itmp = try self.newTemp();
+                if (is_simple) {
+                    const iop: []const u8 = switch (ot) {
+                        .plus_equal => "add",
+                        .minus_equal => "sub",
+                        .star_equal => "mul",
+                        .slash_equal => "div",
+                        else => "srem",
+                    };
+                    try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ itmp, iop, iname, ival });
+                } else {
+                    const iop: []const u8 = switch (ot) {
+                        .less_less => "shl",
+                        .greater_greater => "ashr",
+                        .greater_greater_greater => "lshr",
+                        .ampersand => "and",
+                        .pipe => "or",
+                        else => "xor",
+                    };
+                    try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ itmp, iop, iname, ival });
+                }
+                try self.emitMove(iname, itmp);
+                return;
+            }
+            self.lexer = saved_lexer;
+            self.current = saved_cur;
+            self.peek = saved_peek;
+        }
         _ = try self.parseExpression();
     }
 
     fn parseFor(self: *Parser) anyerror!void {
         try self.expect(.keyword_for);
         try self.expect(.l_paren);
+
+        // Destructuring for-of: `for (const [a, b] of mat)` (bellmanFord).
+        // Desugar: iterate index, load inner header, bind a=inner[0], b=inner[1].
+        if ((self.current.tag == .keyword_let or self.current.tag == .keyword_const or self.current.tag == .keyword_var) and
+            self.peek.tag == .l_bracket)
+        {
+            try self.advance(); // let/const/var
+            try self.expect(.l_bracket);
+            var dnames = [_][]const u8{ "", "" };
+            var dn: usize = 0;
+            while (self.current.tag != .r_bracket and self.current.tag != .eof and dn < 2) {
+                const dt = self.current;
+                try self.expect(.identifier);
+                dnames[dn] = self.tokenText(dt);
+                dn += 1;
+                _ = try self.accept(.comma);
+            }
+            try self.expect(.r_bracket);
+            if (self.current.tag == .identifier and std.mem.eql(u8, self.currentText(), "of")) {
+                try self.advance(); // of
+                const diter = try self.parseExpression();
+                try self.expect(.r_paren);
+                const dlbl = self.nextLabelId();
+                const dloop = try std.fmt.allocPrint(self.allocator, "L_forofd_{d}", .{dlbl});
+                const dend = try std.fmt.allocPrint(self.allocator, "L_endforofd_{d}", .{dlbl});
+                try self.lowerer.reserveLabel(dloop);
+                try self.lowerer.reserveLabel(dend);
+                const dlen = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ dlen, diter });
+                const didx = try self.newTemp();
+                try self.lowerer.emit("    {s} = 0\n", .{didx});
+                try self.lowerer.emitLabel(dloop);
+                const dcmp = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ dcmp, didx, dlen });
+                _ = try self.emitBranchIfFalse(dcmp, dend);
+                try self.pushLoopTargets(dend, dloop);
+                self.loop_depth += 1;
+                // outer element type -> inner header
+                var oelem: []const u8 = "i32[]";
+                if (self.scope_manager.lookup(diter)) |dv| { oelem = elementTypeOf(dv.type_name); }
+                var osz: u32 = 4; var oal: u32 = 4;
+                try getTypeSizeAndAlign(oelem, &osz, &oal);
+                const dptr = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ dptr, diter });
+                const doff = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ doff, didx, osz });
+                const daddr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, dptr, doff });
+                const dhdr = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ dhdr, daddr });
+                const ddata = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ddata, dhdr });
+                try self.scope_manager.enterScope();
+                var di: usize = 0;
+                while (di < dn) : (di += 1) {
+                    const eaddr = try self.newTemp();
+                    // NOTE: ddata base + di*4 immediate
+                    try self.lowerer.emit("    {s} = add {s}, {d}\n", .{ eaddr, ddata, @as(u32, @intCast(di * 4)) });
+                    // Like for-of/arrow binds, the name becomes a real SA
+                    // register (a scope entry alone emits nothing).
+                    try self.scope_manager.declareVar(dnames[di], "i32", dnames[di], false);
+                    try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ dnames[di], eaddr });
+                }
+                if (self.current.tag == .l_brace) {
+                    try self.advance();
+                    try self.scope_manager.enterScope();
+                    while (self.current.tag != .r_brace and self.current.tag != .eof) { try self.parseStatement(); }
+                    try self.exitScopeReleasingLocals();
+                    try self.advance();
+                } else {
+                    try self.scope_manager.enterScope();
+                    try self.parseStatement();
+                    try self.exitScopeReleasingLocals();
+                }
+                try self.scope_manager.exitScope(self.lowerer);
+                const dinc = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ dinc, didx });
+                try self.lowerer.emit("    {s} = {s}\n", .{ didx, dinc });
+                self.scope_manager.markConsumed(dinc);
+                try self.lowerer.useLabel(dloop);
+                try self.lowerer.emitJumpTo(dloop);
+                try self.lowerer.emitLabel(dend);
+                self.loop_depth -= 1;
+                self.popLoopTargets();
+                return;
+            }
+            // not actually `of`: fall through to C-style (restore not trivial;
+            // the shape never appears in the corpus outside for-of, so refuse).
+            std.debug.print("error:{d}:{d}: unsupported for-header destructuring\n", .{ self.current.line, self.current.col });
+            return error.InvalidStatement;
+        }
 
         // Detect for-of pattern: for (const x of expr) or for (let x of expr)
         if ((self.current.tag == .keyword_let or self.current.tag == .keyword_const or self.current.tag == .keyword_var) and
@@ -4997,7 +5757,9 @@ pub const Parser = struct {
         if (self.scope_manager.lookup(name)) |v| {
             // `Record<K, V>` parses to the base name `Record` (generics are
             // stripped for layout); both spellings hold btree handles.
-            return std.mem.eql(u8, v.type_name, "Map") or std.mem.eql(u8, v.type_name, "Record");
+            // Generic spellings (`Map<K, V>`, `Set<T>`) normalize to base.
+            const b = baseTypeOf(v.type_name);
+            return std.mem.eql(u8, b, "Map") or std.mem.eql(u8, b, "Record");
         }
         return false;
     }
@@ -5006,7 +5768,7 @@ pub const Parser = struct {
     /// same key-slice encoding as `Map`).
     fn isSetVar(self: *Parser, name: []const u8) bool {
         if (self.scope_manager.lookup(name)) |v| {
-            return std.mem.eql(u8, v.type_name, "Set");
+            return std.mem.eql(u8, baseTypeOf(v.type_name), "Set");
         }
         return false;
     }
@@ -5200,6 +5962,147 @@ pub const Parser = struct {
         return false;
     }
 
+    /// Deep clone of a slice-typed register (`structuredClone`):
+    /// allocates a fresh header + buffer per level and copies scalars at
+    /// the leaves (johnson/floyd_warshall clone 2D graphs). Depth comes
+    /// from the static array type; non-slice leaves copy by value. Only
+    /// slice/scalar element types lower here (structs-as-elements copy the
+    /// 8-byte slot; Maps/Sets stay loud at the call site).
+    fn lowerDeepClone(self: *Parser, src: []const u8, src_type: []const u8) anyerror![]const u8 {
+        var depth: usize = 0;
+        var t = src_type;
+        while (t.len >= 2 and t[t.len - 2] == '[' and t[t.len - 1] == ']') {
+            depth += 1;
+            t = t[0 .. t.len - 2];
+        }
+        if (depth == 0) {
+            const cp = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ cp, src });
+            return cp;
+        }
+        const elem = elementTypeOf(src_type);
+        const elem_is_slice = elem.len >= 2 and elem[elem.len - 2] == '[' and elem[elem.len - 1] == ']';
+        var esz: u32 = 4;
+        var eal: u32 = 4;
+        try getTypeSizeAndAlign(elem, &esz, &eal);
+        const sa_elem = saTypeOf(elem);
+        const len = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, src });
+        const sdata = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sdata, src });
+        const dest = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{dest});
+        const nby = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nby, len, esz });
+        const ddata = try self.newTemp();
+        const did = self.nextLabelId();
+        const dz = try std.fmt.allocPrint(self.allocator, "L_dc_z_{d}", .{did});
+        const dnz = try std.fmt.allocPrint(self.allocator, "L_dc_nz_{d}", .{did});
+        try self.lowerer.reserveLabel(dz);
+        try self.lowerer.reserveLabel(dnz);
+        const isz = try self.newTemp();
+        try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ isz, nby });
+        try self.lowerer.emitBranchTo(isz, dz, dnz);
+        try self.lowerer.emitLabel(dz);
+        try self.lowerer.emit("    {s} = alloc 4\n", .{ddata});
+        try self.lowerer.emitJumpTo(dnz);
+        try self.lowerer.emitLabel(dnz);
+        const nb2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ nb2, nby });
+        const dd2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc {s}\n", .{ dd2, nb2 });
+        try self.lowerer.emit("    {s} = {s}\n", .{ ddata, dd2 });
+        self.scope_manager.markConsumed(dd2);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, ddata });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, len });
+        try self.retagTemp(dest, src_type);
+        const lid = self.nextLabelId();
+        const ltop = try std.fmt.allocPrint(self.allocator, "L_dc_top_{d}", .{lid});
+        const lbody = try std.fmt.allocPrint(self.allocator, "L_dc_body_{d}", .{lid});
+        const lend = try std.fmt.allocPrint(self.allocator, "L_dc_end_{d}", .{lid});
+        try self.lowerer.reserveLabel(ltop);
+        try self.lowerer.reserveLabel(lbody);
+        try self.lowerer.reserveLabel(lend);
+        const i = try self.newTemp();
+        try self.lowerer.emit("    {s} = 0\n", .{i});
+        try self.retagTemp(i, "u64");
+        try self.lowerer.emitLabel(ltop);
+        const cc = try self.newTemp();
+        try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cc, i, len });
+        try self.lowerer.emitBranchTo(cc, lbody, lend);
+        try self.lowerer.emitLabel(lbody);
+        const so = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ so, i, esz });
+        const saddr = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ saddr, sdata, so });
+        if (elem_is_slice) {
+            const inner = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ inner, saddr, sa_elem });
+            const inew = try self.lowerDeepClone(inner, elem);
+            const daddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, ddata, so });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ daddr, inew, sa_elem });
+            self.scope_manager.markConsumed(inner);
+            self.scope_manager.markConsumed(inew);
+        } else {
+            const cv = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cv, saddr, sa_elem });
+            const daddr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, ddata, so });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ daddr, cv, sa_elem });
+            self.scope_manager.markConsumed(cv);
+            self.scope_manager.markConsumed(daddr);
+        }
+        const inext = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, 1\n", .{ inext, i });
+        try self.lowerer.emit("    {s} = {s}\n", .{ i, inext });
+        self.scope_manager.markConsumed(inext);
+        try self.lowerer.emitJumpTo(ltop);
+        try self.lowerer.emitLabel(lend);
+        self.scope_manager.markConsumed(so);
+        self.scope_manager.markConsumed(saddr);
+        return dest;
+    }
+
+    /// Bounds-checked slice element load (`arr[i]` -> `dest`): an
+    /// out-of-bounds index (including negative, compared unsigned) yields
+    /// `0` instead of raw memory. JS reads `undefined` there and the subset
+    /// maps `undefined` to `0`, so this is the faithful shape (heap
+    /// `sinkDown` loops on `this.heap[leftChild]` past the end). Join-slot
+    /// form like the ternary, since a bare rebind across arms is
+    /// RegisterRedefinition.
+    fn emitCheckedIndexLoad(self: *Parser, dest: []const u8, header: []const u8, index: []const u8, esz: u32, sa_elem: []const u8) anyerror!void {
+        const len = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, header });
+        const slot = try self.joinSlot();
+        const labels = try self.joinLabels("idx");
+        const ok = try self.newTemp();
+        try self.lowerer.emit("    {s} = ult {s}, {s}\n", .{ ok, index, len });
+        try self.lowerer.emitBranchTo(ok, labels[0], labels[1]);
+        try self.lowerer.emitLabel(labels[0]);
+        const data = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, header });
+        const off = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off, index, esz });
+        const addr = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr, data, off });
+        const v = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ v, addr, sa_elem });
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, v });
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[1]);
+        try self.lowerer.emit("    store {s} + 0, 0 as ptr\n", .{slot});
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[2]);
+        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ dest, slot, sa_elem });
+        self.scope_manager.markConsumed(len);
+        self.scope_manager.markConsumed(ok);
+        self.scope_manager.markConsumed(data);
+        self.scope_manager.markConsumed(off);
+        self.scope_manager.markConsumed(addr);
+        self.scope_manager.markConsumed(v);
+    }
+
     /// Grow-copy push: `arr.push(v)`.
     ///
     /// Slices carry no capacity, so every push allocates `(len+1)*esz`,
@@ -5212,6 +6115,191 @@ pub const Parser = struct {
     /// `zero=false` skips the fill (the caller overwrites every slot, e.g.
     /// `Array.from` with a mapper). `dest` must be a fresh temp; retagged
     /// to the array type here.
+    /// Spread array literal (`[...a, x, ...b]`): total length is the
+    /// static count plus each spread part's runtime length; parts fill a
+    /// fresh buffer in order (scalars stored, arrays copied element-wise).
+    /// The result width follows the first spread part's element (else the
+    /// literal rule: any array/string value forces ptr, else packed i32);
+    /// width-mismatched parts refuse loudly instead of mis-storing.
+    fn lowerSpreadLiteral(self: *Parser, vals: []const []const u8, spreads: []const bool) anyerror![]const u8 {
+        var esz: u32 = 4;
+        var sa_elem: []const u8 = "i32";
+        var elem_tag: []const u8 = "i32[]";
+        // Width from the first spread part when present (it defines the
+        // flattened shape); else the literal rule below.
+        for (vals, spreads) |v, sp| {
+            if (!sp) continue;
+            const at = if (self.scope_manager.lookup(v)) |vv| vv.type_name else "i32[]";
+            const et = elementTypeOf(at);
+            if (isArrayType(et) or std.mem.eql(u8, et, "string")) {
+                esz = 8;
+                sa_elem = "ptr";
+                elem_tag = "ptr[]";
+            }
+            break;
+        } else {
+            for (vals) |v| {
+                if (self.scope_manager.lookup(v)) |vv| {
+                    if (isArrayType(vv.type_name) or std.mem.eql(u8, vv.type_name, "string")) {
+                        esz = 8;
+                        sa_elem = "ptr";
+                        elem_tag = "ptr[]";
+                    }
+                    break;
+                }
+            }
+        }
+        const wide = esz == 8;
+        // Compatibility: every part must match the result width class.
+        for (vals, spreads) |v, sp| {
+            if (sp) {
+                const at = if (self.scope_manager.lookup(v)) |vv| vv.type_name else "i32[]";
+                const et = elementTypeOf(at);
+                const part_wide = isArrayType(et) or std.mem.eql(u8, et, "string") or
+                    std.mem.eql(u8, saTypeOf(et), "ptr");
+                if (part_wide != wide) {
+                    return self.refuseAt(
+                        "error: spread of mismatched element width is not supported",
+                        .{},
+                        error.SpreadWidthMismatch,
+                    );
+                }
+            } else {
+                if (self.scope_manager.lookup(v)) |vv| {
+                    const vw = isArrayType(vv.type_name) or std.mem.eql(u8, vv.type_name, "string") or
+                        std.mem.eql(u8, saTypeOf(vv.type_name), "ptr");
+                    if (vw != wide) {
+                        return self.refuseAt(
+                            "error: spread literal mixes incompatible element widths",
+                            .{},
+                            error.SpreadWidthMismatch,
+                        );
+                    }
+                }
+            }
+        }
+        // Total length: static items plus each spread part's runtime length.
+        var static_count: u32 = 0;
+        for (spreads) |sp| {
+            if (!sp) static_count += 1;
+        }
+        var total = try self.newTemp();
+        try self.lowerer.emit("    {s} = {d}\n", .{ total, static_count });
+        for (vals, spreads) |v, sp| {
+            if (!sp) continue;
+            const plen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ plen, v });
+            const ntotal = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ntotal, total, plen });
+            // Fresh temp per part (this loop unrolls at compile time; two
+            // static assignments to one temp is RegisterRedefinition).
+            self.scope_manager.markConsumed(total);
+            total = ntotal;
+            self.scope_manager.markConsumed(plen);
+        }
+        const hdr = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc 16\n", .{hdr});
+        const nbytes = try self.newTemp();
+        try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nbytes, total, esz });
+        const data_reg = try self.newTemp();
+        // Zero-length buffer still needs a valid (non-null) pointer.
+        const did = self.nextLabelId();
+        const dz = try std.fmt.allocPrint(self.allocator, "L_spl_z_{d}", .{did});
+        const dnz = try std.fmt.allocPrint(self.allocator, "L_spl_nz_{d}", .{did});
+        try self.lowerer.reserveLabel(dz);
+        try self.lowerer.reserveLabel(dnz);
+        const isz = try self.newTemp();
+        try self.lowerer.emit("    {s} = eq {s}, 0\n", .{ isz, nbytes });
+        try self.lowerer.emitBranchTo(isz, dz, dnz);
+        try self.lowerer.emitLabel(dz);
+        try self.lowerer.emit("    {s} = alloc 4\n", .{data_reg});
+        try self.lowerer.emitJumpTo(dnz);
+        try self.lowerer.emitLabel(dnz);
+        const nb2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ nb2, nbytes });
+        const dd2 = try self.newTemp();
+        try self.lowerer.emit("    {s} = alloc {s}\n", .{ dd2, nb2 });
+        try self.lowerer.emit("    {s} = {s}\n", .{ data_reg, dd2 });
+        self.scope_manager.markConsumed(dd2);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ hdr, data_reg });
+        try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ hdr, total });
+        try self.retagTemp(hdr, elem_tag);
+        // Fill with a cursor: scalars store, spread parts copy element-wise.
+        const cursor = try self.newTemp();
+        try self.lowerer.emit("    {s} = 0\n", .{cursor});
+        for (vals, spreads) |v, sp| {
+            if (!sp) {
+                const off = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off, cursor, esz });
+                const addr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr, data_reg, off });
+                // A quoted scalar is a string literal, not an SA operand:
+                // materialise the slice first (same rule as plain `let s`).
+                if (v.len >= 2 and (v[0] == '"' or v[0] == '\'')) {
+                    const chunk = try self.materializeStringChunk(v[1 .. v.len - 1]);
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr, chunk, sa_elem });
+                } else {
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr, v, sa_elem });
+                }
+                const nc = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ nc, cursor });
+                try self.lowerer.emit("    !{s}\n", .{cursor});
+                try self.lowerer.emit("    {s} = {s}\n", .{ cursor, nc });
+                self.scope_manager.markConsumed(nc);
+                self.scope_manager.markConsumed(off);
+                self.scope_manager.markConsumed(addr);
+            } else {
+                const plen = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ plen, v });
+                const pdata = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ pdata, v });
+                const lid = self.nextLabelId();
+                const ltop = try std.fmt.allocPrint(self.allocator, "L_spl_top_{d}", .{lid});
+                const lbody = try std.fmt.allocPrint(self.allocator, "L_spl_body_{d}", .{lid});
+                const lend = try std.fmt.allocPrint(self.allocator, "L_spl_end_{d}", .{lid});
+                try self.lowerer.reserveLabel(ltop);
+                try self.lowerer.reserveLabel(lbody);
+                try self.lowerer.reserveLabel(lend);
+                const ji = try self.newTemp();
+                try self.lowerer.emit("    {s} = 0\n", .{ji});
+                try self.lowerer.emitLabel(ltop);
+                const jc = try self.newTemp();
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ jc, ji, plen });
+                try self.lowerer.emitBranchTo(jc, lbody, lend);
+                try self.lowerer.emitLabel(lbody);
+                const so = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ so, ji, esz });
+                const sa_ = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sa_, pdata, so });
+                const sv = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ sv, sa_, sa_elem });
+                const doff = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ doff, cursor, esz });
+                const daddr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ daddr, data_reg, doff });
+                try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ daddr, sv, sa_elem });
+                const nc2 = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ nc2, cursor });
+                try self.lowerer.emit("    !{s}\n", .{cursor});
+                try self.lowerer.emit("    {s} = {s}\n", .{ cursor, nc2 });
+                self.scope_manager.markConsumed(nc2);
+                const ji2 = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, 1\n", .{ ji2, ji });
+                try self.lowerer.emit("    {s} = {s}\n", .{ ji, ji2 });
+                self.scope_manager.markConsumed(ji2);
+                try self.lowerer.emitJumpTo(ltop);
+                try self.lowerer.emitLabel(lend);
+                self.scope_manager.markConsumed(so);
+                self.scope_manager.markConsumed(sa_);
+                self.scope_manager.markConsumed(sv);
+                self.scope_manager.markConsumed(doff);
+                self.scope_manager.markConsumed(daddr);
+                self.scope_manager.markConsumed(jc);
+            }
+        }
+        return hdr;
+    }
+
     fn emitArrayAllocLit(self: *Parser, dest: []const u8, elem_type: []const u8, count: u32) anyerror!void {
         // Tag the header with the full array type (`number[]`), like array
         // literals: member dispatch (`isArrayVar`) and indexing derive the
@@ -5247,8 +6335,34 @@ pub const Parser = struct {
         const data_reg = try self.newTemp();
         try self.lowerer.emit("    {s} = alloc {s}\n", .{ data_reg, bytes_reg });
         if (zero) {
-            try self.lowerer.emitImport("sa_std/core/mem.sa");
-            try self.lowerer.emit("    call @sa_mem_set(&{s}, 0, {s})\n", .{ data_reg, bytes_reg });
+            // Inline zero loop (no `sa_mem_set` import: any `@import`
+            // alongside 2+ vtable decls mistypes indirect calls in the
+            // backend, and memset bytes are wrong for >1B elements anyway).
+            const zid = self.nextLabelId();
+            const ztop = try std.fmt.allocPrint(self.allocator, "L_az_top_{d}", .{zid});
+            const zbody = try std.fmt.allocPrint(self.allocator, "L_az_body_{d}", .{zid});
+            const zend = try std.fmt.allocPrint(self.allocator, "L_az_end_{d}", .{zid});
+            try self.lowerer.reserveLabel(ztop);
+            try self.lowerer.reserveLabel(zbody);
+            try self.lowerer.reserveLabel(zend);
+            const zi = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{zi});
+            try self.lowerer.emitLabel(ztop);
+            const zc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ zc, zi, bytes_reg });
+            try self.lowerer.emitBranchTo(zc, zbody, zend);
+            try self.lowerer.emitLabel(zbody);
+            const za = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ za, data_reg, zi });
+            try self.lowerer.emit("    store {s} + 0, 0 as u8\n", .{za});
+            const zi2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ zi2, zi });
+            try self.lowerer.emit("    {s} = {s}\n", .{ zi, zi2 });
+            self.scope_manager.markConsumed(zi2);
+            try self.lowerer.emitJumpTo(ztop);
+            try self.lowerer.emitLabel(zend);
+            self.scope_manager.markConsumed(zc);
+            self.scope_manager.markConsumed(za);
         }
         try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ dest, data_reg });
         try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ dest, n_reg });
@@ -5409,7 +6523,7 @@ pub const Parser = struct {
     /// field (type text contains `=>`), else null (normal paths apply).
     fn fnFieldOffset(self: *Parser, left: []const u8, member: []const u8) ?u32 {
         const lv = self.scope_manager.lookup(left) orelse return null;
-        const layout = self.layout_table.find(lv.type_name) orelse return null;
+        const layout = self.layout_table.find(baseTypeOf(lv.type_name)) orelse return null;
         for (layout.fields.items) |fld| {
             if (std.mem.eql(u8, fld.name, member)) {
                 // `fn`-typed fields (layout pre-scan normalizes arrow
@@ -5549,16 +6663,103 @@ pub const Parser = struct {
 
     /// Whether `member` is an Array method with slice lowering (used by the
     /// arrow-param fallback in the dot-dispatch chain).
+    /// Declarative standard-library surface: every method/property the
+    /// lowerer dispatches, with sample call args and a one-line note. This
+    /// table is the single source of truth for the `isXMethodName` checks;
+    /// the lowering bodies stay where they are. Adding a method = add a row
+    /// here + its lowering branch + keep the sample valid (the consistency
+    /// test in plugin.zig lowers every sample and fails on drift).
+    pub const LibMethod = struct {
+        name: []const u8,
+        /// Sample call suffix, e.g. `"(1)"` or `"((x) => x)"`. Values
+        /// (non-callables like `Math.PI`) use an empty sample and are
+        /// lowered as bare expressions.
+        sample: []const u8,
+        /// Receiver variable in the consistency test (`"a"` numeric array,
+        /// `"s"` string array, `"m"` map, `"st"` set, `"str"` string).
+        recv: []const u8,
+        notes: []const u8,
+    };
+
+    pub const array_surface: []const LibMethod = &.{
+        .{ .name = "push", .sample = "(1)", .recv = "a", .notes = "append; returns new length" },
+        .{ .name = "pop", .sample = "()", .recv = "a", .notes = "remove last; returns it (0 when empty)" },
+        .{ .name = "fill", .sample = "(0)", .recv = "a", .notes = "per-element stores; returns the array" },
+        .{ .name = "indexOf", .sample = "(2)", .recv = "a", .notes = "first index or -1" },
+        .{ .name = "splice", .sample = "(0, 1)", .recv = "a", .notes = "remove range; returns 0" },
+        .{ .name = "slice", .sample = "(0, 1)", .recv = "a", .notes = "deep-copy range" },
+        .{ .name = "reduce", .sample = "((x, y) => x + y, 0)", .recv = "a", .notes = "fold with init" },
+        .{ .name = "map", .sample = "((x) => x)", .recv = "a", .notes = "fresh mapped array" },
+        .{ .name = "filter", .sample = "((x) => x)", .recv = "a", .notes = "fresh filtered array" },
+        .{ .name = "forEach", .sample = "((x) => x)", .recv = "a", .notes = "side effects; returns 0" },
+        .{ .name = "find", .sample = "((x) => x)", .recv = "a", .notes = "element or 0" },
+        .{ .name = "findIndex", .sample = "((x) => x)", .recv = "a", .notes = "index or -1" },
+        .{ .name = "includes", .sample = "(2)", .recv = "a", .notes = "equality scan to 1/0" },
+        .{ .name = "join", .sample = "(sep)", .recv = "s", .notes = "string arrays only" },
+        .{ .name = "reverse", .sample = "()", .recv = "a", .notes = "in place; returns the array" },
+        .{ .name = "sort", .sample = "()", .recv = "a", .notes = "numeric ascending; comparator form takes (a, b) =>" },
+        .{ .name = "concat", .sample = "(b)", .recv = "a", .notes = "fresh joined array" },
+        .{ .name = "shift", .sample = "()", .recv = "a", .notes = "remove first; returns it" },
+        .{ .name = "unshift", .sample = "(0)", .recv = "a", .notes = "prepend via push-then-rotate" },
+        .{ .name = "every", .sample = "((x) => x)", .recv = "a", .notes = "all-predicate to 1/0" },
+        .{ .name = "some", .sample = "((x) => x)", .recv = "a", .notes = "any-predicate to 1/0" },
+    };
+
+    pub const map_surface: []const LibMethod = &.{
+        .{ .name = "set", .sample = "(1, 100)", .recv = "m", .notes = "insert binding" },
+        .{ .name = "get", .sample = "(1)", .recv = "m", .notes = "value or 0" },
+        .{ .name = "has", .sample = "(1)", .recv = "m", .notes = "presence to 1/0" },
+        .{ .name = "delete", .sample = "(1)", .recv = "m", .notes = "remove binding" },
+        .{ .name = "clear", .sample = "()", .recv = "m", .notes = "remove all" },
+        .{ .name = "size", .sample = "()", .recv = "m", .notes = "entry count (method spelling)" },
+        .{ .name = "getSize", .sample = "()", .recv = "m", .notes = "alias of size" },
+        .{ .name = "keys", .sample = "()", .recv = "m", .notes = "key array" },
+        .{ .name = "values", .sample = "()", .recv = "m", .notes = "value array" },
+        .{ .name = "entries", .sample = "()", .recv = "m", .notes = "pair array" },
+    };
+
+    pub const set_surface: []const LibMethod = &.{
+        .{ .name = "add", .sample = "(1)", .recv = "st", .notes = "insert element" },
+        .{ .name = "has", .sample = "(1)", .recv = "st", .notes = "presence to 1/0" },
+        .{ .name = "delete", .sample = "(1)", .recv = "st", .notes = "remove element" },
+        .{ .name = "clear", .sample = "()", .recv = "st", .notes = "remove all" },
+        .{ .name = "size", .sample = "()", .recv = "st", .notes = "element count (method spelling)" },
+    };
+
+    pub const string_surface: []const LibMethod = &.{
+        .{ .name = "charAt", .sample = "(0)", .recv = "str", .notes = "1-char slice" },
+        .{ .name = "charCodeAt", .sample = "(0)", .recv = "str", .notes = "byte value" },
+        .{ .name = "slice", .sample = "(0, 1)", .recv = "str", .notes = "zero-copy sub-slice" },
+        .{ .name = "toString", .sample = "()", .recv = "str", .notes = "identity" },
+    };
+
+    pub const math_surface: []const LibMethod = &.{
+        .{ .name = "floor", .sample = "(7)", .recv = "Math", .notes = "ints identity; floats via fptosi" },
+        .{ .name = "round", .sample = "(7)", .recv = "Math", .notes = "ints identity; floats via floor(x+0.5)" },
+        .{ .name = "sqrt", .sample = "(9)", .recv = "Math", .notes = "integer binary search" },
+        .{ .name = "ceil", .sample = "(7)", .recv = "Math", .notes = "ints identity; floats via -floor(-x)" },
+        .{ .name = "trunc", .sample = "(7)", .recv = "Math", .notes = "ints identity; floats via fptosi" },
+        .{ .name = "min", .sample = "(3, 8)", .recv = "Math", .notes = "pairwise fold; spread form reduces a slice" },
+        .{ .name = "max", .sample = "(3, 8)", .recv = "Math", .notes = "pairwise fold; spread form reduces a slice" },
+        .{ .name = "abs", .sample = "(0 - 7)", .recv = "Math", .notes = "branch join" },
+        .{ .name = "pow", .sample = "(2, 10)", .recv = "Math", .notes = "integer multiply loop" },
+        .{ .name = "log10", .sample = "(100)", .recv = "Math", .notes = "digit-count loop" },
+        .{ .name = "random", .sample = "()", .recv = "Math", .notes = "deterministic LCG in [0, 32767]" },
+        .{ .name = "PI", .sample = "", .recv = "Math", .notes = "folds to 3 (integer subset)" },
+        .{ .name = "E", .sample = "", .recv = "Math", .notes = "folds to 2 (integer subset)" },
+    };
+
+    pub const number_surface: []const LibMethod = &.{
+        .{ .name = "isInteger", .sample = "(7)", .recv = "Number", .notes = "i32 folds to 1; f64 refused" },
+        .{ .name = "MAX_VALUE", .sample = "", .recv = "Number", .notes = "folds to 2147483647" },
+        .{ .name = "MAX_SAFE_INTEGER", .sample = "", .recv = "Number", .notes = "folds to 2147483647" },
+        .{ .name = "MIN_SAFE_INTEGER", .sample = "", .recv = "Number", .notes = "folds to -2147483648" },
+    };
+
     fn isArrayMethodName(self: *Parser, member: []const u8) bool {
         _ = self;
-        const methods = [_][]const u8{
-            "push", "pop", "fill", "indexOf", "splice", "slice",
-            "reduce", "map", "filter", "forEach", "find", "findIndex",
-            "includes", "join", "reverse", "sort", "concat", "shift",
-            "unshift", "every", "some",
-        };
-        for (methods) |m| {
-            if (std.mem.eql(u8, m, member)) return true;
+        for (array_surface) |m| {
+            if (std.mem.eql(u8, m.name, member)) return true;
         }
         return false;
     }
@@ -5598,8 +6799,10 @@ pub const Parser = struct {
             return out;
         }
         if (std.mem.eql(u8, member_name, "fill")) {
-            // `arr.fill(v)`: set every slot to `v` via sa_mem_set, return
-            // the array itself (JS returns `this`).
+            // `arr.fill(v)`: per-element stores, return the array itself
+            // (JS returns `this`). Element-wise (not byte memset: values
+            // like `Infinity`-folded ints are wider than one byte), and it
+            // avoids the `sa_std/core/mem.sa` import.
             try self.expect(.l_paren);
             const v = try self.parseExpression();
             try self.expect(.r_paren);
@@ -5610,14 +6813,39 @@ pub const Parser = struct {
             var esz: u32 = 4;
             var eal: u32 = 4;
             try getTypeSizeAndAlign(elem_type, &esz, &eal);
+            const sa_elem = saTypeOf(elem_type);
             const len = try self.newTemp();
             try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ len, left });
             const data = try self.newTemp();
             try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ data, left });
-            const nbytes = try self.newTemp();
-            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ nbytes, len, esz });
-            try self.lowerer.emitImport("sa_std/core/mem.sa");
-            try self.lowerer.emit("    call @sa_mem_set(&{s}, {s}, {s})\n", .{ data, v, nbytes });
+            const fid = self.nextLabelId();
+            const f_top = try std.fmt.allocPrint(self.allocator, "L_fill_top_{d}", .{fid});
+            const f_body = try std.fmt.allocPrint(self.allocator, "L_fill_body_{d}", .{fid});
+            const f_end = try std.fmt.allocPrint(self.allocator, "L_fill_end_{d}", .{fid});
+            try self.lowerer.reserveLabel(f_top);
+            try self.lowerer.reserveLabel(f_body);
+            try self.lowerer.reserveLabel(f_end);
+            const fi = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{fi});
+            try self.lowerer.emitLabel(f_top);
+            const fc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ fc, fi, len });
+            try self.lowerer.emitBranchTo(fc, f_body, f_end);
+            try self.lowerer.emitLabel(f_body);
+            const fo = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ fo, fi, esz });
+            const fa = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ fa, data, fo });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ fa, v, sa_elem });
+            const fi2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ fi2, fi });
+            try self.lowerer.emit("    {s} = {s}\n", .{ fi, fi2 });
+            self.scope_manager.markConsumed(fi2);
+            try self.lowerer.emitJumpTo(f_top);
+            try self.lowerer.emitLabel(f_end);
+            self.scope_manager.markConsumed(fc);
+            self.scope_manager.markConsumed(fo);
+            self.scope_manager.markConsumed(fa);
             return left;
         }
         if (std.mem.eql(u8, member_name, "indexOf")) {
@@ -5802,6 +7030,355 @@ pub const Parser = struct {
             try self.lowerer.emitLabel(l_end);
             try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ left, new_len });
             return out;
+        }
+        if (std.mem.eql(u8, member_name, "sort")) {
+            // `arr.sort()` / `arr.sort((a, b) => ...)` (kruskal, swap_sort):
+            // in-place insertion sort. No-arg sorts numeric (i32/number)
+            // ascending; other element types stay loud. A 2-param (or 1-param)
+            // comparator arrow is invoked per comparison (negative → a first),
+            // mirroring `map`'s callback convention (plain/ctx/self).
+            try self.expect(.l_paren);
+            var sort_cb: ?[]const u8 = null;
+            var sort_ctx: ?[]const u8 = null;
+            var sort_plain = false;
+            var sort_self = false;
+            var sort_arity: u8 = 2;
+            if (self.current.tag != .r_paren) {
+                const saved_hint = self.arrow_elem_hint;
+                defer self.arrow_elem_hint = saved_hint;
+                if (self.scope_manager.lookup(left)) |hv| {
+                    const he = elementTypeOf(hv.type_name);
+                    if (self.layout_table.find(baseTypeOf(he)) != null) self.arrow_elem_hint = he;
+                }
+                const sm = try self.parseExpression();
+                if (std.mem.startsWith(u8, sm, "@")) {
+                    sort_cb = sm;
+                    const raw = self.last_arrow_ctx orelse "^ctx";
+                    sort_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                    sort_arity = self.last_arrow_arity;
+                } else if (self.arrow_aliases.get(sm)) |saarg| {
+                    sort_cb = saarg.cb;
+                    if (saarg.plain) {
+                        sort_plain = true;
+                    } else {
+                        const raw = saarg.ctx;
+                        sort_ctx = if (raw.len > 0 and raw[0] == '^') raw[1..] else raw;
+                        sort_arity = saarg.arity;
+                        sort_self = saarg.self_call;
+                    }
+                } else {
+                    return self.refuseAt(
+                        "error: Array.sort callback must be an arrow function or a named function",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                if (sort_arity == 0 or sort_arity > 2) {
+                    return self.refuseAt(
+                        "error: Array.sort comparator takes one or two parameters",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            try self.expect(.r_paren);
+            var sort_elem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |sav| {
+                sort_elem = elementTypeOf(sav.type_name);
+            }
+            if (sort_cb == null) {
+                const numeric = std.mem.eql(u8, sort_elem, "i32") or std.mem.eql(u8, sort_elem, "u32") or
+                    std.mem.eql(u8, sort_elem, "number") or std.mem.eql(u8, sort_elem, "boolean") or
+                    std.mem.eql(u8, sort_elem, "i64") or std.mem.eql(u8, sort_elem, "u64");
+                if (!numeric) {
+                    return self.refuseAt(
+                        "error: Array.sort without a comparator only lowers for numeric arrays",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            var sesz: u32 = 4;
+            var seal: u32 = 4;
+            try getTypeSizeAndAlign(sort_elem, &sesz, &seal);
+            const ssa = saTypeOf(sort_elem);
+            const slen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen, left });
+            const sdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sdata, left });
+            const sid = self.nextLabelId();
+            const s_top = try std.fmt.allocPrint(self.allocator, "L_sort_top_{d}", .{sid});
+            const s_body = try std.fmt.allocPrint(self.allocator, "L_sort_body_{d}", .{sid});
+            const s_itop = try std.fmt.allocPrint(self.allocator, "L_sort_itop_{d}", .{sid});
+            const s_ichk = try std.fmt.allocPrint(self.allocator, "L_sort_ichk_{d}", .{sid});
+            const s_ibody = try std.fmt.allocPrint(self.allocator, "L_sort_ibody_{d}", .{sid});
+            const s_iend = try std.fmt.allocPrint(self.allocator, "L_sort_iend_{d}", .{sid});
+            const s_end = try std.fmt.allocPrint(self.allocator, "L_sort_end_{d}", .{sid});
+            try self.lowerer.reserveLabel(s_top);
+            try self.lowerer.reserveLabel(s_body);
+            try self.lowerer.reserveLabel(s_itop);
+            try self.lowerer.reserveLabel(s_ichk);
+            try self.lowerer.reserveLabel(s_ibody);
+            try self.lowerer.reserveLabel(s_iend);
+            try self.lowerer.reserveLabel(s_end);
+            const si = try self.newTemp();
+            try self.lowerer.emit("    {s} = 1\n", .{si});
+            try self.lowerer.emitLabel(s_top);
+            const sc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ sc, si, slen });
+            try self.lowerer.emitBranchTo(sc, s_body, s_end);
+            try self.lowerer.emitLabel(s_body);
+            const sk_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sk_off, si, sesz });
+            const sk_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sk_addr, sdata, sk_off });
+            const skey = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ skey, sk_addr, ssa });
+            const sj = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ sj, si });
+            try self.lowerer.emitLabel(s_itop);
+            const sjneg = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, 0\n", .{ sjneg, sj });
+            try self.lowerer.emitBranchTo(sjneg, s_iend, s_ichk);
+            try self.lowerer.emitLabel(s_ichk);
+            const saj_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ saj_off, sj, sesz });
+            const saj_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ saj_addr, sdata, saj_off });
+            const saj = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ saj, saj_addr, ssa });
+            const sshift = try self.newTemp();
+            if (sort_cb) |scb| {
+                const sres = try self.newTemp();
+                if (sort_plain) {
+                    if (sort_arity == 2) {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ sres, scb[1..], saj, skey });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s})\n", .{ sres, scb[1..], saj });
+                    }
+                } else {
+                    if (sort_arity == 2) {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s}, {s})\n", .{ sres, scb[1..], saj, skey, sort_ctx.? });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ sres, scb[1..], saj, sort_ctx.? });
+                    }
+                }
+                try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ sshift, sres });
+            } else {
+                try self.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ sshift, saj, skey });
+            }
+            try self.lowerer.emitBranchTo(sshift, s_ibody, s_iend);
+            try self.lowerer.emitLabel(s_ibody);
+            const sn_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ sn_off, sj });
+            const sn_by = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sn_by, sn_off, sesz });
+            const sn_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sn_addr, sdata, sn_by });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ sn_addr, saj, ssa });
+            const sj2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ sj2, sj });
+            try self.lowerer.emit("    {s} = {s}\n", .{ sj, sj2 });
+            self.scope_manager.markConsumed(sj2);
+            try self.lowerer.emitJumpTo(s_itop);
+            try self.lowerer.emitLabel(s_iend);
+            const sd_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ sd_off, sj });
+            const sd_by = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ sd_by, sd_off, sesz });
+            const sd_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sd_addr, sdata, sd_by });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ sd_addr, skey, ssa });
+            const si2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ si2, si });
+            try self.lowerer.emit("    {s} = {s}\n", .{ si, si2 });
+            self.scope_manager.markConsumed(si2);
+            try self.lowerer.emitJumpTo(s_top);
+            try self.lowerer.emitLabel(s_end);
+            self.scope_manager.markConsumed(sk_off);
+            self.scope_manager.markConsumed(sk_addr);
+            self.scope_manager.markConsumed(skey);
+            self.scope_manager.markConsumed(saj_off);
+            self.scope_manager.markConsumed(saj_addr);
+            self.scope_manager.markConsumed(saj);
+            self.scope_manager.markConsumed(sshift);
+            if (sort_cb != null and !sort_plain and !sort_self) try self.lowerer.emit("    !{s}\n", .{sort_ctx.?});
+            self.last_arrow_ctx = null;
+            return left;
+        }
+        if (std.mem.eql(u8, member_name, "unshift")) {
+            // `arr.unshift(v)`: prepend one element (lcs). Implemented as
+            // push-then-rotate-right so growth reuses `lowerArrayPush`.
+            // A non-string value into a string array stays loud (string
+            // indexing yields bytes; storing them as slices would miscompile).
+            try self.expect(.l_paren);
+            const uv = try self.parseExpression();
+            try self.expect(.r_paren);
+            var uelem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |uav| {
+                uelem = elementTypeOf(uav.type_name);
+            }
+            if (std.mem.eql(u8, uelem, "string")) {
+                var uok = false;
+                if (self.scope_manager.lookup(uv)) |uvv| {
+                    uok = std.mem.eql(u8, uvv.type_name, "string");
+                } else if (uv.len >= 2 and (uv[0] == '"' or uv[0] == '\'')) {
+                    uok = true;
+                }
+                if (!uok) {
+                    return self.refuseAt(
+                        "error: Array.unshift of a non-string into a string array is not supported",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            var uesz: u32 = 4;
+            var ueal: u32 = 4;
+            try getTypeSizeAndAlign(uelem, &uesz, &ueal);
+            const usa = saTypeOf(uelem);
+            const ulen = try self.lowerArrayPush(left, uv);
+            const udata = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ udata, left });
+            const uid = self.nextLabelId();
+            const u_top = try std.fmt.allocPrint(self.allocator, "L_unsh_top_{d}", .{uid});
+            const u_body = try std.fmt.allocPrint(self.allocator, "L_unsh_body_{d}", .{uid});
+            const u_end = try std.fmt.allocPrint(self.allocator, "L_unsh_end_{d}", .{uid});
+            try self.lowerer.reserveLabel(u_top);
+            try self.lowerer.reserveLabel(u_body);
+            try self.lowerer.reserveLabel(u_end);
+            const ui = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ ui, ulen });
+            try self.lowerer.emitLabel(u_top);
+            const uc = try self.newTemp();
+            try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ uc, ui });
+            try self.lowerer.emitBranchTo(uc, u_body, u_end);
+            try self.lowerer.emitLabel(u_body);
+            const uprev = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ uprev, ui });
+            const us_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ us_off, uprev, uesz });
+            const us_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ us_addr, udata, us_off });
+            const utmp = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ utmp, us_addr, usa });
+            const ud_off = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ ud_off, ui, uesz });
+            const ud_addr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ud_addr, udata, ud_off });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ud_addr, utmp, usa });
+            try self.lowerer.emit("    {s} = {s}\n", .{ ui, uprev });
+            self.scope_manager.markConsumed(uprev);
+            try self.lowerer.emitJumpTo(u_top);
+            try self.lowerer.emitLabel(u_end);
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ udata, uv, usa });
+            return ulen;
+        }
+        if (std.mem.eql(u8, member_name, "concat")) {
+            // `a.concat(b)` (parse_nested_brackets): fresh array of len(a)
+            // + len(b) with both segments copied. Same-width elements only.
+            try self.expect(.l_paren);
+            const cother = try self.parseExpression();
+            try self.expect(.r_paren);
+            var celem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |cav| {
+                celem = elementTypeOf(cav.type_name);
+            }
+            var cesz: u32 = 4;
+            var ceal: u32 = 4;
+            try getTypeSizeAndAlign(celem, &cesz, &ceal);
+            const csa = saTypeOf(celem);
+            const clen1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ clen1, left });
+            const cdata1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ cdata1, left });
+            const clen2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ clen2, cother });
+            const cdata2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ cdata2, cother });
+            const cnlen = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cnlen, clen1, clen2 });
+            const cnby = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cnby, cnlen, cesz });
+            const cdest = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc 16\n", .{cdest});
+            const cndata = try self.newTemp();
+            try self.lowerer.emit("    {s} = alloc {s}\n", .{ cndata, cnby });
+            try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ cdest, cndata });
+            try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ cdest, cnlen });
+            if (self.scope_manager.lookup(left)) |ctv| {
+                try self.retagTemp(cdest, ctv.type_name);
+            }
+            const cid = self.nextLabelId();
+            const c1top = try std.fmt.allocPrint(self.allocator, "L_cc1_top_{d}", .{cid});
+            const c1body = try std.fmt.allocPrint(self.allocator, "L_cc1_body_{d}", .{cid});
+            const c1end = try std.fmt.allocPrint(self.allocator, "L_cc1_end_{d}", .{cid});
+            const c2top = try std.fmt.allocPrint(self.allocator, "L_cc2_top_{d}", .{cid});
+            const c2body = try std.fmt.allocPrint(self.allocator, "L_cc2_body_{d}", .{cid});
+            const c2end = try std.fmt.allocPrint(self.allocator, "L_cc2_end_{d}", .{cid});
+            try self.lowerer.reserveLabel(c1top);
+            try self.lowerer.reserveLabel(c1body);
+            try self.lowerer.reserveLabel(c1end);
+            try self.lowerer.reserveLabel(c2top);
+            try self.lowerer.reserveLabel(c2body);
+            try self.lowerer.reserveLabel(c2end);
+            const ci = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{ci});
+            try self.lowerer.emitLabel(c1top);
+            const cc1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cc1, ci, clen1 });
+            try self.lowerer.emitBranchTo(cc1, c1body, c1end);
+            try self.lowerer.emitLabel(c1body);
+            const co1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ co1, ci, cesz });
+            const ca1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ca1, cdata1, co1 });
+            const cv1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cv1, ca1, csa });
+            const cd1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cd1, cndata, co1 });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ cd1, cv1, csa });
+            const ci1 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ ci1, ci });
+            try self.lowerer.emit("    {s} = {s}\n", .{ ci, ci1 });
+            self.scope_manager.markConsumed(ci1);
+            try self.lowerer.emitJumpTo(c1top);
+            try self.lowerer.emitLabel(c1end);
+            try self.lowerer.emitLabel(c2top);
+            const cc2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ cc2, ci, cnlen });
+            try self.lowerer.emitBranchTo(cc2, c2body, c2end);
+            try self.lowerer.emitLabel(c2body);
+            const cj = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, {s}\n", .{ cj, ci, clen1 });
+            const co2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ co2, cj, cesz });
+            const ca2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ca2, cdata2, co2 });
+            const cv2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cv2, ca2, csa });
+            const cd2o = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ cd2o, ci, cesz });
+            const cd2a = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ cd2a, cndata, cd2o });
+            try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ cd2a, cv2, csa });
+            const ci2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ ci2, ci });
+            try self.lowerer.emit("    {s} = {s}\n", .{ ci, ci2 });
+            self.scope_manager.markConsumed(ci2);
+            try self.lowerer.emitJumpTo(c2top);
+            try self.lowerer.emitLabel(c2end);
+            self.scope_manager.markConsumed(co1);
+            self.scope_manager.markConsumed(ca1);
+            self.scope_manager.markConsumed(cv1);
+            self.scope_manager.markConsumed(cd1);
+            self.scope_manager.markConsumed(cj);
+            self.scope_manager.markConsumed(co2);
+            self.scope_manager.markConsumed(ca2);
+            self.scope_manager.markConsumed(cv2);
+            self.scope_manager.markConsumed(cd2o);
+            self.scope_manager.markConsumed(cd2a);
+            return cdest;
         }
         if (std.mem.eql(u8, member_name, "fill")) {
             // `arr.fill(v)`: store `v` into every slot (`Array(n).fill(1)`).
@@ -6024,6 +7601,199 @@ pub const Parser = struct {
             // call (`call @f(a, ^ctx)` vs a ctx-less callee).
             self.last_arrow_ctx = null;
             return acc;
+        }
+        if (std.mem.eql(u8, member_name, "forEach") or std.mem.eql(u8, member_name, "some") or
+            std.mem.eql(u8, member_name, "every") or std.mem.eql(u8, member_name, "find") or
+            std.mem.eql(u8, member_name, "findIndex") or std.mem.eql(u8, member_name, "includes"))
+        {
+            // Predicate loops (lcm `some`, edmonds `find`): mirror `map`'s
+            // callback convention (arrow/alias, plain/ctx/self, arity<=3
+            // fed as (el, idx, arr)). `forEach` discards results ("0").
+            // `some`/`every` fold to 1/0 with early exit; `find` yields the
+            // element or 0; `findIndex` the index or -1; `includes(x)` is a
+            // direct equality scan (no callback).
+            const is_foreach = std.mem.eql(u8, member_name, "forEach");
+            const is_some = std.mem.eql(u8, member_name, "some");
+            const is_every = std.mem.eql(u8, member_name, "every");
+            const is_find = std.mem.eql(u8, member_name, "find");
+            const is_findidx = std.mem.eql(u8, member_name, "findIndex");
+            try self.expect(.l_paren);
+            var cb: ?[]const u8 = null;
+            var pctx: ?[]const u8 = null;
+            var parity: u8 = 1;
+            var pplain = false;
+            var pself = false;
+            var needle: ?[]const u8 = null;
+            if (std.mem.eql(u8, member_name, "includes")) {
+                needle = try self.parseExpression();
+            } else {
+                const pm = try self.parseExpression();
+                if (std.mem.startsWith(u8, pm, "@")) {
+                    cb = pm;
+                    const praw = self.last_arrow_ctx orelse "^ctx";
+                    pctx = if (praw.len > 0 and praw[0] == '^') praw[1..] else praw;
+                    parity = self.last_arrow_arity;
+                } else if (self.arrow_aliases.get(pm)) |paarg| {
+                    cb = paarg.cb;
+                    if (paarg.plain) {
+                        pplain = true;
+                    } else {
+                        const praw = paarg.ctx;
+                        pctx = if (praw.len > 0 and praw[0] == '^') praw[1..] else praw;
+                        parity = paarg.arity;
+                        pself = paarg.self_call;
+                    }
+                } else {
+                    return self.refuseAt(
+                        "error: Array.{s} callback must be an arrow function or a named function",
+                        .{member_name},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                if (parity > 3) {
+                    return self.refuseAt(
+                        "error: Array.{s} callback takes too many parameters",
+                        .{member_name},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+            }
+            try self.expect(.r_paren);
+            var pelem: []const u8 = "i32";
+            if (self.scope_manager.lookup(left)) |pav| {
+                pelem = elementTypeOf(pav.type_name);
+            }
+            var pesz: u32 = 4;
+            var peal: u32 = 4;
+            try getTypeSizeAndAlign(pelem, &pesz, &peal);
+            const psa = saTypeOf(pelem);
+            const plen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ plen, left });
+            const pdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ pdata, left });
+            const pout = try self.newTemp();
+            if (is_some or is_findidx) {
+                try self.lowerer.emit("    {s} = 0\n", .{pout});
+            } else if (is_every or is_find) {
+                if (is_every) {
+                    try self.lowerer.emit("    {s} = 1\n", .{pout});
+                } else {
+                    try self.lowerer.emit("    {s} = 0\n", .{pout});
+                }
+            } else if (std.mem.eql(u8, member_name, "includes")) {
+                try self.lowerer.emit("    {s} = 0\n", .{pout});
+            } else {
+                try self.lowerer.emit("    {s} = 0\n", .{pout});
+            }
+            if (is_findidx) {
+                try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ pout, pout });
+            }
+            const pid = self.nextLabelId();
+            const p_top = try std.fmt.allocPrint(self.allocator, "L_pl_top_{d}", .{pid});
+            const p_body = try std.fmt.allocPrint(self.allocator, "L_pl_body_{d}", .{pid});
+            const p_take = try std.fmt.allocPrint(self.allocator, "L_pl_take_{d}", .{pid});
+            const p_next = try std.fmt.allocPrint(self.allocator, "L_pl_next_{d}", .{pid});
+            const p_end = try std.fmt.allocPrint(self.allocator, "L_pl_end_{d}", .{pid});
+            try self.lowerer.reserveLabel(p_top);
+            try self.lowerer.reserveLabel(p_body);
+            try self.lowerer.reserveLabel(p_take);
+            try self.lowerer.reserveLabel(p_next);
+            try self.lowerer.reserveLabel(p_end);
+            const pi = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{pi});
+            try self.retagTemp(pi, "u64");
+            try self.lowerer.emitLabel(p_top);
+            const pcc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ pcc, pi, plen });
+            try self.lowerer.emitBranchTo(pcc, p_body, p_end);
+            try self.lowerer.emitLabel(p_body);
+            const po = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ po, pi, pesz });
+            const pa = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ pa, pdata, po });
+            const pel = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ pel, pa, psa });
+            try self.retagTemp(pel, pelem);
+            const pok = try self.newTemp();
+            if (std.mem.eql(u8, member_name, "includes")) {
+                try self.lowerer.emit("    {s} = eq {s}, {s}\n", .{ pok, pel, needle.? });
+            } else {
+                var pabuf = std.ArrayList(u8).init(self.allocator);
+                defer pabuf.deinit();
+                var ps: u8 = 0;
+                while (ps < parity) : (ps += 1) {
+                    if (ps > 0) try pabuf.appendSlice(", ");
+                    if (ps == 0) {
+                        try pabuf.appendSlice(pel);
+                    } else if (ps == 1) {
+                        try pabuf.appendSlice(pi);
+                    } else {
+                        try pabuf.appendSlice(left);
+                    }
+                }
+                const pv = try self.newTemp();
+                if (pplain) {
+                    if (pabuf.items.len == 0) {
+                        try self.lowerer.emit("    {s} = call @{s}({s})\n", .{ pv, cb.?[1..], pctx orelse "" });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s})\n", .{ pv, cb.?[1..], pabuf.items });
+                    }
+                } else {
+                    if (pabuf.items.len == 0) {
+                        try self.lowerer.emit("    {s} = call @{s}({s})\n", .{ pv, cb.?[1..], pctx.? });
+                    } else {
+                        try self.lowerer.emit("    {s} = call @{s}({s}, {s})\n", .{ pv, cb.?[1..], pabuf.items, pctx.? });
+                    }
+                }
+                // Truthiness: nonzero integers count as true (Talgo guards
+                // like `num < 0` already fold to 0/1 via comparisons).
+                try self.lowerer.emit("    {s} = ne {s}, 0\n", .{ pok, pv });
+                self.scope_manager.markConsumed(pv);
+            }
+            // Per-method take/next wiring through p_take/p_next.
+            // `every` takes on FALSE (any failure decides); the rest take
+            // on TRUE.
+            if (is_every) {
+                try self.lowerer.emitBranchTo(pok, p_next, p_take);
+            } else {
+                try self.lowerer.emitBranchTo(pok, p_take, p_next);
+            }
+            try self.lowerer.emitLabel(p_take);
+            if (is_foreach) {
+                try self.lowerer.emitJumpTo(p_next);
+            } else if (is_some or std.mem.eql(u8, member_name, "includes")) {
+                try self.lowerer.emit("    !{s}\n", .{pout});
+                try self.lowerer.emit("    {s} = 1\n", .{pout});
+                try self.lowerer.emitJumpTo(p_end);
+            } else if (is_every) {
+                try self.lowerer.emit("    !{s}\n", .{pout});
+                try self.lowerer.emit("    {s} = 0\n", .{pout});
+                try self.lowerer.emitJumpTo(p_end);
+            } else if (is_find) {
+                try self.lowerer.emit("    !{s}\n", .{pout});
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ pout, pel });
+                try self.lowerer.emitJumpTo(p_end);
+            } else if (is_findidx) {
+                try self.lowerer.emit("    !{s}\n", .{pout});
+                try self.lowerer.emit("    {s} = add {s}, 0\n", .{ pout, pi });
+                try self.lowerer.emitJumpTo(p_end);
+            }
+            try self.lowerer.emitLabel(p_next);
+            const pi2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ pi2, pi });
+            try self.lowerer.emit("    {s} = {s}\n", .{ pi, pi2 });
+            self.scope_manager.markConsumed(pi2);
+            try self.lowerer.emitJumpTo(p_top);
+            try self.lowerer.emitLabel(p_end);
+            self.scope_manager.markConsumed(po);
+            self.scope_manager.markConsumed(pa);
+            self.scope_manager.markConsumed(pel);
+            self.scope_manager.markConsumed(pok);
+            if (!pplain and !pself and cb != null) try self.lowerer.emit("    !{s}\n", .{pctx.?});
+            self.last_arrow_ctx = null;
+            if (is_foreach) return "0";
+            try self.retagTemp(pout, pelem);
+            return pout;
         }
         if (std.mem.eql(u8, member_name, "map")) {
             // `arr.map(cb)`: allocate a same-length array and fill it with
@@ -6925,11 +8695,86 @@ pub const Parser = struct {
             );
         }
         if (self.current.tag == .ellipsis) {
-            return self.refuseAt(
-                "error: Math.{s} with spread arguments is not supported",
-                .{member_name},
-                error.MathNotSupported,
-            );
+            // `Math.max(...arr)` / `Math.min(...arr)` (lcm): reduce over the
+            // slice with a loop. Integers only; empty arrays yield the
+            // identity extreme (documented).
+            try self.advance(); // ...
+            const sarr = try self.parseExpression();
+            try self.expect(.r_paren);
+            var selem: []const u8 = "i32";
+            if (self.scope_manager.lookup(sarr)) |sav| {
+                selem = elementTypeOf(sav.type_name);
+            }
+            const snumeric = std.mem.eql(u8, selem, "i32") or std.mem.eql(u8, selem, "u32") or
+                std.mem.eql(u8, selem, "number") or std.mem.eql(u8, selem, "boolean");
+            if (!snumeric) {
+                return self.refuseAt(
+                    "error: Math.{s} with spread only lowers for numeric arrays",
+                    .{member_name},
+                    error.MathNotSupported,
+                );
+            }
+            var sesz: u32 = 4;
+            var seal: u32 = 4;
+            try getTypeSizeAndAlign(selem, &sesz, &seal);
+            const ssa = saTypeOf(selem);
+            const slen = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ slen, sarr });
+            const sdata = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ sdata, sarr });
+            const sbest = try self.newTemp();
+            if (is_min) {
+                try self.lowerer.emit("    {s} = 2147483647\n", .{sbest});
+            } else {
+                try self.lowerer.emit("    {s} = -2147483648\n", .{sbest});
+            }
+            const sidx = self.nextLabelId();
+            const s_top = try std.fmt.allocPrint(self.allocator, "L_mm_top_{d}", .{sidx});
+            const s_body = try std.fmt.allocPrint(self.allocator, "L_mm_body_{d}", .{sidx});
+            const s_take = try std.fmt.allocPrint(self.allocator, "L_mm_take_{d}", .{sidx});
+            const s_skip = try std.fmt.allocPrint(self.allocator, "L_mm_skip_{d}", .{sidx});
+            const s_end = try std.fmt.allocPrint(self.allocator, "L_mm_end_{d}", .{sidx});
+            try self.lowerer.reserveLabel(s_top);
+            try self.lowerer.reserveLabel(s_body);
+            try self.lowerer.reserveLabel(s_take);
+            try self.lowerer.reserveLabel(s_skip);
+            try self.lowerer.reserveLabel(s_end);
+            const si = try self.newTemp();
+            try self.lowerer.emit("    {s} = 0\n", .{si});
+            try self.lowerer.emitLabel(s_top);
+            const scc = try self.newTemp();
+            try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ scc, si, slen });
+            try self.lowerer.emitBranchTo(scc, s_body, s_end);
+            try self.lowerer.emitLabel(s_body);
+            const so = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ so, si, sesz });
+            const sa = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ sa, sdata, so });
+            const sv = try self.newTemp();
+            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ sv, sa, ssa });
+            const sc2 = try self.newTemp();
+            if (is_min) {
+                try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ sc2, sv, sbest });
+            } else {
+                try self.lowerer.emit("    {s} = sgt {s}, {s}\n", .{ sc2, sv, sbest });
+            }
+            try self.lowerer.emitBranchTo(sc2, s_take, s_skip);
+            try self.lowerer.emitLabel(s_take);
+            try self.lowerer.emit("    !{s}\n", .{sbest});
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ sbest, sv });
+            try self.lowerer.emitJumpTo(s_skip);
+            try self.lowerer.emitLabel(s_skip);
+            const si2 = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 1\n", .{ si2, si });
+            try self.lowerer.emit("    {s} = {s}\n", .{ si, si2 });
+            self.scope_manager.markConsumed(si2);
+            try self.lowerer.emitJumpTo(s_top);
+            try self.lowerer.emitLabel(s_end);
+            self.scope_manager.markConsumed(so);
+            self.scope_manager.markConsumed(sa);
+            self.scope_manager.markConsumed(sv);
+            self.scope_manager.markConsumed(sc2);
+            return sbest;
         }
         var best = try self.parseExpression();
         if (self.isFloatOperand(best)) {
@@ -7169,7 +9014,7 @@ pub const Parser = struct {
         // Copy the receiver type slice NOW: `newTemp` below can reallocate
         // the variables array, dangling `tv` (observed as a garbage
         // `type_name.len` overflowing the arena in `methodKey`).
-        const recv_type: []const u8 = tv.type_name;
+        const recv_type: []const u8 = baseTypeOf(tv.type_name);
         const emit_name = (try self.classMethodEmitName(recv_type, member_name)) orelse {
             // Interface-typed receiver with a class impl somewhere: dynamic
             // dispatch is not lowered yet, refuse loudly instead of miscompiling.
@@ -7229,11 +9074,13 @@ pub const Parser = struct {
         try self.lowerer.emit(")\n", .{});
         // Retag the result: method returns like `MapEntry[]` must not stay
         // `i32`, or downstream indexing/for-of derives the wrong stride
-        // and field access aborts the caller mid-body.
+        // and field access aborts the caller mid-body. Bare-variable returns
+        // (`extract(): T`) substitute through the receiver's instance
+        // bindings (`T=Edge`).
         if (self.class_methods.get(try self.methodKey(recv_type, member_name))) |sig| {
             if (sig.ret) |rt| {
                 if (!std.mem.eql(u8, rt, "void")) {
-                    try self.retagTemp(t, rt);
+                    try self.retagTemp(t, self.substInstanceGeneric(left, rt));
                 }
             }
         }
@@ -7422,7 +9269,9 @@ pub const Parser = struct {
         while (i < text.len and text[i] >= '0' and text[i] <= '9') : (i += 1) {
             digits_after += 1;
         }
-        return digits_before > 0 and digits_after > 0 and i == text.len;
+        // Leading-dot floats (`.5`, lexed as one number token) count, as do
+        // plain `1.5` shapes; a bare `.` or `5.` does not.
+        return digits_after > 0 and i == text.len and (digits_before > 0 or text[0] == '.');
     }
 
     /// Whether a value register/literal should be treated as float for
@@ -7771,6 +9620,23 @@ pub const Parser = struct {
             if (std.mem.eql(u8, p.type_name, "i32")) {
                 try self.arrow_param_names.append(p.name);
             }
+            if (p.destructure) |dd| {
+                // Pair elements pack flat i32 slots (tuple push stores the
+                // data pointer; fixed 2-tuples read data+0/+4). Documented.
+                // Like for-of, the names become real SA registers: declare
+                // then define via the load itself (a scope entry alone emits
+                // nothing, leaving the name undeclared in SA-ASM).
+                const ddata = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ddata, p.name });
+                try self.scope_manager.declareVar(dd.first, "i32", dd.first, false);
+                try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ dd.first, ddata });
+                if (dd.has_second) {
+                    const daddr1 = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, 4\n", .{ daddr1, ddata });
+                    try self.scope_manager.declareVar(dd.second, "i32", dd.second, false);
+                    try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ dd.second, daddr1 });
+                }
+            }
         }
         defer self.arrow_param_names.shrinkRetainingCapacity(param_mark);
 
@@ -7892,6 +9758,23 @@ pub const Parser = struct {
             if (captures.items.len == 0) {
                 try self.captureless_cb.put(cb_name, {});
             }
+            {
+                // Parameter types for call-site generic inference (`new
+                // PriorityQueue((e: Edge) => ...)` binds `T := Edge`).
+                const plist = try self.allocator.alloc([]const u8, params.len);
+                for (params, 0..) |pp, ppi| {
+                    plist[ppi] = try self.allocator.dupe(u8, pp.type_name);
+                }
+                const skey = try self.allocator.dupe(u8, cb_name);
+                // A name is lowered once; keep the first record.
+                if (self.cb_sigs.get(skey) == null) {
+                    try self.cb_sigs.put(skey, .{ .params = plist });
+                } else {
+                    self.allocator.free(skey);
+                    for (plist) |t| self.allocator.free(t);
+                    self.allocator.free(plist);
+                }
+            }
             return cb_name;
         }
         try self.scope_manager.exitScope(self.lowerer);
@@ -7951,6 +9834,20 @@ pub const Parser = struct {
         }
         if (captures.items.len == 0) {
             try self.captureless_cb.put(cb_name, {});
+        }
+        {
+            const plist = try self.allocator.alloc([]const u8, params.len);
+            for (params, 0..) |pp, ppi| {
+                plist[ppi] = try self.allocator.dupe(u8, pp.type_name);
+            }
+            const skey = try self.allocator.dupe(u8, cb_name);
+            if (self.cb_sigs.get(skey) == null) {
+                try self.cb_sigs.put(skey, .{ .params = plist });
+            } else {
+                self.allocator.free(skey);
+                for (plist) |t| self.allocator.free(t);
+                self.allocator.free(plist);
+            }
         }
 
         return cb_name;
@@ -8416,7 +10313,7 @@ pub const Parser = struct {
                 // static dispatch on the receiver's concrete type).
                 if (self.current.tag == .l_paren) {
                     if (self.scope_manager.lookup(left_name)) |lv| {
-                        const mkey = try self.methodKey(lv.type_name, member_name);
+                        const mkey = try self.methodKey(baseTypeOf(lv.type_name), member_name);
                         if (self.class_methods.contains(mkey)) {
                             _ = try self.lowerClassMethodCall(left_name, member_name);
                             _ = try self.accept(.semicolon);
@@ -8425,7 +10322,7 @@ pub const Parser = struct {
                     }
                 }
                 const v = self.scope_manager.lookup(left_name) orelse return error.UndefinedVariable;
-                const layout = self.layout_table.find(v.type_name) orelse return error.TypeIsNotAnInterface;
+                const layout = self.layout_table.find(baseTypeOf(v.type_name)) orelse return error.TypeIsNotAnInterface;
 
                 var found_field: ?Field = null;
                 for (layout.fields.items) |f| {
@@ -8452,10 +10349,10 @@ pub const Parser = struct {
                         self.allocator.free(tv.type_name);
                         tv.type_name = try self.allocator.dupe(u8, field.type_name);
                     }
-                    const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
-                        field.type_name
-                    else
-                        "ptr";
+                    // Width-aware field load: `number`/`boolean` are i32
+                    // (a `ptr` load would swallow the neighbor field's bytes
+                    // into the value, e.g. struct keys used as indices).
+                    const sa_type = saTypeOf(field.type_name);
                     try self.lowerer.emit("    {s} = load {s} + {d} as {s}\n", .{ temp_name, left_name, field.offset, sa_type });
                     chain_base = left_name;
                     chain_off = field.offset;
@@ -8470,7 +10367,8 @@ pub const Parser = struct {
             // Single-segment member update: `obj.f++` / `this.size--`.
             // (Multi-segment chains stay loads; write-back through a temp
             // would store into the temp, not the original object.)
-            if (chain_len == 1 and (self.current.tag == .plus_plus or self.current.tag == .minus_minus)) {
+            if (chain_len == 1 and (self.current.tag == .plus_plus or self.current.tag == .minus_minus) and
+                self.current.line == self.prev_line) {
                 const is_inc = self.current.tag == .plus_plus;
                 try self.advance();
                 _ = try self.accept(.semicolon);
@@ -8615,6 +10513,35 @@ pub const Parser = struct {
                 _ = try self.accept(.semicolon);
                 return;
             }
+            // Method call on an indexed element (`graph[node].forEach(...)`,
+            // `residualGraph[u].push(...)`): materialize the inner header
+            // and dispatch like a variable receiver. Anything else after
+            // `]` stays loud instead of silently dropping the statement.
+            if (self.current.tag == .dot) {
+                var im_elem: []const u8 = "i32";
+                if (self.scope_manager.lookup(name)) |imv| {
+                    im_elem = elementTypeOf(imv.type_name);
+                }
+                var im_sz: u32 = 4;
+                var im_al: u32 = 4;
+                try getTypeSizeAndAlign(im_elem, &im_sz, &im_al);
+                const im_data = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ im_data, name });
+                const im_off = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ im_off, index, im_sz });
+                const im_addr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ im_addr, im_data, im_off });
+                const im_hdr = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ im_hdr, im_addr, saTypeOf(im_elem) });
+                try self.retagTemp(im_hdr, im_elem);
+                try self.advance(); // .
+                const im_tok = self.current;
+                try self.expect(.identifier);
+                const im_name = self.tokenText(im_tok);
+                _ = try self.lowerArrayMethodCall(im_hdr, im_name);
+                _ = try self.accept(.semicolon);
+                return;
+            }
 
             if (self.current.tag == .equal or self.current.tag == .plus_equal or self.current.tag == .minus_equal) {
                 const is_add_assign = self.current.tag != .equal;
@@ -8640,6 +10567,20 @@ pub const Parser = struct {
                     try self.lowerer.emit("    call @sa_btree_map_insert(&{s}, &{s}, {s})\n", .{ name, mks, val });
                     return;
                 }
+                // Out-of-bounds compound stores are skipped (the read would
+                // be garbage and the write would corrupt the heap; sparse
+                // extension growth is unsupported, documented).
+                const st_len = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ st_len, name });
+                const st_ok = try self.newTemp();
+                try self.lowerer.emit("    {s} = ult {s}, {s}\n", .{ st_ok, index, st_len });
+                const st_id = self.nextLabelId();
+                const st_go = try std.fmt.allocPrint(self.allocator, "L_st_go_{d}", .{st_id});
+                const st_end = try std.fmt.allocPrint(self.allocator, "L_st_end_{d}", .{st_id});
+                try self.lowerer.reserveLabel(st_go);
+                try self.lowerer.reserveLabel(st_end);
+                try self.lowerer.emitBranchTo(st_ok, st_go, st_end);
+                try self.lowerer.emitLabel(st_go);
                 // `name` is a slice, so the element address comes from the
                 // header's data pointer at +0, not from the header itself.
                 var st_elem: []const u8 = "i32";
@@ -8668,6 +10609,68 @@ pub const Parser = struct {
                     // `store` requires an explicit byte offset, like `load`.
                     try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ addr_temp, val, saTypeOf(st_elem) });
                 }
+                try self.lowerer.emitJumpTo(st_end);
+                try self.lowerer.emitLabel(st_end);
+                self.scope_manager.markConsumed(st_len);
+                self.scope_manager.markConsumed(st_ok);
+                self.scope_manager.markConsumed(base_temp);
+                self.scope_manager.markConsumed(off_temp);
+                self.scope_manager.markConsumed(addr_temp);
+            } else if ((self.current.tag == .plus_plus or self.current.tag == .minus_minus) and
+                self.current.line == self.prev_line)
+            {
+                // `arr[i]++` / `arr[i]--` as a statement (counting_sort):
+                // load, step, store back. Same-line only (ASI, like the
+                // scalar postfix rule).
+                const ii_inc = self.current.tag == .plus_plus;
+                try self.advance();
+                _ = try self.accept(.semicolon);
+                if (self.isMapVar(name)) {
+                    _ = try self.refuseAt(
+                        "error: increment on map entries is not supported",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                    return error.ConstructorsNotSupported;
+                }
+                var ii_elem: []const u8 = "i32";
+                if (self.scope_manager.lookup(name)) |iiv| {
+                    ii_elem = elementTypeOf(iiv.type_name);
+                }
+                var ii_sz: u32 = 4;
+                var ii_al: u32 = 4;
+                try getTypeSizeAndAlign(ii_elem, &ii_sz, &ii_al);
+                const ii_len = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ ii_len, name });
+                const ii_ok = try self.newTemp();
+                try self.lowerer.emit("    {s} = ult {s}, {s}\n", .{ ii_ok, index, ii_len });
+                const ii_id = self.nextLabelId();
+                const ii_go = try std.fmt.allocPrint(self.allocator, "L_ii_go_{d}", .{ii_id});
+                const ii_end = try std.fmt.allocPrint(self.allocator, "L_ii_end_{d}", .{ii_id});
+                try self.lowerer.reserveLabel(ii_go);
+                try self.lowerer.reserveLabel(ii_end);
+                try self.lowerer.emitBranchTo(ii_ok, ii_go, ii_end);
+                try self.lowerer.emitLabel(ii_go);
+                const ii_base = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ ii_base, name });
+                const ii_off = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ ii_off, index, ii_sz });
+                const ii_addr = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ ii_addr, ii_base, ii_off });
+                const ii_cur = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ ii_cur, ii_addr, saTypeOf(ii_elem) });
+                const ii_nxt = try self.newTemp();
+                try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ ii_nxt, if (ii_inc) "add" else "sub", ii_cur });
+                self.scope_manager.markConsumed(ii_cur);
+                try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ ii_addr, ii_nxt, saTypeOf(ii_elem) });
+                self.scope_manager.markConsumed(ii_nxt);
+                try self.lowerer.emitJumpTo(ii_end);
+                try self.lowerer.emitLabel(ii_end);
+                self.scope_manager.markConsumed(ii_len);
+                self.scope_manager.markConsumed(ii_ok);
+                self.scope_manager.markConsumed(ii_base);
+                self.scope_manager.markConsumed(ii_off);
+                self.scope_manager.markConsumed(ii_addr);
             }
         } else if (self.current.tag == .equal) {
             // Simple assignment: x = expr, or x = { ... } for a struct.
@@ -8684,7 +10687,7 @@ pub const Parser = struct {
                     });
                     return error.UndefinedVariable;
                 };
-                const layout = self.layout_table.find(v.type_name) orelse {
+                const layout = self.layout_table.find(baseTypeOf(v.type_name)) orelse {
                     std.debug.print("error:{d}:{d}: struct literal assigned to non-interface variable '{s}'\n", .{
                         self.current.line,
                         self.current.col,
@@ -8740,7 +10743,7 @@ pub const Parser = struct {
             //-hand sides (arithmetic, calls) leave their operands live and are
             // released normally.
             try self.emitMove(name, val);
-        } else if (self.current.tag == .plus_plus) {
+        } else if (self.current.tag == .plus_plus and self.current.line == name_tok.line) {
             try self.advance();
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
@@ -8749,7 +10752,7 @@ pub const Parser = struct {
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
             self.scope_manager.markConsumed(temp);
             self.markRebound(name);
-        } else if (self.current.tag == .minus_minus) {
+        } else if (self.current.tag == .minus_minus and self.current.line == name_tok.line) {
             try self.advance();
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
@@ -8758,14 +10761,24 @@ pub const Parser = struct {
             try self.lowerer.emit("    {s} = {s}\n", .{ name, temp });
             self.scope_manager.markConsumed(temp);
             self.markRebound(name);
-        } else if (self.current.tag == .plus_equal or self.current.tag == .minus_equal) {
-            // Compound assignment on a scalar: `x += v` / `x -= v`.
-            const is_add = self.current.tag == .plus_equal;
+        } else if (self.current.tag == .plus_equal or self.current.tag == .minus_equal or
+            self.current.tag == .star_equal or self.current.tag == .slash_equal or
+            self.current.tag == .percent_equal)
+        {
+            // Compound assignment on a scalar: `x +=/-=/*=//=/%= v`.
+            const op_tag = self.current.tag;
             try self.advance();
             const val = try self.parseExpression();
             _ = try self.accept(.semicolon);
             const temp = try self.newTemp();
-            try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp, if (is_add) "add" else "sub", name, val });
+            const sa_op: []const u8 = switch (op_tag) {
+                .plus_equal => "add",
+                .minus_equal => "sub",
+                .star_equal => "mul",
+                .slash_equal => "div",
+                else => "srem",
+            };
+            try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp, sa_op, name, val });
             // Rebinding a live register is RegisterRedefinition: kill the
             // old value first (same rule as expression `++`).
             try self.releaseOwnedIfLive(name);
@@ -8777,6 +10790,42 @@ pub const Parser = struct {
             }
             try self.lowerer.emit("    {s} = add {s}, 0\n", .{ name, temp });
             self.scope_manager.markConsumed(temp);
+            self.markRebound(name);
+        } else if (self.current.tag == .less_less or self.current.tag == .greater_greater or
+            self.current.tag == .greater_greater_greater or self.current.tag == .ampersand or
+            self.current.tag == .pipe or self.current.tag == .caret)
+        {
+            // Shift/bitwise assignment: `x <<= e` / `x >>= e` / `x >>>= e` /
+            // `x &= e` / `x |= e` / `x ^= e` (lexed as op + `=`).
+            const sop = self.current.tag;
+            try self.advance();
+            if (!(try self.accept(.equal))) {
+                std.debug.print("error:{d}:{d}: unexpected statement starting with identifier '{s}'\n", .{
+                    name_tok.line, name_tok.col, name,
+                });
+                return error.InvalidStatement;
+            }
+            const sval = try self.parseExpression();
+            _ = try self.accept(.semicolon);
+            const stemp = try self.newTemp();
+            const ssa: []const u8 = switch (sop) {
+                .less_less => "shl",
+                .greater_greater => "ashr",
+                .greater_greater_greater => "lshr",
+                .ampersand => "and",
+                .pipe => "or",
+                else => "xor",
+            };
+            try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ stemp, ssa, name, sval });
+            try self.releaseOwnedIfLive(name);
+            if (self.scope_manager.lookup(name)) |sllv| {
+                if (!sllv.is_heap_allocated and !sllv.is_consumed and !sllv.is_released) {
+                    try self.lowerer.emit("    !{s}\n", .{name});
+                    sllv.is_released = true;
+                }
+            }
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ name, stemp });
+            self.scope_manager.markConsumed(stemp);
             self.markRebound(name);
         } else {
             std.debug.print("error:{d}:{d}: unexpected statement starting with identifier '{s}'\n", .{
@@ -8812,14 +10861,31 @@ pub const Parser = struct {
             // decided purely by exclusion (`?` not followed by `.`/`?`).
             if (self.current.tag == .question) {
                 if (self.peek.tag == .dot) {
-                    if (try self.optionalIsCall()) {
-                        // `a?.m(...)`: degrade to the plain dot dispatch
-                        // (documented; Talgo only chains properties).
+                    if (try self.optionalChainKind()) |kind| {
                         try self.advance(); // ?
-                        left = try self.parseInfix(left, .call);
+                        switch (kind) {
+                            .call => left = try self.parseOptionalCall(left),
+                            .index => left = try self.parseOptionalIndex(left),
+                            .property => {
+                                // `?` already consumed above; both arms
+                                // expect the cursor on `.`.
+                                if (try self.optionalIsCall()) {
+                                    // `a?.m(...)`: degrade to the plain dot
+                                    // dispatch (documented; Talgo only
+                                    // chains properties).
+                                    left = try self.parseInfix(left, .call);
+                                } else {
+                                    left = try self.parseOptionalProperty(left);
+                                }
+                            },
+                        }
                     } else {
+                        // `?.` not followed by member/call/index (notably a
+                        // digit as in `a?.5:b`): not a chain at all, this
+                        // `?` opens a ternary (Bun/esbuild rule).
+                        if (min_prec != .lowest) break;
                         try self.advance(); // ?
-                        left = try self.parseOptionalProperty(left);
+                        left = try self.parseTernary(left);
                     }
                     continue;
                 } else if (self.peek.tag == .question) {
@@ -8845,16 +10911,24 @@ pub const Parser = struct {
             }
             const prec = getPrecedence(self.current.tag);
             if (@intFromEnum(prec) <= @intFromEnum(min_prec)) break;
+            // ASI: a `++`/`--` on the next line is a new statement, not a
+            // postfix operator (parseInfix would return unconsumed and loop
+            // forever here).
+            if ((self.current.tag == .plus_plus or self.current.tag == .minus_minus) and
+                self.current.line != self.prev_line) break;
             left = try self.parseInfix(left, prec);
         }
 
         return left;
     }
 
-    /// Speculative shape check for `?.`: true when `?.name(` follows (up to
-    /// the `(`), i.e. an optional method call rather than a property.
-    /// Restores all lexer state; safe before the real parse.
-    fn optionalIsCall(self: *Parser) anyerror!bool {
+    const OptChainKind = enum { call, index, property };
+
+    /// Single speculative probe for `?.X`: classifies what follows the dot
+    /// without consuming (Bun/esbuild shape: `?.(` call, `?.[` index,
+    /// `?.name` property; anything else — notably a digit as in `a?.5:b` —
+    /// is not a chain at all). Restores all lexer state.
+    fn optionalChainKind(self: *Parser) anyerror!?OptChainKind {
         const saved_lexer = self.lexer;
         const saved_current = self.current;
         const saved_peek = self.peek;
@@ -8865,6 +10939,97 @@ pub const Parser = struct {
         }
         // current == `?`, peek == `.`
         try self.advance(); // ?
+        if (self.current.tag != .dot) return null;
+        try self.advance(); // .
+        return switch (self.current.tag) {
+            .l_paren => .call,
+            .l_bracket => .index,
+            .identifier => .property,
+            else => null,
+        };
+    }
+
+    /// Null-guarded indexed read for `a?.[i]` (cursor on `.`, `[` next):
+    /// a null (0) receiver yields 0 (JS undefined); otherwise the checked
+    /// index load runs (itself OOB-safe). Join-slot form like `?.`.
+    fn parseOptionalIndex(self: *Parser, left: []const u8) anyerror![]const u8 {
+        try self.expect(.dot);
+        try self.expect(.l_bracket);
+        const index = try self.parseExpression();
+        try self.expect(.r_bracket);
+        var elem_type: []const u8 = "i32";
+        if (self.scope_manager.lookup(left)) |lv| {
+            if (isArrayType(lv.type_name)) elem_type = elementTypeOf(lv.type_name);
+        }
+        var esz: u32 = 4;
+        var eal: u32 = 4;
+        try getTypeSizeAndAlign(elem_type, &esz, &eal);
+        const sa_elem = saTypeOf(elem_type);
+        const slot = try self.joinSlot();
+        const labels = try self.joinLabels("optidx");
+        const c = try self.newTemp();
+        try self.lowerer.emit("    {s} = ne {s}, 0\n", .{ c, left });
+        try self.lowerer.emitBranchTo(c, labels[0], labels[1]);
+        try self.lowerer.emitLabel(labels[0]);
+        try self.scope_manager.enterScope();
+        const v = try self.newTemp();
+        try self.emitCheckedIndexLoad(v, left, index, esz, sa_elem);
+        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, v });
+        try self.exitScopeReleasingLocals();
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[1]);
+        try self.lowerer.emit("    store {s} + 0, 0 as ptr\n", .{slot});
+        try self.lowerer.emitJumpTo(labels[2]);
+        try self.lowerer.emitLabel(labels[2]);
+        self.scope_manager.markConsumed(c);
+        const res = try self.newTemp();
+        try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ res, slot, sa_elem });
+        try self.retagTemp(res, elem_type);
+        return res;
+    }
+
+    /// Optional call `f?.(args)` (cursor on `.`, `(` next). Callable
+    /// names and aliases are never null and route straight to the plain
+    /// call path, which resolves each form. Anything else in callee
+    /// position is a runtime value, and functions are not first-class
+    /// values in the subset (a bare variable cannot supply the `(cb, ctx)`
+    /// pair an indirect call needs, and the backend has no signature
+    /// provenance for it): refuse loudly instead of miscompiling. This
+    /// matches plain `cb(v)` on parameters, which is likewise unsupported.
+    fn parseOptionalCall(self: *Parser, left: []const u8) anyerror![]const u8 {
+        try self.expect(.dot);
+        if (self.arrow_aliases.get(left) == null) {
+            var is_fn_name = false;
+            if (self.scope_manager.lookup(left)) |lv| {
+                if (std.mem.eql(u8, lv.type_name, "fn")) is_fn_name = true;
+            } else {
+                is_fn_name = true;
+            }
+            if (!is_fn_name) {
+                return self.refuseAt(
+                    "error: optional call on a runtime value is not supported: functions are not first-class values (store callbacks in aliases)",
+                    .{},
+                    error.HigherOrderCallNotSupported,
+                );
+            }
+        }
+        return try self.parseInfix(left, .call);
+    }
+
+    /// Speculative shape check for `?.`: true when `?.name(` follows (up to
+    /// the `(`), i.e. an optional method call rather than a property.
+    /// Entry cursor is on `.` (the dispatch consumed `?` after classifying
+    /// via `optionalChainKind`). Restores all lexer state.
+    fn optionalIsCall(self: *Parser) anyerror!bool {
+        const saved_lexer = self.lexer;
+        const saved_current = self.current;
+        const saved_peek = self.peek;
+        defer {
+            self.lexer = saved_lexer;
+            self.current = saved_current;
+            self.peek = saved_peek;
+        }
+        // current == `.`
         if (self.current.tag != .dot) return false;
         try self.advance(); // .
         if (self.current.tag != .identifier) return false;
@@ -8913,7 +11078,7 @@ pub const Parser = struct {
             try self.lowerer.emit("    {s} = load {s} + 8 as u32\n", .{ temp_name, left });
             return temp_name;
         }
-        if (std.mem.eql(u8, member_name, "length") and self.layout_table.find(v.type_name) == null) {
+        if (std.mem.eql(u8, member_name, "length") and self.layout_table.find(baseTypeOf(v.type_name)) == null) {
             const temp_name = try self.newTemp();
             try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ temp_name, left });
             return temp_name;
@@ -8930,7 +11095,7 @@ pub const Parser = struct {
             try self.lowerer.emit("    {s} = call @sa_btree_set_len(&{s})\n", .{ temp_name, left });
             return temp_name;
         }
-        const layout = self.layout_table.find(v.type_name) orelse return error.TypeIsNotAnInterface;
+        const layout = self.layout_table.find(baseTypeOf(v.type_name)) orelse return error.TypeIsNotAnInterface;
         var found_field: ?Field = null;
         for (layout.fields.items) |f| {
             if (std.mem.eql(u8, f.name, member_name)) {
@@ -8950,10 +11115,7 @@ pub const Parser = struct {
         try self.lowerer.emitLabel(labels[0]);
         try self.scope_manager.enterScope();
         const av = try self.newTemp();
-        const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
-            field.type_name
-        else
-            "ptr";
+        const sa_type = saTypeOf(field.type_name);
         try self.lowerer.emit("    {s} = load {s} + {d} as {s}\n", .{ av, left, field.offset, sa_type });
         try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, av });
         try self.exitScopeReleasingLocals();
@@ -9119,6 +11281,37 @@ pub const Parser = struct {
 
     fn parsePrefix(self: *Parser) anyerror![]const u8 {
         switch (self.current.tag) {
+            .plus_plus, .minus_minus => {
+                // Prefix `++i` / `--i` (TheAlgorithms C-style loops use
+                // `++i` in the increment clause and `++count` inline):
+                // `i = i +/- 1`, value is the NEW value (unlike postfix).
+                const is_inc = self.current.tag == .plus_plus;
+                try self.advance();
+                // Operand is usually a plain identifier.
+                if (self.current.tag == .identifier) {
+                    const ntok = self.current;
+                    try self.advance();
+                    const name = self.tokenText(ntok);
+                    const tmp = try self.newTemp();
+                    try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ tmp, if (is_inc) "add" else "sub", name });
+                    try self.releaseOwnedIfLive(name);
+                    if (self.scope_manager.lookup(name)) |llv| {
+                        if (!llv.is_heap_allocated and !llv.is_consumed and !llv.is_released) {
+                            try self.lowerer.emit("    !{s}\n", .{name});
+                            llv.is_released = true;
+                        }
+                    }
+                    try self.lowerer.emit("    {s} = {s}\n", .{ name, tmp });
+                    self.scope_manager.markConsumed(tmp);
+                    self.markRebound(name);
+                    return name;
+                }
+                // Fallback: `-`/`!`-like operand expression then adjust.
+                const operand = try self.parsePrefix();
+                const tmp2 = try self.newTemp();
+                try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ tmp2, if (is_inc) "add" else "sub", operand });
+                return tmp2;
+            },
             .number => {
                 const tok = self.current;
                 try self.advance();
@@ -9282,20 +11475,67 @@ pub const Parser = struct {
                     try self.advance(); // =>
                     return try self.parseArrowBody(&[_]ArrowParam{}, false);
                 }
-                if (self.current.tag == .identifier) {
+                if (self.current.tag == .identifier or self.current.tag == .l_bracket) {
                     const saved_lexer = self.lexer;
                     const saved_current = self.current;
                     const saved_peek = self.peek;
                     var probe = std.ArrayList(ArrowParam).init(self.allocator);
                     defer probe.deinit();
                     var is_arrow = false;
-                    // Walk `ident [: type] (, ident [: type])* ) =>`
+                    // Walk `ident [: type] (, ident [: type])* ) =>`.
+                    // An element may destructure (`([a, b]) =>` in forEach):
+                    // bind a synthesized element register (see Destructure).
+                    var dseq: u32 = 0;
                     while (true) {
+                        if (self.current.tag == .l_bracket) {
+                            // Speculative: any shape mismatch bails to a
+                            // normal parenthesized parse (array literals).
+                            try self.advance(); // [
+                            if (self.current.tag != .identifier) break;
+                            const d1 = self.current;
+                            try self.advance();
+                            const dn1 = self.tokenText(d1);
+                            var dn2: []const u8 = "";
+                            var dhas2 = false;
+                            if (try self.accept(.comma)) {
+                                if (self.current.tag != .identifier) break;
+                                const d2 = self.current;
+                                try self.advance();
+                                dn2 = self.tokenText(d2);
+                                dhas2 = true;
+                            }
+                            if (self.current.tag != .r_bracket) break;
+                            try self.advance(); // ]
+                            // Optional element annotation (skipped).
+                            if (try self.accept(.colon)) {
+                                if (self.current.tag == .l_bracket) {
+                                    try self.advance();
+                                    var dtd: usize = 1;
+                                    while (dtd > 0 and self.current.tag != .eof) {
+                                        if (self.current.tag == .l_bracket) dtd += 1;
+                                        if (self.current.tag == .r_bracket) dtd -= 1;
+                                        try self.advance();
+                                    }
+                                } else if (self.current.tag == .identifier) {
+                                    try self.advance();
+                                    try self.skipGenericArgs();
+                                }
+                                while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                    try self.advance();
+                                    try self.advance();
+                                }
+                            }
+                            const dname = try std.fmt.allocPrint(self.allocator, "__d{d}", .{dseq});
+                            dseq += 1;
+                            try probe.append(.{ .name = dname, .type_name = "i32[]", .destructure = .{ .first = dn1, .second = dn2, .has_second = dhas2 } });
+                            if (try self.accept(.comma)) continue;
+                            break;
+                        }
                         if (self.current.tag != .identifier) break;
                         const pn_tok = self.current;
                         try self.advance();
                         _ = try self.accept(.question);
-                        var pt: []const u8 = "i32";
+                        var pt: []const u8 = self.arrow_elem_hint orelse "i32";
                         if (try self.accept(.colon)) {
                             const tt = self.current;
                             // Type names lex as identifiers (or keywords like
@@ -9311,6 +11551,40 @@ pub const Parser = struct {
                                     try self.advance(); // [
                                     try self.advance(); // ]
                                 }
+                            } else if (self.current.tag == .l_bracket) {
+                                // Tuple param type (`a: [number, number]`):
+                                // skip balanced, treat as one array level.
+                                try self.advance();
+                                var ptd: usize = 1;
+                                while (ptd > 0 and self.current.tag != .eof) {
+                                    if (self.current.tag == .l_bracket) ptd += 1;
+                                    if (self.current.tag == .r_bracket) ptd -= 1;
+                                    try self.advance();
+                                }
+                                var ptp: u32 = 1;
+                                while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                    try self.advance();
+                                    try self.advance();
+                                    ptp += 1;
+                                }
+                                pt = if (ptp == 1) "i32[]" else "i32[][]";
+                            } else if (self.current.tag == .l_paren) {
+                                // Grouped/union param (`p: (number | null)[]`):
+                                // skip balanced, keep first-arm shape.
+                                try self.advance();
+                                var pgd: usize = 1;
+                                while (pgd > 0 and self.current.tag != .eof) {
+                                    if (self.current.tag == .l_paren) pgd += 1;
+                                    if (self.current.tag == .r_paren) pgd -= 1;
+                                    try self.advance();
+                                }
+                                var pga: u32 = 0;
+                                while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                    try self.advance();
+                                    try self.advance();
+                                    pga += 1;
+                                }
+                                if (pga > 0) pt = "i32[]";
                             } else {
                                 // Unknown token in type position: not an arrow.
                                 break;
@@ -9367,16 +11641,88 @@ pub const Parser = struct {
                     if (is_arrow) {
                         var real = std.ArrayList(ArrowParam).init(self.allocator);
                         defer real.deinit();
+                        var rseq: u32 = 0;
                         while (true) {
+                            if (self.current.tag == .l_bracket) {
+                                try self.advance(); // [
+                                const r1 = self.current;
+                                try self.expect(.identifier);
+                                const rn1 = self.tokenText(r1);
+                                var rn2: []const u8 = "";
+                                var rhas2 = false;
+                                if (try self.accept(.comma)) {
+                                    const r2 = self.current;
+                                    try self.expect(.identifier);
+                                    rn2 = self.tokenText(r2);
+                                    rhas2 = true;
+                                }
+                                try self.expect(.r_bracket);
+                                if (try self.accept(.colon)) {
+                                    if (self.current.tag == .l_bracket) {
+                                        try self.advance();
+                                        var rtd: usize = 1;
+                                        while (rtd > 0 and self.current.tag != .eof) {
+                                            if (self.current.tag == .l_bracket) rtd += 1;
+                                            if (self.current.tag == .r_bracket) rtd -= 1;
+                                            try self.advance();
+                                        }
+                                    } else if (self.current.tag == .identifier) {
+                                        try self.advance();
+                                        try self.skipGenericArgs();
+                                    }
+                                    while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                        try self.advance();
+                                        try self.advance();
+                                    }
+                                }
+                                const rname = try std.fmt.allocPrint(self.allocator, "__d{d}", .{rseq});
+                                rseq += 1;
+                                try real.append(.{ .name = rname, .type_name = "i32[]", .destructure = .{ .first = rn1, .second = rn2, .has_second = rhas2 } });
+                                if (try self.accept(.comma)) continue;
+                                break;
+                            }
                             const pn_tok = self.current;
                             try self.expect(.identifier);
                             const pn = self.tokenText(pn_tok);
                             var p_opt = try self.accept(.question);
-                            var pt: []const u8 = "i32";
+                            var pt: []const u8 = self.arrow_elem_hint orelse "i32";
                             if (try self.accept(.colon)) {
-                                const tt = self.current;
-                                try self.advance();
-                                pt = self.tokenText(tt);
+                                if (self.current.tag == .l_bracket) {
+                                    // Tuple param type (dijkstra): erase to slice.
+                                    try self.advance();
+                                    var rtd: usize = 1;
+                                    while (rtd > 0 and self.current.tag != .eof) {
+                                        if (self.current.tag == .l_bracket) rtd += 1;
+                                        if (self.current.tag == .r_bracket) rtd -= 1;
+                                        try self.advance();
+                                    }
+                                    var rtp: u32 = 1;
+                                    while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                        try self.advance();
+                                        try self.advance();
+                                        rtp += 1;
+                                    }
+                                    pt = if (rtp == 1) "i32[]" else "i32[][]";
+                                } else if (self.current.tag == .l_paren) {
+                                    // Grouped/union param (edmondsKarp): erase.
+                                    try self.advance();
+                                    var rgd: usize = 1;
+                                    while (rgd > 0 and self.current.tag != .eof) {
+                                        if (self.current.tag == .l_paren) rgd += 1;
+                                        if (self.current.tag == .r_paren) rgd -= 1;
+                                        try self.advance();
+                                    }
+                                    var rga: u32 = 0;
+                                    while (self.current.tag == .l_bracket and self.peek.tag == .r_bracket) {
+                                        try self.advance();
+                                        try self.advance();
+                                        rga += 1;
+                                    }
+                                    if (rga > 0) pt = "i32[]";
+                                } else {
+                                    const tt = self.current;
+                                    try self.advance();
+                                    pt = self.tokenText(tt);
                                 // Same generic/`T[]` skip as the probe above;
                                 // the probe already validated the shape.
                                 try self.skipGenericArgs();
@@ -9398,6 +11744,7 @@ pub const Parser = struct {
                                         buf[pt.len + k * 2 + 1] = ']';
                                     }
                                     pt = buf;
+                                }
                                 }
                             }
                             var p_def: ?[]const u8 = null;
@@ -9535,12 +11882,28 @@ pub const Parser = struct {
                 try self.advance();
                 var vals = std.ArrayList([]const u8).init(self.allocator);
                 defer vals.deinit();
+                // Spread items (`...a`) lower below via slice/concat/push
+                // shapes; parallel array records which slots spread.
+                var spread_flags = std.ArrayList(bool).init(self.allocator);
+                defer spread_flags.deinit();
+                var has_spread = false;
                 while (self.current.tag != .r_bracket and self.current.tag != .eof) {
-                    const val = try self.parseExpression();
-                    try vals.append(val);
+                    if (try self.accept(.ellipsis)) {
+                        const arr = try self.parseExpression();
+                        try vals.append(arr);
+                        try spread_flags.append(true);
+                        has_spread = true;
+                    } else {
+                        const val = try self.parseExpression();
+                        try vals.append(val);
+                        try spread_flags.append(false);
+                    }
                     _ = try self.accept(.comma);
                 }
                 try self.expect(.r_bracket);
+                if (has_spread) {
+                    return try self.lowerSpreadLiteral(vals.items, spread_flags.items);
+                }
                 // Element width follows the first element when known
                 // (nested `[]` values are header pointers, 8 bytes);
                 // otherwise the i32 default keeps scalar literals packed.
@@ -9807,11 +12170,30 @@ pub const Parser = struct {
                     return error.UnknownInterface;
                 };
                 try self.expect(.l_paren);
-                var ctor_args = std.ArrayList([]const u8).init(self.allocator);
+                const CtorArg = struct { reg: []const u8, cb: ?[]const u8 = null, ctx: ?[]const u8 = null };
+                var ctor_args = std.ArrayList(CtorArg).init(self.allocator);
                 defer ctor_args.deinit();
                 while (self.current.tag != .r_paren and self.current.tag != .eof) {
+                    self.last_arrow_ctx = null;
                     const a = try self.parseExpression();
-                    try ctor_args.append(try self.argReg(a));
+                    const a_ctx = self.last_arrow_ctx;
+                    self.last_arrow_ctx = null;
+                    const areg = try self.argReg(a);
+                    // Closures stay split (`cb` + `ctx`): `fn`-typed callee
+                    // params decay to a bare code pointer (captureless-only,
+                    // like indirect `fn` calls), other params take the plain
+                    // call convention (`cb, ctx` pair).
+                    if (std.mem.startsWith(u8, a, "@")) {
+                        try ctor_args.append(.{ .reg = areg, .cb = a, .ctx = a_ctx });
+                    } else if (self.arrow_aliases.get(a)) |al| {
+                        if (al.plain) {
+                            try ctor_args.append(.{ .reg = areg });
+                        } else {
+                            try ctor_args.append(.{ .reg = areg, .cb = al.cb, .ctx = al.ctx });
+                        }
+                    } else {
+                        try ctor_args.append(.{ .reg = areg });
+                    }
                     _ = try self.accept(.comma);
                 }
                 try self.expect(.r_paren);
@@ -9819,6 +12201,15 @@ pub const Parser = struct {
                 if (self.scope_manager.lookup(dest)) |tv| {
                     self.allocator.free(tv.type_name);
                     tv.type_name = try self.allocator.dupe(u8, type_name);
+                }
+                // Call-site generic inference: unify bare variables in the
+                // ctor's `fn`-param types with concrete structs from the
+                // closure arguments (`new PriorityQueue((e: Edge) => ...)`
+                // binds `T := Edge` on this instance). Single-variable only;
+                // ambiguity leaves the instance generic (loud downstream).
+                {
+                    const ck = try self.methodKey(type_name, "ctor");
+                    try self.inferInstanceGenerics(type_name, ck, &ctor_args, dest);
                 }
                 try self.lowerer.emit("    {s} = alloc {d}\n", .{ dest, layout.size });
                 for (layout.fields.items) |f| {
@@ -9842,9 +12233,56 @@ pub const Parser = struct {
                 if (self.class_methods.contains(ctor_key)) {
                     const ctor_owner = self.method_emit_owner.get(ctor_key) orelse type_name;
                     const ctor_emit = try std.fmt.allocPrint(self.allocator, "{s}_ctor", .{ctor_owner});
+                    const csig_fn = self.class_methods.get(ctor_key);
+                    // Pre-materialize `fn`-typed args BEFORE opening the call
+                    // line: vtable emission writes full instructions and
+                    // would corrupt a half-written `call`.
+                    var ctor_fp = std.ArrayList(?[]const u8).init(self.allocator);
+                    defer ctor_fp.deinit();
+                    for (ctor_args.items, 0..) |ca, cai| {
+                        var is_fn_param = false;
+                        if (csig_fn) |sg| {
+                            if (sg.params) |sp| {
+                                if (cai < sp.len) {
+                                    const ptn = sp[cai].type_name;
+                                    is_fn_param = std.mem.eql(u8, ptn, "fn") or std.mem.indexOf(u8, ptn, "=>") != null;
+                                }
+                            }
+                        }
+                        if (is_fn_param) {
+                            if (ca.cb) |cbn| {
+                                // Bare code pointer; capturing arrows refuse
+                                // loudly inside (context cannot travel). The
+                                // context box is dead here: release it now or
+                                // it leaks at function exit.
+                                try ctor_fp.append(try self.fnPtrForCb(cbn));
+                                if (ca.ctx) |ccx| {
+                                    const bx = if (ccx.len > 0 and ccx[0] == '^') ccx[1..] else ccx;
+                                    try self.lowerer.emit("    !{s}\n", .{bx});
+                                }
+                            } else {
+                                try ctor_fp.append(null);
+                            }
+                        } else {
+                            try ctor_fp.append(null);
+                        }
+                    }
                     try self.lowerer.emit("    call @{s}({s}", .{ ctor_emit, dest });
-                    for (ctor_args.items) |a| {
-                        try self.lowerer.emit(", {s}", .{a});
+                    for (ctor_args.items, 0..) |ca, cai| {
+                        if (ctor_fp.items[cai]) |fp| {
+                            try self.lowerer.emit(", {s}", .{fp});
+                            continue;
+                        }
+                        if (ca.cb) |cbn| {
+                            if (ca.ctx) |cx| {
+                                const bx = if (cx.len > 0 and cx[0] == '^') cx[1..] else cx;
+                                try self.lowerer.emit(", {s}, {s}", .{ cbn, bx });
+                            } else {
+                                try self.lowerer.emit(", {s}", .{cbn});
+                            }
+                        } else {
+                            try self.lowerer.emit(", {s}", .{ca.reg});
+                        }
                     }
                     // `new TreeNode(data)` vs `(data, left?, right?)`: pad
                     // missing trailing optional params with `0` (undefined).
@@ -10005,6 +12443,42 @@ pub const Parser = struct {
             const sa_op: []const u8 = if (tag == .ampersand) "and" else if (tag == .pipe) "or" else "xor";
             try self.lowerer.emit("    {s} = {s} {s}, {s}\n", .{ temp_name, sa_op, left, right });
             return temp_name;
+        }
+
+        // Exponent `**` (integer-only pow loop, like Math.pow).
+        if (tag == .star_star) {
+            try self.advance();
+            const right = try self.parseExpressionWithPrecedence(precedence);
+            try self.rejectFutureOperand(left);
+            try self.rejectFutureOperand(right);
+            const pres = try self.newTemp();
+            try self.lowerer.emit("    {s} = 1\n", .{pres});
+            const pid = self.nextLabelId();
+            const plt = try std.fmt.allocPrint(self.allocator, "L_pw_top_{d}", .{pid});
+            const plb = try std.fmt.allocPrint(self.allocator, "L_pw_body_{d}", .{pid});
+            const ple = try std.fmt.allocPrint(self.allocator, "L_pw_end_{d}", .{pid});
+            try self.lowerer.reserveLabel(plt);
+            try self.lowerer.reserveLabel(plb);
+            try self.lowerer.reserveLabel(ple);
+            const pctr = try self.newTemp();
+            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ pctr, right });
+            try self.lowerer.emitLabel(plt);
+            const pcc = try self.newTemp();
+            try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ pcc, pctr });
+            try self.lowerer.emitBranchTo(pcc, plb, ple);
+            try self.lowerer.emitLabel(plb);
+            const pnr = try self.newTemp();
+            try self.lowerer.emit("    {s} = mul {s}, {s}\n", .{ pnr, pres, left });
+            try self.lowerer.emit("    !{s}\n", .{pres});
+            try self.lowerer.emit("    {s} = {s}\n", .{ pres, pnr });
+            self.scope_manager.markConsumed(pnr);
+            const pnc = try self.newTemp();
+            try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ pnc, pctr });
+            try self.lowerer.emit("    {s} = {s}\n", .{ pctr, pnc });
+            self.scope_manager.markConsumed(pnc);
+            try self.lowerer.emitJumpTo(plt);
+            try self.lowerer.emitLabel(ple);
+            return pres;
         }
 
         // Arithmetic: + - * / %
@@ -10229,7 +12703,124 @@ pub const Parser = struct {
                     if (std.mem.eql(u8, member_name, "min") or std.mem.eql(u8, member_name, "max")) {
                         return try self.lowerMathMinMax(member_name);
                     }
-                    if (!std.mem.eql(u8, member_name, "floor") and !std.mem.eql(u8, member_name, "round") and !std.mem.eql(u8, member_name, "sqrt")) {
+                    if (std.mem.eql(u8, member_name, "random")) {
+                        // `Math.random()`: deterministic LCG (documented;
+                        // randomized Talgo algorithms run but differ from
+                        // Node exact values). Returns i32 in [0, 32767].
+                        try self.expect(.l_paren);
+                        try self.expect(.r_paren);
+                        const seed_name = "__ts_rand_seed";
+                        if (self.scope_manager.lookup(seed_name) == null) {
+                            try self.scope_manager.declareVar(seed_name, "i32", seed_name, false);
+                            try self.lowerer.emit("    {s} = 12345\n", .{seed_name});
+                        }
+                        const rs = try self.newTemp();
+                        try self.lowerer.emit("    {s} = mul {s}, 1103515245\n", .{ rs, seed_name });
+                        const rs2 = try self.newTemp();
+                        try self.lowerer.emit("    {s} = add {s}, 12345\n", .{ rs2, rs });
+                        self.scope_manager.markConsumed(rs);
+                        try self.lowerer.emit("    {s} = {s}\n", .{ seed_name, rs2 });
+                        self.scope_manager.markConsumed(rs2);
+                        self.markRebound(seed_name);
+                        const ro = try self.newTemp();
+                        try self.lowerer.emit("    {s} = ashr {s}, 16\n", .{ ro, seed_name });
+                        const rm = try self.newTemp();
+                        try self.lowerer.emit("    {s} = and {s}, 32767\n", .{ rm, ro });
+                        return rm;
+                    }
+                    if (std.mem.eql(u8, member_name, "log10")) {
+                        // Integer `Math.log10(n)` = digits(n)-1 loop.
+                        try self.expect(.l_paren);
+                        const lv = try self.parseExpression();
+                        try self.expect(.r_paren);
+                        const lacc = try self.newTemp();
+                        try self.lowerer.emit("    {s} = 0\n", .{lacc});
+                        const ltmp = try self.newTemp();
+                        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ ltmp, lv });
+                        const lid = self.nextLabelId();
+                        const llt = try std.fmt.allocPrint(self.allocator, "L_l10_top_{d}", .{lid});
+                        const llb = try std.fmt.allocPrint(self.allocator, "L_l10_body_{d}", .{lid});
+                        const lle = try std.fmt.allocPrint(self.allocator, "L_l10_end_{d}", .{lid});
+                        try self.lowerer.reserveLabel(llt);
+                        try self.lowerer.reserveLabel(llb);
+                        try self.lowerer.reserveLabel(lle);
+                        try self.lowerer.emitLabel(llt);
+                        const lcc = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sge {s}, 10\n", .{ lcc, ltmp });
+                        try self.lowerer.emitBranchTo(lcc, llb, lle);
+                        try self.lowerer.emitLabel(llb);
+                        const lq = try self.newTemp();
+                        try self.lowerer.emit("    {s} = div {s}, 10\n", .{ lq, ltmp });
+                        try self.lowerer.emit("    {s} = {s}\n", .{ ltmp, lq });
+                        self.scope_manager.markConsumed(lq);
+                        const la = try self.newTemp();
+                        try self.lowerer.emit("    {s} = add {s}, 1\n", .{ la, lacc });
+                        try self.lowerer.emit("    !{s}\n", .{lacc});
+                        try self.lowerer.emit("    {s} = {s}\n", .{ lacc, la });
+                        self.scope_manager.markConsumed(la);
+                        try self.lowerer.emitJumpTo(llt);
+                        try self.lowerer.emitLabel(lle);
+                        return lacc;
+                    }
+                    if (std.mem.eql(u8, member_name, "abs")) {
+                        try self.expect(.l_paren);
+                        const v = try self.parseExpression();
+                        try self.expect(.r_paren);
+                        // abs via branch: r = v>=0 ? v : -v
+                        const slot = try self.joinSlot();
+                        const labels = try self.joinLabels("abs");
+                        const c = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sge {s}, 0\n", .{ c, v });
+                        try self.lowerer.emitBranchTo(c, labels[0], labels[1]);
+                        try self.lowerer.emitLabel(labels[0]);
+                        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, v });
+                        try self.lowerer.emitJumpTo(labels[2]);
+                        try self.lowerer.emitLabel(labels[1]);
+                        const nv = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sub 0, {s}\n", .{ nv, v });
+                        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ slot, nv });
+                        try self.lowerer.emitJumpTo(labels[2]);
+                        try self.lowerer.emitLabel(labels[2]);
+                        const out = try self.newTemp();
+                        try self.lowerer.emit("    {s} = load {s} + 0 as i32\n", .{ out, slot });
+                        return out;
+                    }
+                    if (std.mem.eql(u8, member_name, "pow")) {
+                        try self.expect(.l_paren);
+                        const base = try self.parseExpression();
+                        try self.expect(.comma);
+                        const expo = try self.parseExpression();
+                        try self.expect(.r_paren);
+                        // integer pow loop: r=1; for(e times) r*=base
+                        const res = try self.newTemp();
+                        try self.lowerer.emit("    {s} = 1\n", .{res});
+                        const id = self.nextLabelId();
+                        const lt = try std.fmt.allocPrint(self.allocator, "L_pow_top_{d}", .{id});
+                        const lb = try std.fmt.allocPrint(self.allocator, "L_pow_body_{d}", .{id});
+                        const le = try std.fmt.allocPrint(self.allocator, "L_pow_end_{d}", .{id});
+                        try self.lowerer.reserveLabel(lt);
+                        try self.lowerer.reserveLabel(lb);
+                        try self.lowerer.reserveLabel(le);
+                        const ctr = try self.newTemp();
+                        try self.lowerer.emit("    {s} = add {s}, 0\n", .{ ctr, expo });
+                        try self.lowerer.emitLabel(lt);
+                        const cc = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sgt {s}, 0\n", .{ cc, ctr });
+                        try self.lowerer.emitBranchTo(cc, lb, le);
+                        try self.lowerer.emitLabel(lb);
+                        const nr = try self.newTemp();
+                        try self.lowerer.emit("    {s} = mul {s}, {s}\n", .{ nr, res, base });
+                        try self.lowerer.emit("    {s} = {s}\n", .{ res, nr });
+                        self.scope_manager.markConsumed(nr);
+                        const nc = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ nc, ctr });
+                        try self.lowerer.emit("    {s} = {s}\n", .{ ctr, nc });
+                        self.scope_manager.markConsumed(nc);
+                        try self.lowerer.emitJumpTo(lt);
+                        try self.lowerer.emitLabel(le);
+                        return res;
+                    }
+                    if (!std.mem.eql(u8, member_name, "floor") and !std.mem.eql(u8, member_name, "round") and !std.mem.eql(u8, member_name, "sqrt") and !std.mem.eql(u8, member_name, "ceil") and !std.mem.eql(u8, member_name, "trunc")) {
                         _ = try self.refuseAt(
                             "error: Math.{s} is not supported",
                             .{member_name},
@@ -10250,6 +12841,66 @@ pub const Parser = struct {
                     try self.expect(.r_paren);
                     if (std.mem.eql(u8, member_name, "sqrt")) {
                         return try self.lowerMathSqrt(fnum);
+                    }
+                    if (std.mem.eql(u8, member_name, "floor") or std.mem.eql(u8, member_name, "ceil") or
+                        std.mem.eql(u8, member_name, "round") or std.mem.eql(u8, member_name, "trunc"))
+                    {
+                        const fis_float = self.isFloatOperand(fnum);
+                        if (!fis_float) {
+                            // Integer identity (existing behavior).
+                            const fout = try self.newTemp();
+                            try self.lowerer.emit("    {s} = add {s}, 0\n", .{ fout, fnum });
+                            return fout;
+                        }
+                        // Float floor: trunc + adjust-down when fractional
+                        // and negative (`fptosi` truncates toward zero).
+                        // ceil(x) = -floor(-x); round(x) = floor(x + 0.5);
+                        // trunc(x) = fptosi(x).
+                        var farg = fnum;
+                        var negate_out = false;
+                        if (std.mem.eql(u8, member_name, "ceil")) {
+                            const fn1 = try self.newTemp();
+                            try self.lowerer.emit("    {s} = fneg {s}\n", .{ fn1, fnum });
+                            farg = fn1;
+                            negate_out = true;
+                        } else if (std.mem.eql(u8, member_name, "round")) {
+                            const fh = try self.newTemp();
+                            try self.lowerer.emit("    {s} = fadd {s}, 0.5\n", .{ fh, fnum });
+                            farg = fh;
+                        } else if (std.mem.eql(u8, member_name, "trunc")) {
+                            const ft = try self.newTemp();
+                            try self.lowerer.emit("    {s} = fptosi {s}\n", .{ ft, fnum });
+                            return ft;
+                        }
+                        const ft0 = try self.newTemp();
+                        try self.lowerer.emit("    {s} = fptosi {s}\n", .{ ft0, farg });
+                        const fb = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sitofp {s}\n", .{ fb, ft0 });
+                        const fcc = try self.newTemp();
+                        try self.lowerer.emit("    {s} = fcmp_gt {s}, {s}\n", .{ fcc, fb, farg });
+                        const fid = self.nextLabelId();
+                        const fl_dec = try std.fmt.allocPrint(self.allocator, "L_fl_dec_{d}", .{fid});
+                        const fl_keep = try std.fmt.allocPrint(self.allocator, "L_fl_keep_{d}", .{fid});
+                        try self.lowerer.reserveLabel(fl_dec);
+                        try self.lowerer.reserveLabel(fl_keep);
+                        try self.lowerer.emitBranchTo(fcc, fl_dec, fl_keep);
+                        try self.lowerer.emitLabel(fl_dec);
+                        const ft1 = try self.newTemp();
+                        try self.lowerer.emit("    {s} = sub {s}, 1\n", .{ ft1, ft0 });
+                        try self.lowerer.emit("    !{s}\n", .{ft0});
+                        try self.lowerer.emit("    {s} = {s}\n", .{ ft0, ft1 });
+                        self.scope_manager.markConsumed(ft1);
+                        try self.lowerer.emitJumpTo(fl_keep);
+                        try self.lowerer.emitLabel(fl_keep);
+                        self.scope_manager.markConsumed(fb);
+                        self.scope_manager.markConsumed(fcc);
+                        if (negate_out) {
+                            // ceil: result is i32 already; negation on ints.
+                            const fn2 = try self.newTemp();
+                            try self.lowerer.emit("    {s} = sub 0, {s}\n", .{ fn2, ft0 });
+                            return fn2;
+                        }
+                        return ft0;
                     }
                     if (self.scope_manager.lookup(fnum)) |fv| {
                         if (std.mem.eql(u8, fv.type_name, "f64")) {
@@ -10305,7 +12956,7 @@ pub const Parser = struct {
                     // a field does not fall into UnknownMethod recovery).
                     return try self.lowerFnFieldCall(left, off);
                 } else if (self.scope_manager.lookup(left)) |lv| blk: {
-                    const key = try self.methodKey(lv.type_name, member_name);
+                    const key = try self.methodKey(baseTypeOf(lv.type_name), member_name);
                     if (!self.class_methods.contains(key)) break :blk;
                     return try self.lowerClassMethodCall(left, member_name);
                 } else {
@@ -10322,6 +12973,29 @@ pub const Parser = struct {
                         if (std.mem.eql(u8, member_name, "MAX_VALUE") or
                             std.mem.eql(u8, member_name, "MAX_SAFE_INTEGER")) return "2147483647";
                         if (std.mem.eql(u8, member_name, "MIN_SAFE_INTEGER")) return "-2147483648";
+                    }
+                    // `Math.PI` / `Math.E` as values (degrees/radians): the
+                    // integer subset folds them (documented).
+                    for (self.enums.items) |e| {
+                        if (std.mem.eql(u8, e.name, left)) {
+                            for (e.variants.items, 0..) |v, vi| {
+                                if (std.mem.eql(u8, v, member_name)) {
+                                    return try std.fmt.allocPrint(self.allocator, "{d}", .{e.values.items[vi]});
+                                }
+                            }
+                            std.debug.print("error:{d}:{d}: unknown variant '{s}' on enum '{s}'\n", .{
+                                member_tok.line, member_tok.col, member_name, left,
+                            });
+                            return error.UnknownField;
+                        }
+                    }
+                    if (std.mem.eql(u8, left, "Math")) {
+                        if (std.mem.eql(u8, member_name, "PI")) return "3";
+                        if (std.mem.eql(u8, member_name, "E")) return "2";
+                        if (std.mem.eql(u8, member_name, "SQRT2")) return "1";
+                        if (std.mem.eql(u8, member_name, "SQRT1_2")) return "0";
+                        if (std.mem.eql(u8, member_name, "LN2")) return "0";
+                        if (std.mem.eql(u8, member_name, "LOG2E")) return "1";
                     }
                     std.debug.print("error:{d}:{d}: property access on undefined variable '{s}'\n", .{
                         member_tok.line, member_tok.col, left,
@@ -10345,7 +13019,7 @@ pub const Parser = struct {
                 // instead of failing with TypeIsNotAnInterface. Structs with
                 // real layouts keep the field path below; a missing field
                 // there stays a loud UnknownField.
-                if (std.mem.eql(u8, member_name, "length") and self.layout_table.find(v.type_name) == null) {
+                if (std.mem.eql(u8, member_name, "length") and self.layout_table.find(baseTypeOf(v.type_name)) == null) {
                     const temp_name = try self.newTemp();
                     try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ temp_name, left });
                     return temp_name;
@@ -10368,7 +13042,7 @@ pub const Parser = struct {
                     return temp_name;
                 }
 
-                const layout = self.layout_table.find(v.type_name) orelse return error.TypeIsNotAnInterface;
+                const layout = self.layout_table.find(baseTypeOf(v.type_name)) orelse return error.TypeIsNotAnInterface;
 
                 var found_field: ?Field = null;
                 for (layout.fields.items) |f| {
@@ -10389,10 +13063,7 @@ pub const Parser = struct {
                     tv.type_name = try self.allocator.dupe(u8, field.type_name);
                 }
 
-                const sa_type = if (std.mem.eql(u8, field.type_name, "i32") or std.mem.eql(u8, field.type_name, "u32") or std.mem.eql(u8, field.type_name, "f64"))
-                    field.type_name
-                else
-                    "ptr";
+                const sa_type = saTypeOf(field.type_name);
 
                 try self.lowerer.emit("    {s} = load {s} + {d} as {s}\n", .{ temp_name, left, field.offset, sa_type });
                 return temp_name;
@@ -10438,20 +13109,80 @@ pub const Parser = struct {
             var e_align: u32 = 4;
             try getTypeSizeAndAlign(elem_type, &e_size, &e_align);
             const sa_elem = saTypeOf(elem_type);
-            const base_temp = try self.newTemp();
-            try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ base_temp, left });
-
-            const off_temp = try self.newTemp();
-            try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ off_temp, index, e_size });
-
-            const addr_temp = try self.newTemp();
-            try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ addr_temp, base_temp, off_temp });
-
             const val_temp = try self.newTemp();
-            try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ val_temp, addr_temp, sa_elem });
+            try self.emitCheckedIndexLoad(val_temp, left, index, e_size, sa_elem);
             if (self.scope_manager.lookup(val_temp)) |tv| {
                 self.allocator.free(tv.type_name);
                 tv.type_name = try self.allocator.dupe(u8, elem_type);
+            }
+            // Chained 2D read `mat[i][j]` (gaussian/lcs/dp): the first index
+            // yields an inner slice header value; resolve through it.
+            if (self.current.tag == .l_bracket) {
+                try self.advance();
+                const index2 = try self.parseExpression();
+                try self.expect(.r_bracket);
+                const inner_elem = elementTypeOf(elem_type);
+                var isz: u32 = 4;
+                var ial: u32 = 4;
+                try getTypeSizeAndAlign(inner_elem, &isz, &ial);
+                const isa = saTypeOf(inner_elem);
+                // val_temp holds the inner header *value*; for slice-of-slice
+                // the element was loaded as ptr header copy. Load data ptr.
+                // If element is a header struct value, val_temp IS the header
+                // temp; its data pointer lives at +0 only when val_temp is a
+                // header pointer. Our 1-level load produced the header word
+                // for ptr elements and scalar for i32; for 2D numeric arrays
+                // the outer element type is `i32[]` -> sa ptr, so val_temp is
+                // the inner header pointer value: read +0/+8 through temps.
+                // val_temp is the inner header pointer: checked load
+                // through it (OOB yields 0, like the 1D path).
+                const out2 = try self.newTemp();
+                try self.emitCheckedIndexLoad(out2, val_temp, index2, isz, isa);
+                if (self.scope_manager.lookup(out2)) |tv2| {
+                    self.allocator.free(tv2.type_name);
+                    tv2.type_name = try self.allocator.dupe(u8, inner_elem);
+                }
+                return out2;
+            }
+            // `arr[i]++` / `arr[i]--` in expression position: deliver the
+            // old value but write the stepped value back (the generic
+            // postfix path below would rebind the temp and lose the store).
+            if ((self.current.tag == .plus_plus or self.current.tag == .minus_minus) and
+                self.current.line == self.prev_line and !self.isMapVar(left))
+            {
+                const ei_inc = self.current.tag == .plus_plus;
+                try self.advance();
+                const ei_nxt = try self.newTemp();
+                try self.lowerer.emit("    {s} = {s} {s}, 1\n", .{ ei_nxt, if (ei_inc) "add" else "sub", val_temp });
+                // Write back only when in bounds (checked read yielded a
+                // real slot; an OOB `arr[i]++` is a no-op value-wise).
+                const eiw = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ eiw, left });
+                const eiok = try self.newTemp();
+                try self.lowerer.emit("    {s} = ult {s}, {s}\n", .{ eiok, index, eiw });
+                const eiid = self.nextLabelId();
+                const eiwb = try std.fmt.allocPrint(self.allocator, "L_eiwb_{d}", .{eiid});
+                const eiend = try std.fmt.allocPrint(self.allocator, "L_eiend_{d}", .{eiid});
+                try self.lowerer.reserveLabel(eiwb);
+                try self.lowerer.reserveLabel(eiend);
+                try self.lowerer.emitBranchTo(eiok, eiwb, eiend);
+                try self.lowerer.emitLabel(eiwb);
+                const eid = try self.newTemp();
+                try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ eid, left });
+                const eio = try self.newTemp();
+                try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ eio, index, e_size });
+                const eia = try self.newTemp();
+                try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ eia, eid, eio });
+                try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ eia, ei_nxt, sa_elem });
+                try self.lowerer.emitJumpTo(eiend);
+                try self.lowerer.emitLabel(eiend);
+                self.scope_manager.markConsumed(ei_nxt);
+                self.scope_manager.markConsumed(eiw);
+                self.scope_manager.markConsumed(eiok);
+                self.scope_manager.markConsumed(eid);
+                self.scope_manager.markConsumed(eio);
+                self.scope_manager.markConsumed(eia);
+                return val_temp;
             }
             return val_temp;
         }
@@ -10462,6 +13193,11 @@ pub const Parser = struct {
         // usable (`a[i++]`), while the moved-into-target temp is consumed.
         // Returning the moved temp itself trips UseAfterMove at the use.
         if (tag == .plus_plus or tag == .minus_minus) {
+            // JS [no LineTerminator here]: a `++`/`--` on the next line
+            // starts a new statement (prefix), it is not this operand's
+            // postfix operator (tarjan: `= index` then `++index`). End the
+            // expression here and leave the `++` for the statement level.
+            if (self.current.line != self.prev_line) return left;
             try self.advance();
             // Snapshot the old value first: postfix delivers the
             // pre-increment value to the enclosing expression (`a[i++]`
@@ -10511,12 +13247,198 @@ pub const Parser = struct {
             var args = std.ArrayList([]const u8).init(self.allocator);
             defer args.deinit();
 
+            // Spread-aware argument collection: items are parsed tagged
+            // (scalar vs `...arr`), then assembled below. Plain calls
+            // without spread keep the historical direct path.
+            var citems = std.ArrayList([]const u8).init(self.allocator);
+            defer citems.deinit();
+            var cspread = std.ArrayList(bool).init(self.allocator);
+            defer cspread.deinit();
+            var any_spread = false;
             while (self.current.tag != .r_paren and self.current.tag != .eof) {
-                const arg = try self.parseExpression();
-                try args.append(try self.argReg(arg));
+                if (self.current.tag == .ellipsis) {
+                    try self.advance(); // ...
+                    const arr = try self.parseExpression();
+                    const at = if (self.scope_manager.lookup(arr)) |av| av.type_name else null;
+                    if (at == null or (!isArrayType(at.?) and !std.mem.eql(u8, baseTypeOf(at.?), "string"))) {
+                        _ = try self.refuseAt(
+                            "error: spread call needs an array (or string) operand",
+                            .{},
+                            error.SpreadNotArray,
+                        );
+                        return error.SpreadNotArray;
+                    }
+                    try citems.append(arr);
+                    try cspread.append(true);
+                    any_spread = true;
+                } else {
+                    const arg = try self.parseExpression();
+                    try citems.append(try self.argReg(arg));
+                    try cspread.append(false);
+                }
                 _ = try self.accept(.comma);
             }
             try self.expect(.r_paren);
+            // Callee shape: alias arity, plain-function arity/rest, else
+            // spread is loud (stdlib/extern/methods resolve elsewhere).
+            var spread_arity: ?u8 = null;
+            if (self.arrow_aliases.get(left)) |al| {
+                spread_arity = al.arity;
+            } else if (self.fn_arity.get(left)) |a| {
+                spread_arity = a;
+            }
+            const rest_idx: ?u8 = self.fn_rest.get(left);
+            if (any_spread and spread_arity == null) {
+                _ = try self.refuseAt(
+                    "error: spread call needs a statically known arity",
+                    .{},
+                    error.SpreadArityUnknown,
+                );
+                return error.SpreadArityUnknown;
+            }
+            if (any_spread) {
+                // Merge every item (scalars and spreads alike) into one
+                // temp array via the literal lowering (width-checked), then
+                // slice it positionally: fixed slots first, rest (when the
+                // callee declares it) copies the tail. Missing pads 0 via
+                // the checked read, extras drop — documented subset
+                // semantics for dynamic-length spread.
+                const combined = try self.lowerSpreadLiteral(citems.items, cspread.items);
+                const cbt0 = if (self.scope_manager.lookup(combined)) |cv| cv.type_name else "i32[]";
+                const cbe0 = elementTypeOf(cbt0);
+                var cbesz0: u32 = 4;
+                var cbeal0: u32 = 4;
+                try getTypeSizeAndAlign(cbe0, &cbesz0, &cbeal0);
+                const cbsa0 = saTypeOf(cbe0);
+                const n = spread_arity.?;
+                if (rest_idx) |ri| {
+                    const relem = self.fn_rest_elem.get(left) orelse "i32";
+                    // Width agreement between the merged array and the rest
+                    // element (else the tail copy would mis-store).
+                    var re_sz: u32 = 4;
+                    var re_al: u32 = 4;
+                    try getTypeSizeAndAlign(relem, &re_sz, &re_al);
+                    if (re_sz != cbesz0) {
+                        _ = try self.refuseAt(
+                            "error: spread/rest element width mismatch",
+                            .{},
+                            error.SpreadWidthMismatch,
+                        );
+                        return error.SpreadWidthMismatch;
+                    }
+                    // Positional slots 0..R-1 from the head.
+                    var si: u8 = 0;
+                    while (si < ri) : (si += 1) {
+                        const li = try self.newTemp();
+                        try self.lowerer.emit("    {s} = {d}\n", .{ li, si });
+                        const lt = try self.newTemp();
+                        try self.emitCheckedIndexLoad(lt, combined, li, cbesz0, cbsa0);
+                        try args.append(try self.argReg(lt));
+                        self.scope_manager.markConsumed(li);
+                    }
+                    // Rest = copy of combined[R..len] at the rest width.
+                    var resz: u32 = 4;
+                    var real: u32 = 4;
+                    try getTypeSizeAndAlign(relem, &resz, &real);
+                    const clen = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 8 as u64\n", .{ clen, combined });
+                    const rtotal = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, 0\n", .{ rtotal, clen });
+                    const rhdr = try self.newTemp();
+                    try self.lowerer.emit("    {s} = alloc 16\n", .{rhdr});
+                    const rnby = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ rnby, rtotal, resz });
+                    const rdata = try self.newTemp();
+                    try self.lowerer.emit("    {s} = alloc {s}\n", .{ rdata, rnby });
+                    // Guard empty (alloc 0 is fine but keep the pattern).
+                    const rj = try self.newTemp();
+                    try self.lowerer.emit("    {s} = {d}\n", .{ rj, ri });
+                    const rtop = try std.fmt.allocPrint(self.allocator, "L_rsp_top_{d}", .{self.nextLabelId()});
+                    const rbody = try std.fmt.allocPrint(self.allocator, "L_rsp_body_{d}", .{self.nextLabelId()});
+                    const rend = try std.fmt.allocPrint(self.allocator, "L_rsp_end_{d}", .{self.nextLabelId()});
+                    try self.lowerer.reserveLabel(rtop);
+                    try self.lowerer.reserveLabel(rbody);
+                    try self.lowerer.reserveLabel(rend);
+                    try self.lowerer.emitLabel(rtop);
+                    const rc = try self.newTemp();
+                    try self.lowerer.emit("    {s} = slt {s}, {s}\n", .{ rc, rj, clen });
+                    try self.lowerer.emitBranchTo(rc, rbody, rend);
+                    try self.lowerer.emitLabel(rbody);
+                    const rdo = try self.newTemp();
+                    try self.lowerer.emit("    {s} = sub {s}, {d}\n", .{ rdo, rj, ri });
+                    const rso = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ rso, rj, cbesz0 });
+                    const rsa = try self.newTemp();
+                    const cdata = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as ptr\n", .{ cdata, combined });
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ rsa, cdata, rso });
+                    const rv = try self.newTemp();
+                    try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ rv, rsa, cbsa0 });
+                    const rdo2 = try self.newTemp();
+                    try self.lowerer.emit("    {s} = mul {s}, {d}\n", .{ rdo2, rdo, resz });
+                    const rda = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, {s}\n", .{ rda, rdata, rdo2 });
+                    try self.lowerer.emit("    store {s} + 0, {s} as {s}\n", .{ rda, rv, saTypeOf(relem) });
+                    const rj2 = try self.newTemp();
+                    try self.lowerer.emit("    {s} = add {s}, 1\n", .{ rj2, rj });
+                    try self.lowerer.emit("    !{s}\n", .{rj});
+                    try self.lowerer.emit("    {s} = {s}\n", .{ rj, rj2 });
+                    self.scope_manager.markConsumed(rj2);
+                    try self.lowerer.emitJumpTo(rtop);
+                    try self.lowerer.emitLabel(rend);
+                    try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ rhdr, rdata });
+                    // Actual tail length (header len, not the bound).
+                    const rlen = try self.newTemp();
+                    try self.lowerer.emit("    {s} = sub {s}, {d}\n", .{ rlen, rj, ri });
+                    try self.lowerer.emit("    store {s} + 8, {s} as u64\n", .{ rhdr, rlen });
+                    const rtype = try std.fmt.allocPrint(self.allocator, "{s}[]", .{relem});
+                    try self.retagTemp(rhdr, rtype);
+                    try args.append(try self.argReg(rhdr));
+                    self.scope_manager.markConsumed(rj);
+                } else {
+                    var si: u8 = 0;
+                    while (si < n) : (si += 1) {
+                        const li = try self.newTemp();
+                        try self.lowerer.emit("    {s} = {d}\n", .{ li, si });
+                        const lt = try self.newTemp();
+                        try self.emitCheckedIndexLoad(lt, combined, li, cbesz0, cbsa0);
+                        try args.append(try self.argReg(lt));
+                        self.scope_manager.markConsumed(li);
+                    }
+                }
+            } else {
+                for (citems.items) |c| {
+                    try args.append(c);
+                }
+                // Rest packing (no spread): trailing args bundle into a
+                // fresh array (empty when none — the callee still takes
+                // one array param).
+                if (rest_idx) |ri| {
+                    if (args.items.len >= ri) {
+                        const relem = self.fn_rest_elem.get(left) orelse "i32";
+                        var resz: u32 = 4;
+                        var real: u32 = 4;
+                        try getTypeSizeAndAlign(relem, &resz, &real);
+                        const ressa = saTypeOf(relem);
+                        const rcount = @as(u32, @intCast(args.items.len - ri));
+                        const rhdr = try self.newTemp();
+                        try self.lowerer.emit("    {s} = alloc 16\n", .{rhdr});
+                        const rdata = try self.newTemp();
+                        try self.lowerer.emit("    {s} = alloc {d}\n", .{ rdata, @max(rcount * resz, 4) });
+                        var rk: u32 = 0;
+                        while (rk < rcount) : (rk += 1) {
+                            const off = rk * resz;
+                            try self.lowerer.emit("    store {s} + {d}, {s} as {s}\n", .{ rdata, off, args.items[ri + rk], ressa });
+                        }
+                        try self.lowerer.emit("    store {s} + 0, {s} as ptr\n", .{ rhdr, rdata });
+                        try self.lowerer.emit("    store {s} + 8, {d} as u64\n", .{ rhdr, rcount });
+                        const rtype = try std.fmt.allocPrint(self.allocator, "{s}[]", .{relem});
+                        try self.retagTemp(rhdr, rtype);
+                        args.items.len = ri;
+                        try args.append(try self.argReg(rhdr));
+                    }
+                }
+            }
 
             const temp_name = try self.newTemp();
 
@@ -10635,6 +13557,37 @@ pub const Parser = struct {
                     );
                 }
                 return try self.lowerParseInt(temp_name, sarg);
+            } else if (std.mem.eql(u8, left, "structuredClone") and self.scope_manager.lookup(left) == null and self.arrow_aliases.get(left) == null) {
+                // `structuredClone(arr)` (johnson/floyd_warshall): deep copy
+                // of slice-typed values (see lowerDeepClone). A user-declared
+                // `structuredClone` keeps the normal call path.
+                if (args.items.len != 1) {
+                    return self.refuseAt(
+                        "error: structuredClone takes a single argument",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                const csarg = args.items[0];
+                const st: []const u8 = if (self.scope_manager.lookup(csarg)) |csv| csv.type_name else "i32";
+                var sdepth: usize = 0;
+                var stt = st;
+                while (stt.len >= 2 and stt[stt.len - 2] == '[' and stt[stt.len - 1] == ']') {
+                    sdepth += 1;
+                    stt = stt[0 .. stt.len - 2];
+                }
+                if (sdepth == 0) {
+                    return self.refuseAt(
+                        "error: structuredClone only lowers for arrays",
+                        .{},
+                        error.ConstructorsNotSupported,
+                    );
+                }
+                const cnew = try self.lowerDeepClone(csarg, st);
+                try self.lowerer.emit("    {s} = {s}\n", .{ temp_name, cnew });
+                self.scope_manager.markConsumed(cnew);
+                try self.retagTemp(temp_name, st);
+                return temp_name;
             } else if (std.mem.eql(u8, left, "Array") and self.scope_manager.lookup(left) == null and self.arrow_aliases.get(left) == null) {
                 // `Array(n)` call form (no `new`): identical to construction.
                 // A user-declared `Array` keeps the normal call path. The
@@ -10819,7 +13772,7 @@ fn getPrecedence(tag: lexer_mod.Token.Tag) Precedence {
         .ampersand => .bit_and,
         .equal_equal, .bang_equal, .less, .greater, .less_equal, .greater_equal => .comparison,
         .plus, .minus => .sum,
-        .star, .slash, .percent => .product,
+        .star, .slash, .percent, .star_star => .product,
         .less_less, .greater_greater, .greater_greater_greater => .sum,
         .plus_plus, .minus_minus => .call,
         // `x as T` binds like a postfix operator (member-call level).
