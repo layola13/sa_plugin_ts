@@ -61,7 +61,7 @@ pub const Variable = struct {
 };
 
 pub const Scope = struct {
-    variables: std.ArrayList(Variable),
+    variables: std.array_list.Managed(Variable),
     
     pub fn deinit(self: *Scope, allocator: std.mem.Allocator) void {
         for (self.variables.items) |v| {
@@ -75,7 +75,7 @@ pub const Scope = struct {
 
 pub const ScopeManager = struct {
     allocator: std.mem.Allocator,
-    scopes: std.ArrayList(Scope),
+    scopes: std.array_list.Managed(Scope),
 
     /// When true, `exitScope` no longer emits releases; the parser calls
     /// `releaseAllOwned` at each return site instead.
@@ -88,7 +88,7 @@ pub const ScopeManager = struct {
     pub fn init(allocator: std.mem.Allocator) ScopeManager {
         return .{
             .allocator = allocator,
-            .scopes = std.ArrayList(Scope).init(allocator),
+            .scopes = std.array_list.Managed(Scope).init(allocator),
         };
     }
 
@@ -101,7 +101,7 @@ pub const ScopeManager = struct {
 
     pub fn enterScope(self: *ScopeManager) !void {
         const scope = Scope{
-            .variables = std.ArrayList(Variable).init(self.allocator),
+            .variables = std.array_list.Managed(Variable).init(self.allocator),
         };
         try self.scopes.append(scope);
     }
@@ -182,10 +182,10 @@ pub const ScopeManager = struct {
     /// Scopes only push/pop at the top and variables only append, so
     /// restoring by (depth, index) prefix is stable; added scopes/vars are
     /// left alone.
-    pub fn snapshotFlags(self: *ScopeManager, allocator: std.mem.Allocator) !std.ArrayList(std.ArrayList(FlagSnap)) {
-        var out = std.ArrayList(std.ArrayList(FlagSnap)).init(allocator);
+    pub fn snapshotFlags(self: *ScopeManager, allocator: std.mem.Allocator) !std.array_list.Managed(std.array_list.Managed(FlagSnap)) {
+        var out = std.array_list.Managed(std.array_list.Managed(FlagSnap)).init(allocator);
         for (self.scopes.items) |*scope| {
-            var one = std.ArrayList(FlagSnap).init(allocator);
+            var one = std.array_list.Managed(FlagSnap).init(allocator);
             for (scope.variables.items) |*v| {
                 try one.append(.{ .consumed = v.is_consumed, .released = v.is_released });
             }
@@ -196,7 +196,7 @@ pub const ScopeManager = struct {
 
     /// Restore a snapshot taken with snapshotFlags (prefix-wise; see above).
     /// Emissions are untouched — only future emission decisions change.
-    pub fn restoreFlags(self: *ScopeManager, snap: std.ArrayList(std.ArrayList(FlagSnap))) void {
+    pub fn restoreFlags(self: *ScopeManager, snap: std.array_list.Managed(std.array_list.Managed(FlagSnap))) void {
         const n = @min(snap.items.len, self.scopes.items.len);
         var d: usize = 0;
         while (d < n) : (d += 1) {
@@ -211,7 +211,7 @@ pub const ScopeManager = struct {
     }
 
     /// Free a snapshot taken with snapshotFlags.
-    pub fn freeSnap(self: *ScopeManager, snap: *std.ArrayList(std.ArrayList(FlagSnap))) void {
+    pub fn freeSnap(self: *ScopeManager, snap: *std.array_list.Managed(std.array_list.Managed(FlagSnap))) void {
         for (snap.items) |*one| one.deinit();
         snap.deinit();
         _ = self;

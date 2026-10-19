@@ -2,17 +2,17 @@ const std = @import("std");
 
 pub const Lowerer = struct {
     allocator: std.mem.Allocator,
-    output: std.ArrayList(u8),
+    output: std.array_list.Managed(u8),
 
     /// File-scope declarations (SA `@const` data constants).
     ///
     /// SA-ASM requires these at module scope, but they are discovered while
     /// walking function bodies, so they are buffered here and prepended to the
     /// output by `toOwnedSlice`.
-    header: std.ArrayList(u8),
+    header: std.array_list.Managed(u8),
 
     /// Already-emitted `@import` paths, so imports are deduplicated.
-    imports: std.ArrayList([]const u8),
+    imports: std.array_list.Managed([]const u8),
 
     /// Arity-matched `@extern` names already declared in the header.
     externs: std.StringHashMapUnmanaged(void) = .{},
@@ -25,7 +25,7 @@ pub const Lowerer = struct {
     /// SA-ASM has no nested functions: emitting the callback inline splits the
     /// parent's basic block (FallthroughForbidden). Callbacks are buffered here
     /// and spliced between the header and the main output by `toOwnedSlice`.
-    callbacks: std.ArrayList(u8),
+    callbacks: std.array_list.Managed(u8),
 
     /// When non-null, `emit` redirects into this buffer instead of `output`.
     ///
@@ -34,7 +34,7 @@ pub const Lowerer = struct {
     /// the instruction stream without disturbing parse order. SA-ASM requires
     /// basic blocks to be emitted in execution order, so the `for` increment
     /// must physically follow the loop body, not the loop header.
-    capture: ?*std.ArrayList(u8) = null,
+    capture: ?*std.array_list.Managed(u8) = null,
 
     /// Label not yet written out. Deferred so a label whose block would end up
     /// empty can be dropped or given a body, which SA-ASM requires: every basic
@@ -69,7 +69,7 @@ pub const Lowerer = struct {
     /// Resolution against `written_serials` happens per
     /// `computeDominators` call, so later calls see more labels and the
     /// result only grows more complete; nothing here is ever speculative.
-    succ_names: std.ArrayListUnmanaged(std.ArrayListUnmanaged([]const u8)) = .{},
+    succ_names: std.ArrayListUnmanaged(std.ArrayListUnmanaged([]const u8)) = .empty,
 
     /// Serial of each label actually written to the output, for resolving
     /// `succ_names`. A pending label that is dropped (unreferenced and
@@ -80,10 +80,10 @@ pub const Lowerer = struct {
     pub fn init(allocator: std.mem.Allocator) Lowerer {
         return .{
             .allocator = allocator,
-            .output = std.ArrayList(u8).init(allocator),
-            .header = std.ArrayList(u8).init(allocator),
-            .imports = std.ArrayList([]const u8).init(allocator),
-            .callbacks = std.ArrayList(u8).init(allocator),
+            .output = std.array_list.Managed(u8).init(allocator),
+            .header = std.array_list.Managed(u8).init(allocator),
+            .imports = std.array_list.Managed([]const u8).init(allocator),
+            .callbacks = std.array_list.Managed(u8).init(allocator),
         };
     }
 
@@ -102,7 +102,7 @@ pub const Lowerer = struct {
 
     /// Declare a file-scope UTF-8 data constant.
     pub fn emitConst(self: *Lowerer, name: []const u8, text: []const u8) !void {
-        try self.header.writer().print("@const {s} = utf8:\"", .{name});
+        try self.header.print("@const {s} = utf8:\"", .{name});
         for (text) |ch| {
             switch (ch) {
                 '"' => try self.header.appendSlice("\\\""),
@@ -126,7 +126,7 @@ pub const Lowerer = struct {
             if (std.mem.eql(u8, existing, path)) return;
         }
         try self.imports.append(path);
-        try self.header.writer().print("@import \"{s}\"\n", .{path});
+        try self.header.print("@import \"{s}\"\n", .{path});
     }
 
     /// Record that `name` is the target of a branch, so it must be emitted.
@@ -148,11 +148,11 @@ pub const Lowerer = struct {
     pub fn emitExtern(self: *Lowerer, name: []const u8, arity: usize) !void {
         if (self.externs.contains(name)) return;
         try self.externs.put(self.allocator, name, {});
-        try self.header.writer().print("@extern {s}(", .{name});
+        try self.header.print("@extern {s}(", .{name});
         var i: usize = 0;
         while (i < arity) : (i += 1) {
             if (i > 0) try self.header.appendSlice(", ");
-            try self.header.writer().print("a{d}: i32", .{i});
+            try self.header.print("a{d}: i32", .{i});
         }
         try self.header.appendSlice(") -> i32\n");
     }
@@ -164,7 +164,7 @@ pub const Lowerer = struct {
     pub fn emitVTableFn(self: *Lowerer, name: []const u8, cb: []const u8) !void {
         if (self.vtables.contains(name)) return;
         try self.vtables.put(self.allocator, name, {});
-        try self.header.writer().print("@const {s} = vtable {{ call = {s} }}\n", .{ name, cb });
+        try self.header.print("@const {s} = vtable {{ call = {s} }}\n", .{ name, cb });
     }
 
     /// Mark `name` as needing emission before any branch to it is seen.
@@ -188,7 +188,7 @@ pub const Lowerer = struct {
             // this one), and those instructions need a block to live in.
             // A label that ends a function with nothing after it is dropped by
             // `finishFunction` instead, which checks before flushing.
-            try self.output.writer().print("{s}:\n", .{label});
+            try self.output.print("{s}:\n", .{label});
             // The single choke point where a label becomes a real block: all
             // CFG resolution reads this map, so a dropped label (never
             // flushed) can never misroute an edge.
@@ -203,7 +203,7 @@ pub const Lowerer = struct {
         if (self.succ_names.items.len <= serial) {
             const old_len = self.succ_names.items.len;
             try self.succ_names.resize(self.allocator, serial + 1);
-            for (self.succ_names.items[old_len..]) |*l| l.* = .{};
+            for (self.succ_names.items[old_len..]) |*l| l.* = .empty;
         }
     }
 
@@ -211,17 +211,17 @@ pub const Lowerer = struct {
     fn growBlock(self: *Lowerer) !void {
         const old_len = self.succ_names.items.len;
         try self.succ_names.resize(self.allocator, self.block_serial + 1);
-        for (self.succ_names.items[old_len..]) |*l| l.* = .{};
+        for (self.succ_names.items[old_len..]) |*l| l.* = .empty;
     }
 
     /// Emit an ordinary (non-terminating) instruction.
     pub fn emit(self: *Lowerer, comptime fmt: []const u8, args: anytype) !void {
         if (self.capture) |buf| {
-            try buf.writer().print(fmt, args);
+            try buf.print(fmt, args);
             return;
         }
         try self.flushPending();
-        try self.output.writer().print(fmt, args);
+        try self.output.print(fmt, args);
         self.block_empty = false;
         self.block_terminated = false;
     }
@@ -257,14 +257,14 @@ pub const Lowerer = struct {
     /// jump to `name` is emitted so the block is well-formed.
     pub fn emitLabel(self: *Lowerer, name: []const u8) !void {
         if (self.capture) |buf| {
-            try buf.writer().print("{s}:\n", .{name});
+            try buf.print("{s}:\n", .{name});
             return;
         }
         if (self.pending_label) |prev| {
             if (self.labelUsed(prev)) {
                 try self.flushPending();
                 if (self.block_empty) {
-                    try self.output.writer().print("    jmp {s}\n", .{name});
+                    try self.output.print("    jmp {s}\n", .{name});
                     try self.ensureBlock(self.block_serial);
                     try self.succ_names.items[self.block_serial].append(self.allocator, name);
                 }
@@ -336,7 +336,7 @@ pub const Lowerer = struct {
             for (succs) |*l| l.deinit(self.allocator);
             self.allocator.free(succs);
         }
-        for (succs) |*l| l.* = .{};
+        for (succs) |*l| l.* = .empty;
         for (self.succ_names.items, 0..) |*names, from| {
             if (from >= n) break;
             for (names.items) |tgt| {
@@ -364,7 +364,7 @@ pub const Lowerer = struct {
             for (preds) |*l| l.deinit(self.allocator);
             self.allocator.free(preds);
         }
-        for (preds) |*l| l.* = .{};
+        for (preds) |*l| l.* = .empty;
         for (succs, 0..) |*list, from| {
             for (list.items) |to| {
                 preds[to].append(self.allocator, @intCast(from)) catch {};

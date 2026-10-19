@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const lexer_mod = @import("lexer.zig");
 const scope_mod = @import("scope.zig");
 const lowerer_mod = @import("lowerer.zig");
@@ -24,7 +25,7 @@ const JumpTarget = struct {
 pub const StructLayout = struct {
     name: []const u8,
     size: u32,
-    fields: std.ArrayList(Field),
+    fields: std.array_list.Managed(Field),
 
     pub fn deinit(self: *StructLayout, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -38,12 +39,12 @@ pub const StructLayout = struct {
 
 pub const LayoutTable = struct {
     allocator: std.mem.Allocator,
-    layouts: std.ArrayList(StructLayout),
+    layouts: std.array_list.Managed(StructLayout),
 
     pub fn init(allocator: std.mem.Allocator) LayoutTable {
         return .{
             .allocator = allocator,
-            .layouts = std.ArrayList(StructLayout).init(allocator),
+            .layouts = std.array_list.Managed(StructLayout).init(allocator),
         };
     }
 
@@ -71,8 +72,8 @@ pub const LayoutTable = struct {
 
 pub const EnumDef = struct {
     name: []const u8,
-    variants: std.ArrayList([]const u8),
-    values: std.ArrayList(i64),
+    variants: std.array_list.Managed([]const u8),
+    values: std.array_list.Managed(i64),
 
     pub fn deinit(self: *EnumDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -267,15 +268,15 @@ pub const Parser = struct {
     /// SA-ASM has no `break`/`continue` instructions: both are unconditional
     /// jumps, so the enclosing construct's label must be known at the point
     /// the statement is emitted.
-    break_stack: std.ArrayList(JumpTarget) = undefined,
-    continue_stack: std.ArrayList(JumpTarget) = undefined,
+    break_stack: std.array_list.Managed(JumpTarget) = undefined,
+    continue_stack: std.array_list.Managed(JumpTarget) = undefined,
 
     /// Parameters of each enclosing function, so `return` can release them.
     ///
     /// SA-ASM requires every live register to be released before a function
     /// exits, and parameters are live registers. Releases must precede the
     /// `return` on each path, otherwise they become unreachable code.
-    func_param_stack: std.ArrayList([][]const u8) = undefined,
+    func_param_stack: std.array_list.Managed([][]const u8) = undefined,
     last_arrow_ctx: ?[]const u8 = null,
     /// Nesting depth inside arrow closure callbacks. A value-return inside an
     /// arrow body is diagnosed loudly: void callbacks cannot carry a value and
@@ -286,7 +287,7 @@ pub const Parser = struct {
     /// (`row` in `mat.map((row) => row.map(...))`); the dot-dispatch chain
     /// consults this set so array methods on such params still reach
     /// `lowerArrayMethodCall` (scalar-element assumption, documented).
-    arrow_param_names: std.ArrayList([]const u8) = undefined,
+    arrow_param_names: std.array_list.Managed([]const u8) = undefined,
     /// Declared return type (TS spelling) per function name, recorded when
     /// a `function` or top-level arrow signature is lowered. Expression-
     /// level call sites retag the result temp from it, so `const c = f()`
@@ -362,11 +363,11 @@ pub const Parser = struct {
     async_inner: ?[]const u8 = null,
     /// Async function names (duped) to their inner value type (duped).
     async_fns: std.StringHashMap([]const u8) = undefined,
-    errors: std.ArrayList(ParseError),
+    errors: std.array_list.Managed(ParseError),
     has_fatal_error: bool = false,
     template_lexer_mode: bool = false,
-    enums: std.ArrayList(EnumDef),
-    stdlib: std.ArrayList(StdlibEntry),
+    enums: std.array_list.Managed(EnumDef),
+    stdlib: std.array_list.Managed(StdlibEntry),
 
     pub const StdlibEntry = struct {
         name: []const u8,
@@ -392,17 +393,17 @@ pub const Parser = struct {
             .current = current,
             .peek = peek,
             .label_counter = 0,
-            .break_stack = std.ArrayList(JumpTarget).init(allocator),
-            .continue_stack = std.ArrayList(JumpTarget).init(allocator),
-            .func_param_stack = std.ArrayList([][]const u8).init(allocator),
+            .break_stack = std.array_list.Managed(JumpTarget).init(allocator),
+            .continue_stack = std.array_list.Managed(JumpTarget).init(allocator),
+            .func_param_stack = std.array_list.Managed([][]const u8).init(allocator),
             .async_fns = std.StringHashMap([]const u8).init(allocator),
-            .enums = std.ArrayList(EnumDef).init(allocator),
-            .stdlib = std.ArrayList(StdlibEntry).init(allocator),
-            .errors = std.ArrayList(ParseError).init(allocator),
+            .enums = std.array_list.Managed(EnumDef).init(allocator),
+            .stdlib = std.array_list.Managed(StdlibEntry).init(allocator),
+            .errors = std.array_list.Managed(ParseError).init(allocator),
         };
 
         // Pre-register built-in 'string' interface
-        var string_fields = std.ArrayList(Field).init(allocator);
+        var string_fields = std.array_list.Managed(Field).init(allocator);
         try string_fields.append(.{ .name = try allocator.dupe(u8, "ptr"), .offset = 0, .type_name = try allocator.dupe(u8, "ptr") });
         try string_fields.append(.{ .name = try allocator.dupe(u8, "len"), .offset = 8, .type_name = try allocator.dupe(u8, "u32") });
         const string_layout = StructLayout{
@@ -421,7 +422,7 @@ pub const Parser = struct {
         parser_inst.method_emit_owner = std.StringHashMap([]const u8).init(allocator);
         parser_inst.field_inits = std.StringHashMap([]const u8).init(allocator);        parser_inst.captureless_cb = std.StringHashMap(void).init(allocator);        parser_inst.cb_sigs = std.StringHashMap(CbSig).init(allocator);        parser_inst.generic_instances = std.StringHashMap(GenericBinding).init(allocator);
         parser_inst.imported_files = std.StringHashMap(void).init(allocator);
-        parser_inst.arrow_param_names = std.ArrayList([]const u8).init(allocator);
+        parser_inst.arrow_param_names = std.array_list.Managed([]const u8).init(allocator);
         parser_inst.fn_ret = std.StringHashMap([]const u8).init(allocator);
         parser_inst.fn_arity = std.StringHashMap(u8).init(allocator);
         parser_inst.fn_rest = std.StringHashMap(u8).init(allocator);
@@ -672,7 +673,7 @@ pub const Parser = struct {
     }
 
     /// Collect identifier-ish tokens from a type text, skipping keywords.
-    fn collectTypeIdents(self: *Parser, text: []const u8, out: *std.ArrayList([]const u8)) anyerror!void {
+    fn collectTypeIdents(self: *Parser, text: []const u8, out: *std.array_list.Managed([]const u8)) anyerror!void {
         _ = self;
         var i: usize = 0;
         while (i < text.len) {
@@ -941,7 +942,7 @@ pub const Parser = struct {
     /// owns those registers. Marking them released here would leak them on
     /// the ready path.
     fn emitPendingReturnCleanups(self: *Parser, keep: []const u8) anyerror!void {
-        var saved = std.ArrayList(bool).init(self.allocator);
+        var saved = std.array_list.Managed(bool).init(self.allocator);
         defer saved.deinit();
         for (self.scope_manager.scopes.items) |*scope| {
             for (scope.variables.items) |*v| {
@@ -1049,7 +1050,7 @@ pub const Parser = struct {
             },
         };
         try self.expect(.l_bracket);
-        var targets = std.ArrayList(Target).init(self.allocator);
+        var targets = std.array_list.Managed(Target).init(self.allocator);
         defer targets.deinit();
         while (true) {
             // Base: identifier or `this`.
@@ -1142,7 +1143,7 @@ pub const Parser = struct {
         try self.expect(.r_bracket);
         try self.expect(.equal);
         try self.expect(.l_bracket);
-        var tmps = std.ArrayList([]const u8).init(self.allocator);
+        var tmps = std.array_list.Managed([]const u8).init(self.allocator);
         defer tmps.deinit();
         while (true) {
             const e = try self.parseExpression();
@@ -1804,7 +1805,7 @@ pub const Parser = struct {
 
         try self.expect(.l_brace);
 
-        var fields = std.ArrayList(Field).init(self.allocator);
+        var fields = std.array_list.Managed(Field).init(self.allocator);
         var offset: u32 = 0;
 
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
@@ -1890,8 +1891,8 @@ pub const Parser = struct {
 
     /// Parse one method/constructor parameter list into (name, type) pairs,
     /// skipping modifiers and `?` optional markers. Assumes cursor is on `(`.
-    fn parseMethodParams(self: *Parser) anyerror!std.ArrayList(MethodParam) {
-        var params = std.ArrayList(MethodParam).init(self.allocator);
+    fn parseMethodParams(self: *Parser) anyerror!std.array_list.Managed(MethodParam) {
+        var params = std.array_list.Managed(MethodParam).init(self.allocator);
         try self.expect(.l_paren);
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
             const had_mod = try self.skipModifiers();
@@ -2339,7 +2340,7 @@ pub const Parser = struct {
         // child key (shared body — layouts prefix). Overrides (emitted
         // later) overwrite these entries; pre-scan stubs skip existing keys.
         if (self.class_parent.get(class_name)) |parent_name| {
-            var to_alias = std.ArrayList([]const u8).init(self.allocator);
+            var to_alias = std.array_list.Managed([]const u8).init(self.allocator);
             defer to_alias.deinit();
             var kit = self.class_methods.keyIterator();
             const prefix = try std.fmt.allocPrint(self.allocator, "{s}.", .{parent_name});
@@ -2373,7 +2374,7 @@ pub const Parser = struct {
             const saved_current = self.current;
             const saved_peek = self.peek;
             const saved_tpl = self.template_lexer_mode;
-            var pre_fields = std.ArrayList(Field).init(self.allocator);
+            var pre_fields = std.array_list.Managed(Field).init(self.allocator);
             var pre_offset: u32 = 0;
             // Copy-down: parent fields prefix the child layout, so every
             // parent offset is valid on child instances and parent method
@@ -2422,7 +2423,7 @@ pub const Parser = struct {
                         // Every param (property or plain) is also recorded
                         // for forward `new` short-arg padding.
                         try self.expect(.l_paren);
-                        var pp_stored = std.ArrayList(StoredParam).init(self.allocator);
+                        var pp_stored = std.array_list.Managed(StoredParam).init(self.allocator);
                         defer pp_stored.deinit();
                         while (self.current.tag != .r_paren and self.current.tag != .eof) {
                             const pp_had_mod = try self.skipModifiers();
@@ -2699,7 +2700,7 @@ pub const Parser = struct {
             }
             return;
         }
-        var fields = std.ArrayList(Field).init(self.allocator);
+        var fields = std.array_list.Managed(Field).init(self.allocator);
         var offset: u32 = 0;
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
             _ = try self.skipModifiers();
@@ -2746,7 +2747,7 @@ pub const Parser = struct {
                 // the source slice, and replay it in the ctor (explicit or
                 // synthesized). Imports/consts still land in the header.
                 const istart: usize = @as(usize, self.current.start);
-                var discard = std.ArrayList(u8).init(self.allocator);
+                var discard = std.array_list.Managed(u8).init(self.allocator);
                 defer discard.deinit();
                 const saved_cap = self.lowerer.capture;
                 self.lowerer.capture = &discard;
@@ -2833,7 +2834,7 @@ pub const Parser = struct {
         // call sites verify. Aliased (inherited) entries are skipped — the
         // parent body already exists under its own name.
         {
-            var stubs = std.ArrayList([]const u8).init(self.allocator);
+            var stubs = std.array_list.Managed([]const u8).init(self.allocator);
             defer stubs.deinit();
             var sit = self.class_methods.keyIterator();
             const sprefix = try std.fmt.allocPrint(self.allocator, "{s}.", .{class_name});
@@ -2964,7 +2965,7 @@ pub const Parser = struct {
         // Node<T>` can build inline.
         if (self.current.tag == .l_brace) {
             try self.advance();
-            var alias_fields = std.ArrayList(Field).init(self.allocator);
+            var alias_fields = std.array_list.Managed(Field).init(self.allocator);
             var alias_offset: u32 = 0;
             while (self.current.tag != .r_brace and self.current.tag != .eof) {
                 const af_tok = self.current;
@@ -3007,7 +3008,7 @@ pub const Parser = struct {
 
         // Register as an alias by duplicating the target layout if it exists
         if (self.layout_table.find(target)) |src_layout| {
-            var alias_fields = std.ArrayList(Field).init(self.allocator);
+            var alias_fields = std.array_list.Managed(Field).init(self.allocator);
             for (src_layout.fields.items) |f| {
                 try alias_fields.append(.{
                     .name = try self.allocator.dupe(u8, f.name),
@@ -3036,8 +3037,8 @@ pub const Parser = struct {
 
         try self.expect(.l_brace);
 
-        var variants = std.ArrayList([]const u8).init(self.allocator);
-        var values = std.ArrayList(i64).init(self.allocator);
+        var variants = std.array_list.Managed([]const u8).init(self.allocator);
+        var values = std.array_list.Managed(i64).init(self.allocator);
         var val: i64 = 0;
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
             const v_tok = self.current;
@@ -3071,10 +3072,10 @@ pub const Parser = struct {
     /// Unify one ctor `fn`-param type against one closure signature for
     /// call-site generic inference. Returns false on conflict (abandon).
     fn unifyGenericPair(self: *Parser, ctor_ty: []const u8, cb_types: [][]const u8, var_name: *?[]const u8, concrete: *?[]const u8) anyerror!bool {
-        var cids = std.ArrayList([]const u8).init(self.allocator);
+        var cids = std.array_list.Managed([]const u8).init(self.allocator);
         defer cids.deinit();
         try self.collectTypeIdents(ctor_ty, &cids);
-        var oids = std.ArrayList([]const u8).init(self.allocator);
+        var oids = std.array_list.Managed([]const u8).init(self.allocator);
         defer oids.deinit();
         for (cb_types) |ct| {
             try self.collectTypeIdents(ct, &oids);
@@ -3368,9 +3369,9 @@ pub const Parser = struct {
             var elem_align: u32 = 4;
             try getTypeSizeAndAlign(elem_type, &elem_size, &elem_align);
 
-            var values = std.ArrayList([]const u8).init(self.allocator);
+            var values = std.array_list.Managed([]const u8).init(self.allocator);
             defer values.deinit();
-            var spread_flags = std.ArrayList(bool).init(self.allocator);
+            var spread_flags = std.array_list.Managed(bool).init(self.allocator);
             defer spread_flags.deinit();
             var has_spread = false;
 
@@ -3804,7 +3805,7 @@ pub const Parser = struct {
         try self.arrow_aliases.put(key, .{ .cb = cb_name, .ctx = "", .plain = true });
         try self.scope_manager.declareVar(name, "fn", name, false);
 
-        var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
+        var params = std.array_list.Managed(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
         // Leading type params (`<T>(arr: T[]) =>`): erased, skip.
         if (self.current.tag == .less) {
@@ -4004,7 +4005,7 @@ pub const Parser = struct {
 
         try self.expect(.l_paren);
 
-        var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
+        var params = std.array_list.Managed(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
         var rest_idx: ?u8 = null;
 
@@ -4164,7 +4165,7 @@ pub const Parser = struct {
 
         try self.expect(.l_paren);
 
-        var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
+        var params = std.array_list.Managed(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
 
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
@@ -5053,9 +5054,9 @@ pub const Parser = struct {
         // loop runs body-then-increment. Emitting it here would place the
         // increment ahead of the loop test, running the body one extra time
         // with an already-incremented induction variable.
-        var inc_buf: ?std.ArrayList(u8) = null;
+        var inc_buf: ?std.array_list.Managed(u8) = null;
         if (self.current.tag != .r_paren) {
-            var buf = std.ArrayList(u8).init(self.allocator);
+            var buf = std.array_list.Managed(u8).init(self.allocator);
             self.lowerer.capture = &buf;
             const inc_result = self.parseForIncrement();
             self.lowerer.capture = null;
@@ -5405,7 +5406,7 @@ pub const Parser = struct {
         try self.expect(.keyword_import);
         try self.expect(.l_brace);
 
-        var symbols = std.ArrayList([]const u8).init(self.allocator);
+        var symbols = std.array_list.Managed([]const u8).init(self.allocator);
         defer symbols.deinit();
 
         while (self.current.tag != .r_brace and self.current.tag != .eof) {
@@ -5568,7 +5569,7 @@ pub const Parser = struct {
             const raw = try std.fmt.allocPrint(self.allocator, "{s}/{s}{s}", .{ self.base_dir, path, suf });
             defer self.allocator.free(raw);
             const cand = try self.normalizePath(raw);
-            std.fs.cwd().access(cand, .{}) catch {
+            sio.cwd().access(cand, .{}) catch {
                 self.allocator.free(cand);
                 continue;
             };
@@ -5580,7 +5581,7 @@ pub const Parser = struct {
     /// Lexically normalize a `/`-joined path (`a/./b` -> `a/b`,
     /// `a/x/../b` -> `a/b`), so import identities are stable.
     fn normalizePath(self: *Parser, path: []const u8) anyerror![]const u8 {
-        var parts = std.ArrayList([]const u8).init(self.allocator);
+        var parts = std.array_list.Managed([]const u8).init(self.allocator);
         defer parts.deinit();
         var it = std.mem.splitScalar(u8, path, '/');
         const absolute = path.len > 0 and path[0] == '/';
@@ -5592,7 +5593,7 @@ pub const Parser = struct {
             }
             try parts.append(seg);
         }
-        var out = std.ArrayList(u8).init(self.allocator);
+        var out = std.array_list.Managed(u8).init(self.allocator);
         errdefer out.deinit();
         if (absolute) try out.append('/');
         for (parts.items, 0..) |p, i| {
@@ -5611,7 +5612,7 @@ pub const Parser = struct {
         defer self.allocator.free(resolved);
         if (self.imported_files.contains(resolved)) return;
         try self.imported_files.put(try self.allocator.dupe(u8, resolved), {});
-        const content = std.fs.cwd().readFileAlloc(self.allocator, resolved, 4 * 1024 * 1024) catch return error.FileNotFound;
+        const content = sio.cwd().readFileAlloc(self.allocator, resolved, 4 * 1024 * 1024) catch return error.FileNotFound;
         defer self.allocator.free(content);
 
         const saved_lexer = self.lexer;
@@ -5702,7 +5703,7 @@ pub const Parser = struct {
 
         try self.expect(.l_paren);
 
-        var params = std.ArrayList(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
+        var params = std.array_list.Managed(struct { name: []const u8, type_name: []const u8 }).init(self.allocator);
         defer params.deinit();
 
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
@@ -6575,7 +6576,7 @@ pub const Parser = struct {
         try self.lowerer.emitLabel(l_body);
         // Mapper args: element slot is `0` (fresh array), index slot is
         // `i`, any further slots are `0`.
-        var arg_buf = std.ArrayList(u8).init(self.allocator);
+        var arg_buf = std.array_list.Managed(u8).init(self.allocator);
         defer arg_buf.deinit();
         var slot: u8 = 0;
         while (slot < @max(map_arity, 1)) : (slot += 1) {
@@ -6617,7 +6618,7 @@ pub const Parser = struct {
     /// Returns a temp holding the `i32` result.
     fn lowerFnFieldCall(self: *Parser, left: []const u8, off: u32) anyerror![]const u8 {
         try self.expect(.l_paren);
-        var args = std.ArrayList([]const u8).init(self.allocator);
+        var args = std.array_list.Managed([]const u8).init(self.allocator);
         defer args.deinit();
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
             const a = try self.parseExpression();
@@ -8478,7 +8479,7 @@ pub const Parser = struct {
             // value args (a zero-arity `() => v` takes none; over- or
             // under-passing trips CapabilityMismatch). Arity above 4 is
             // refused loudly instead of mis-called.
-            var arg_buf = std.ArrayList(u8).init(self.allocator);
+            var arg_buf = std.array_list.Managed(u8).init(self.allocator);
             defer arg_buf.deinit();
             if (red_arity > 4) {
                 if (is_rright) {
@@ -8681,7 +8682,7 @@ pub const Parser = struct {
             if (std.mem.eql(u8, member_name, "includes")) {
                 try self.lowerer.emit("    {s} = eq {s}, {s}\n", .{ pok, pel, needle.? });
             } else {
-                var pabuf = std.ArrayList(u8).init(self.allocator);
+                var pabuf = std.array_list.Managed(u8).init(self.allocator);
                 defer pabuf.deinit();
                 var ps: u8 = 0;
                 while (ps < parity) : (ps += 1) {
@@ -8868,7 +8869,7 @@ pub const Parser = struct {
             try self.retagTemp(cur, elem_type);
             // Callback arg slots: (cur, i, arr). Exactly `arity` value
             // args; arity above 3 is refused loudly (see reduce).
-            var arg_buf = std.ArrayList(u8).init(self.allocator);
+            var arg_buf = std.array_list.Managed(u8).init(self.allocator);
             defer arg_buf.deinit();
             if (map_arity2 > 3) {
                 return self.refuseAt(
@@ -9000,7 +9001,7 @@ pub const Parser = struct {
             const cur = try self.newTemp();
             try self.lowerer.emit("    {s} = load {s} + 0 as {s}\n", .{ cur, saddr, sa_elem });
             try self.retagTemp(cur, elem_type);
-            var arg_buf = std.ArrayList(u8).init(self.allocator);
+            var arg_buf = std.array_list.Managed(u8).init(self.allocator);
             defer arg_buf.deinit();
             if (flt_arity > 3) {
                 return self.refuseAt(
@@ -9546,7 +9547,7 @@ pub const Parser = struct {
             var has_del = false;
             var start_v: []const u8 = "0";
             var del_v: []const u8 = "0";
-            var items = std.ArrayList([]const u8).init(self.allocator);
+            var items = std.array_list.Managed([]const u8).init(self.allocator);
             defer items.deinit();
             if (self.current.tag != .r_paren) {
                 start_v = try self.parseExpression();
@@ -10672,7 +10673,7 @@ pub const Parser = struct {
             return error.UnknownMethod;
         };
         try self.expect(.l_paren);
-        var args = std.ArrayList([]const u8).init(self.allocator);
+        var args = std.array_list.Managed([]const u8).init(self.allocator);
         defer args.deinit();
         while (self.current.tag != .r_paren and self.current.tag != .eof) {
             const a = try self.parseExpression();
@@ -11071,7 +11072,7 @@ pub const Parser = struct {
         }
 
         // Scan body to find captured variables from outer scope
-        var captures = std.ArrayList(scope_mod.Variable).init(self.allocator);
+        var captures = std.array_list.Managed(scope_mod.Variable).init(self.allocator);
         defer captures.deinit();
 
         const is_expr_body = self.current.tag != .l_brace;
@@ -11560,10 +11561,10 @@ pub const Parser = struct {
         self: *Parser,
         result_dest: ?[]const u8, // null = bare call, non-null = assign to temp
         entry: StdlibEntry,
-        args: std.ArrayList([]const u8),
+        args: std.array_list.Managed([]const u8),
     ) anyerror!void {
         // Build transformed arg list
-        var transformed = std.ArrayList([]const u8).init(self.allocator);
+        var transformed = std.array_list.Managed([]const u8).init(self.allocator);
         defer transformed.deinit();
 
         for (args.items, 0..) |arg, idx| {
@@ -11749,7 +11750,7 @@ pub const Parser = struct {
         if (self.current.tag == .l_paren) {
             // Bare function call
             try self.expect(.l_paren);
-            var args = std.ArrayList([]const u8).init(self.allocator);
+            var args = std.array_list.Managed([]const u8).init(self.allocator);
             defer args.deinit();
 
             while (self.current.tag != .r_paren and self.current.tag != .eof) {
@@ -11830,7 +11831,7 @@ pub const Parser = struct {
                     try self.lowerer.emit(")\n", .{});
                     return;
                 }
-                var expanded = std.ArrayList([]const u8).init(self.allocator);
+                var expanded = std.array_list.Managed([]const u8).init(self.allocator);
                 defer expanded.deinit();
                 for (args.items) |arg| {
                     if (self.arrow_aliases.get(arg)) |aarg| {
@@ -13137,7 +13138,7 @@ pub const Parser = struct {
                 try self.expect(.identifier);
                 const mname = self.tokenText(mtok);
                 try self.expect(.l_paren);
-                var sargs = std.ArrayList([]const u8).init(self.allocator);
+                var sargs = std.array_list.Managed([]const u8).init(self.allocator);
                 defer sargs.deinit();
                 while (self.current.tag != .r_paren and self.current.tag != .eof) {
                     const a = try self.parseExpression();
@@ -13192,7 +13193,7 @@ pub const Parser = struct {
                     const saved_lexer = self.lexer;
                     const saved_current = self.current;
                     const saved_peek = self.peek;
-                    var probe = std.ArrayList(ArrowParam).init(self.allocator);
+                    var probe = std.array_list.Managed(ArrowParam).init(self.allocator);
                     defer probe.deinit();
                     var is_arrow = false;
                     // Walk `ident [: type] (, ident [: type])* ) =>`.
@@ -13352,7 +13353,7 @@ pub const Parser = struct {
                     self.current = saved_current;
                     self.peek = saved_peek;
                     if (is_arrow) {
-                        var real = std.ArrayList(ArrowParam).init(self.allocator);
+                        var real = std.array_list.Managed(ArrowParam).init(self.allocator);
                         defer real.deinit();
                         var rseq: u32 = 0;
                         while (true) {
@@ -13593,11 +13594,11 @@ pub const Parser = struct {
                 // separate element buffer; the old inline layout read back
                 // shifted via the +0/+8 header slots).
                 try self.advance();
-                var vals = std.ArrayList([]const u8).init(self.allocator);
+                var vals = std.array_list.Managed([]const u8).init(self.allocator);
                 defer vals.deinit();
                 // Spread items (`...a`) lower below via slice/concat/push
                 // shapes; parallel array records which slots spread.
-                var spread_flags = std.ArrayList(bool).init(self.allocator);
+                var spread_flags = std.array_list.Managed(bool).init(self.allocator);
                 defer spread_flags.deinit();
                 var has_spread = false;
                 while (self.current.tag != .r_bracket and self.current.tag != .eof) {
@@ -13884,7 +13885,7 @@ pub const Parser = struct {
                 };
                 try self.expect(.l_paren);
                 const CtorArg = struct { reg: []const u8, cb: ?[]const u8 = null, ctx: ?[]const u8 = null };
-                var ctor_args = std.ArrayList(CtorArg).init(self.allocator);
+                var ctor_args = std.array_list.Managed(CtorArg).init(self.allocator);
                 defer ctor_args.deinit();
                 while (self.current.tag != .r_paren and self.current.tag != .eof) {
                     self.last_arrow_ctx = null;
@@ -13950,7 +13951,7 @@ pub const Parser = struct {
                     // Pre-materialize `fn`-typed args BEFORE opening the call
                     // line: vtable emission writes full instructions and
                     // would corrupt a half-written `call`.
-                    var ctor_fp = std.ArrayList(?[]const u8).init(self.allocator);
+                    var ctor_fp = std.array_list.Managed(?[]const u8).init(self.allocator);
                     defer ctor_fp.deinit();
                     for (ctor_args.items, 0..) |ca, cai| {
                         var is_fn_param = false;
@@ -14039,7 +14040,7 @@ pub const Parser = struct {
                 const brace_tok = self.current;
                 try self.advance();
                 const Entry = struct { name: []const u8, val: []const u8 };
-                var entries = std.ArrayList(Entry).init(self.allocator);
+                var entries = std.array_list.Managed(Entry).init(self.allocator);
                 defer entries.deinit();
                 while (self.current.tag != .r_brace and self.current.tag != .eof) {
                     const fn_tok = self.current;
@@ -14992,15 +14993,15 @@ pub const Parser = struct {
         // Function call: name(args)
         if (tag == .l_paren) {
             try self.advance();
-            var args = std.ArrayList([]const u8).init(self.allocator);
+            var args = std.array_list.Managed([]const u8).init(self.allocator);
             defer args.deinit();
 
             // Spread-aware argument collection: items are parsed tagged
             // (scalar vs `...arr`), then assembled below. Plain calls
             // without spread keep the historical direct path.
-            var citems = std.ArrayList([]const u8).init(self.allocator);
+            var citems = std.array_list.Managed([]const u8).init(self.allocator);
             defer citems.deinit();
-            var cspread = std.ArrayList(bool).init(self.allocator);
+            var cspread = std.array_list.Managed(bool).init(self.allocator);
             defer cspread.deinit();
             var any_spread = false;
             while (self.current.tag != .r_paren and self.current.tag != .eof) {
@@ -15411,7 +15412,7 @@ pub const Parser = struct {
                     }
                     return temp_name;
                 }
-                var expanded = std.ArrayList([]const u8).init(self.allocator);
+                var expanded = std.array_list.Managed([]const u8).init(self.allocator);
                 defer expanded.deinit();
                 for (args.items) |arg| {
                     if (self.arrow_aliases.get(arg)) |aarg| {
