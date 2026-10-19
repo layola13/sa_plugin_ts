@@ -1954,9 +1954,9 @@ test "sa_plugin_ts resolves a cross-file parent via relative import" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try (sio.Dir{ .inner = tmp.dir }).realpathAlloc(allocator, ".");
     defer allocator.free(dir_path);
-    try tmp.dir.writeFile(.{
+    try (sio.Dir{ .inner = tmp.dir }).writeFile(.{
         .sub_path = "base.ts",
         .data =
         \\export class Base {
@@ -2567,10 +2567,10 @@ test "benchmark: parsing speed for large input" {
     const allocator = std.testing.allocator;
 
     // Generate a large TS source with many function declarations
-    var source_buf = std.array_list.Managed(u8).init(allocator);
+    var source_buf: std.Io.Writer.Allocating = .init(allocator);
     defer source_buf.deinit();
 
-    const writer = source_buf.writer();
+    const writer = &source_buf.writer;
     try writer.writeAll("interface Data {\n  value: i32;\n  count: i32;\n}\n\n");
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
@@ -2585,7 +2585,7 @@ test "benchmark: parsing speed for large input" {
         try writer.writeAll("}\n\n");
     }
 
-    const source = source_buf.items;
+    const source = source_buf.written();
     const line_count = blk: {
         var count: u32 = 0;
         for (source) |c| {
@@ -3529,7 +3529,7 @@ fn lowerForRuntimeTest(allocator: std.mem.Allocator, tc: *const RuntimeCase) ![]
 fn findSaForRuntimeTest(allocator: std.mem.Allocator) !?[]u8 {
     if (sio.getEnvVarOwned(allocator, "SA_BIN")) |v| return v else |_| {}
     const dev_path = "/content/sa_all/sci/zig-out/bin/sa";
-    std.fs.accessAbsolute(dev_path, .{}) catch return null;
+    sio.cwd().access(dev_path, .{}) catch return null;
     return try allocator.dupe(u8, dev_path);
 }
 
@@ -3540,7 +3540,7 @@ fn runRuntimeCase(allocator: std.mem.Allocator, sa_path: []const u8, tc: *const 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try (sio.Dir{ .inner = tmp.dir }).realpathAlloc(allocator, ".");
     defer allocator.free(dir_path);
     const sai_path = try std.fs.path.join(allocator, &.{ dir_path, "case.sai" });
     defer allocator.free(sai_path);
@@ -3555,7 +3555,7 @@ fn runRuntimeCase(allocator: std.mem.Allocator, sa_path: []const u8, tc: *const 
     build_child.stdout_behavior = .Ignore;
     build_child.stderr_behavior = .Ignore;
     const build_term = try build_child.spawnAndWait();
-    if (build_term != .Exited or build_term.Exited != 0) {
+    if (build_term != .exited or build_term.exited != 0) {
         std.debug.print("sa build failed for '{s}': {any}\n", .{ tc.name, build_term });
         return error.TestExpectedEqual;
     }
@@ -3564,7 +3564,7 @@ fn runRuntimeCase(allocator: std.mem.Allocator, sa_path: []const u8, tc: *const 
     run_child.stdout_behavior = .Ignore;
     run_child.stderr_behavior = .Ignore;
     const run_term = try run_child.spawnAndWait();
-    if (run_term != .Exited or run_term.Exited != tc.expected) {
+    if (run_term != .exited or run_term.exited != tc.expected) {
         std.debug.print("wrong result for '{s}': got {any}, want status {d}\n", .{ tc.name, run_term, tc.expected });
         return error.TestExpectedEqual;
     }
