@@ -1,4 +1,5 @@
 const std = @import("std");
+const sio = @import("sio");
 const plugin_api = @import("plugin_api");
 const plugin_helpers = @import("plugin_helpers.zig");
 const lexer = @import("lexer.zig");
@@ -35,7 +36,7 @@ fn isHelpArg(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
 }
 
-fn writeTsHelp(stderr: std.io.AnyWriter) !void {
+fn writeTsHelp(stderr: *std.Io.Writer) !void {
     try stderr.writeAll("usage: ts <command> [options]\n");
     try stderr.writeAll("       sa ts <command> [options]\n\n");
     try stderr.writeAll("Commands:\n");
@@ -58,8 +59,8 @@ fn runTsSkillsCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     var json_mode = ctx.json_mode;
     var idx = option_start;
@@ -140,7 +141,7 @@ const TsDelegateArgs = struct {
     file: ?[]const u8 = null,
     package_name: ?[]const u8 = null,
     help_requested: bool = false,
-    passthrough: std.ArrayListUnmanaged([]const u8) = .{},
+    passthrough: std.ArrayListUnmanaged([]const u8) = .empty,
 };
 
 fn parseTsDelegateArgs(
@@ -197,7 +198,7 @@ fn hasJobsArg(passthrough: []const []const u8) bool {
 
 /// Append `--jobs auto` unless the user already controls `--jobs`,
 /// mirroring the `sa sla` convention for delegated commands.
-fn appendDefaultJobsAuto(argv: *std.ArrayList([]const u8), passthrough: []const []const u8) !void {
+fn appendDefaultJobsAuto(argv: *std.array_list.Managed([]const u8), passthrough: []const []const u8) !void {
     if (hasJobsArg(passthrough)) return;
     try argv.append("--jobs");
     try argv.append("auto");
@@ -206,10 +207,10 @@ fn appendDefaultJobsAuto(argv: *std.ArrayList([]const u8), passthrough: []const 
 fn lowerFileToSa(
     ctx: *const plugin_api.Context,
     input_path: []const u8,
-    stderr: std.io.AnyWriter,
+    stderr: *std.Io.Writer,
 ) anyerror![]u8 {
     plugin_api.emitLog(ctx, .info, "reading TypeScript source file");
-    const source = std.fs.cwd().readFileAlloc(ctx.allocator, input_path, 16 * 1024 * 1024) catch |err| {
+    const source = sio.cwd().readFileAlloc(ctx.allocator, input_path, 16 * 1024 * 1024) catch |err| {
         try stderr.print("error[SA-TS]: cannot read '{s}': {}\n", .{ input_path, err });
         return err;
     };
@@ -235,7 +236,7 @@ fn lowerSource(
     ctx: *const plugin_api.Context,
     source: []const u8,
     base_dir: []const u8,
-    stderr: std.io.AnyWriter,
+    stderr: *std.Io.Writer,
 ) anyerror![]u8 {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
@@ -295,9 +296,9 @@ fn lowerSource(
 /// SA_EXE env override, SCI_ROOT dev layout, the directory of the host that
 /// loaded this plugin, PATH walk, then a bare "sa" fallback.
 fn resolveSaExecutable(allocator: std.mem.Allocator) []const u8 {
-    if (std.process.getEnvVarOwned(allocator, "SA_EXE")) |override_path| {
+    if (sio.getEnvVarOwned(allocator, "SA_EXE")) |override_path| {
         if (override_path.len > 0) {
-            std.fs.cwd().access(override_path, .{}) catch {
+            sio.cwd().access(override_path, .{}) catch {
                 allocator.free(override_path);
                 return "sa";
             };
@@ -306,21 +307,21 @@ fn resolveSaExecutable(allocator: std.mem.Allocator) []const u8 {
         allocator.free(override_path);
     } else |_| {}
 
-    if (std.process.getEnvVarOwned(allocator, "SCI_ROOT")) |sci_root| {
+    if (sio.getEnvVarOwned(allocator, "SCI_ROOT")) |sci_root| {
         defer allocator.free(sci_root);
         const dev_sa = std.fs.path.join(allocator, &.{ sci_root, "zig-out", "bin", "sa" }) catch return "sa";
-        std.fs.cwd().access(dev_sa, .{}) catch {
+        sio.cwd().access(dev_sa, .{}) catch {
             allocator.free(dev_sa);
             return "sa";
         };
         return dev_sa;
     } else |_| {}
 
-    if (std.fs.selfExePathAlloc(allocator)) |self_path| {
+    if (sio.selfExePathAlloc(allocator)) |self_path| {
         defer allocator.free(self_path);
         if (std.fs.path.dirname(self_path)) |self_dir| {
             const cand = std.fs.path.join(allocator, &.{ self_dir, "sa" }) catch return "sa";
-            std.fs.cwd().access(cand, .{}) catch {
+            sio.cwd().access(cand, .{}) catch {
                 allocator.free(cand);
                 return "sa";
             };
@@ -328,13 +329,13 @@ fn resolveSaExecutable(allocator: std.mem.Allocator) []const u8 {
         }
     } else |_| {}
 
-    if (std.process.getEnvVarOwned(allocator, "PATH")) |path_val| {
+    if (sio.getEnvVarOwned(allocator, "PATH")) |path_val| {
         defer allocator.free(path_val);
         var it = std.mem.tokenizeAny(u8, path_val, ":;\x0a");
         while (it.next()) |entry| {
             if (entry.len == 0) continue;
             const cand = std.fs.path.join(allocator, &.{ entry, "sa" }) catch return "sa";
-            std.fs.cwd().access(cand, .{}) catch {
+            sio.cwd().access(cand, .{}) catch {
                 allocator.free(cand);
                 continue;
             };
@@ -351,11 +352,11 @@ var ts_tmp_counter: u32 = 0;
 /// Caller must delete the file when done.
 fn writeTsTempSai(allocator: std.mem.Allocator, sibling_path: []const u8, sa_code: []const u8) ![]u8 {
     ts_tmp_counter +%= 1;
-    const uniq = std.time.nanoTimestamp();
+    const uniq = sio.nanoTimestamp();
     const dir = std.fs.path.dirname(sibling_path) orelse ".";
     const base = std.fs.path.basename(sibling_path);
     const tmp = try std.fmt.allocPrint(allocator, "{s}/.ts-tmp-{d}-{d}-{s}.sai", .{ dir, uniq, ts_tmp_counter, base });
-    std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = sa_code }) catch |err| {
+    sio.cwd().writeFile(.{ .sub_path = tmp, .data = sa_code }) catch |err| {
         allocator.free(tmp);
         return err;
     };
@@ -374,7 +375,7 @@ fn writeTsTempSai(allocator: std.mem.Allocator, sibling_path: []const u8, sa_cod
 /// The entry source is `<member>/src/main.ts`, falling back to
 /// `<member>/main.ts`.
 fn readPackageName(allocator: std.mem.Allocator, manifest_path: []const u8) !?[]u8 {
-    const content = std.fs.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
+    const content = sio.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
     defer allocator.free(content);
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |raw| {
@@ -396,10 +397,10 @@ fn parseWorkspaceMembers(allocator: std.mem.Allocator, manifest_path: []const u8
     members: std.ArrayListUnmanaged([]const u8),
     default_member: ?[]u8,
 } {
-    const content = std.fs.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
+    const content = sio.cwd().readFileAlloc(allocator, manifest_path, 1024 * 1024) catch return null;
     defer allocator.free(content);
     if (std.mem.indexOf(u8, content, "workspace") == null) return null;
-    var out_members = std.ArrayListUnmanaged([]const u8){};
+    var out_members = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (out_members.items) |m| allocator.free(m);
         out_members.deinit(allocator);
@@ -432,7 +433,7 @@ fn parseWorkspaceMembers(allocator: std.mem.Allocator, manifest_path: []const u8
 fn entrySourceIfExists(allocator: std.mem.Allocator, member_dir: []const u8) !?[]u8 {
     for ([_][]const u8{ "src/main.ts", "main.ts" }) |rel| {
         const cand = try std.fs.path.join(allocator, &.{ member_dir, rel });
-        std.fs.cwd().access(cand, .{}) catch {
+        sio.cwd().access(cand, .{}) catch {
             allocator.free(cand);
             continue;
         };
@@ -444,9 +445,9 @@ fn entrySourceIfExists(allocator: std.mem.Allocator, member_dir: []const u8) !?[
 fn resolveTsWorkspaceEntry(
     allocator: std.mem.Allocator,
     package_name: ?[]const u8,
-    stderr: std.io.AnyWriter,
+    stderr: *std.Io.Writer,
 ) !?[]u8 {
-    const cwd = std.fs.cwd().realpathAlloc(allocator, ".") catch return null;
+    const cwd = sio.cwd().realpathAlloc(allocator, ".") catch return null;
     defer allocator.free(cwd);
 
     var dir = try allocator.dupe(u8, cwd);
@@ -455,7 +456,7 @@ fn resolveTsWorkspaceEntry(
         const manifest = try std.fs.path.join(allocator, &.{ dir, "sa.mod" });
         defer allocator.free(manifest);
         const has_manifest = blk: {
-            std.fs.cwd().access(manifest, .{}) catch break :blk false;
+            sio.cwd().access(manifest, .{}) catch break :blk false;
             break :blk true;
         };
         if (has_manifest) {
@@ -555,14 +556,14 @@ fn resolveTsInputFile(
     allocator: std.mem.Allocator,
     file: ?[]const u8,
     package_name: ?[]const u8,
-    stderr: std.io.AnyWriter,
+    stderr: *std.Io.Writer,
 ) !?[]u8 {
     if (file) |f| return try allocator.dupe(u8, f);
     return try resolveTsWorkspaceEntry(allocator, package_name, stderr);
 }
 
-fn writeNewFile(path: []const u8, bytes: []const u8, stderr: std.io.AnyWriter) !bool {
-    var file = std.fs.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
+fn writeNewFile(path: []const u8, bytes: []const u8, stderr: *std.Io.Writer) !bool {
+    var file = sio.cwd().createFile(path, .{ .exclusive = true }) catch |err| {
         try stderr.print("File Error: failed to create {s}: {}\n", .{ path, err });
         return false;
     };
@@ -577,8 +578,8 @@ fn writeNewFile(path: []const u8, bytes: []const u8, stderr: std.io.AnyWriter) !
 fn runTsInitCommand(
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     var project_path: ?[]const u8 = null;
     var idx = option_start;
@@ -612,12 +613,12 @@ fn runTsInitCommand(
         if (base.len == 0 or std.mem.eql(u8, base, ".")) break :blk "app";
         break :blk base;
     };
-    std.fs.cwd().makePath(root) catch |err| {
+    sio.cwd().makePath(root) catch |err| {
         try stderr.print("File Error: failed to create directory {s}: {}\n", .{ root, err });
         return 1;
     };
     const src_dir = try std.fs.path.join(allocator, &.{ root, "src" });
-    std.fs.cwd().makePath(src_dir) catch |err| {
+    sio.cwd().makePath(src_dir) catch |err| {
         try stderr.print("File Error: failed to create directory {s}: {}\n", .{ src_dir, err });
         return 1;
     };
@@ -654,8 +655,8 @@ fn runTsLowerCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     const parsed = parseTsFileArgs(args, option_start);
     if (parsed.help_requested) {
@@ -677,7 +678,7 @@ fn runTsLowerCommand(
     defer ctx.allocator.free(sa_code);
 
     if (parsed.out) |path| {
-        var file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        var file = sio.cwd().createFile(path, .{}) catch |err| {
             try stderr.print("error[SA-TS]: cannot write to '{s}': {}\n", .{ path, err });
             return 1;
         };
@@ -698,8 +699,8 @@ fn runTsCheckCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     const parsed = parseTsFileArgs(args, option_start);
     if (parsed.help_requested) {
@@ -728,8 +729,8 @@ fn runTsBuildCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     const parsed = parseTsFileArgs(args, option_start);
     if (parsed.help_requested) {
@@ -752,7 +753,7 @@ fn runTsBuildCommand(
 
     const final_out_owned: []const u8 = if (parsed.out) |path| path else try defaultSaiOut(arena.allocator(), input_path);
 
-    std.fs.cwd().writeFile(.{ .sub_path = final_out_owned, .data = sa_code }) catch |err| {
+    sio.cwd().writeFile(.{ .sub_path = final_out_owned, .data = sa_code }) catch |err| {
         try stderr.print("error[SA-TS]: cannot write to '{s}': {}\n", .{ final_out_owned, err });
         return 1;
     };
@@ -765,8 +766,8 @@ fn runTsTestCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     _ = stdout;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -789,22 +790,22 @@ fn runTsTestCommand(
         try stderr.print("error[SA-TS]: cannot write temp SA file: {}\n", .{err});
         return 1;
     };
-    defer std.fs.cwd().deleteFile(tmp_sai) catch {};
+    defer sio.cwd().deleteFile(tmp_sai) catch {};
 
-    var argv = std.ArrayList([]const u8).init(arena.allocator());
+    var argv = std.array_list.Managed([]const u8).init(arena.allocator());
     try argv.append(resolveSaExecutable(arena.allocator()));
     try argv.append("test");
     try argv.append(tmp_sai);
     try argv.appendSlice(parsed.passthrough.items);
     try appendDefaultJobsAuto(&argv, parsed.passthrough.items);
 
-    var child = std.process.Child.init(argv.items, arena.allocator());
+    var child = sio.Child.init(argv.items, arena.allocator());
     const term = child.spawnAndWait() catch |err| {
         try stderr.print("error[SA-TS]: failed to run 'sa test': {}\n", .{err});
         return 1;
     };
     return switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 }
@@ -813,8 +814,8 @@ fn runTsBuildExeCommand(
     ctx: *const plugin_api.Context,
     args: []const []const u8,
     option_start: usize,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) !u8 {
     _ = stdout;
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
@@ -837,22 +838,22 @@ fn runTsBuildExeCommand(
         try stderr.print("error[SA-TS]: cannot write temp SA file: {}\n", .{err});
         return 1;
     };
-    defer std.fs.cwd().deleteFile(tmp_sai) catch {};
+    defer sio.cwd().deleteFile(tmp_sai) catch {};
 
-    var argv = std.ArrayList([]const u8).init(arena.allocator());
+    var argv = std.array_list.Managed([]const u8).init(arena.allocator());
     try argv.append(resolveSaExecutable(arena.allocator()));
     try argv.append("build-exe");
     try argv.append(tmp_sai);
     try argv.appendSlice(parsed.passthrough.items);
     try appendDefaultJobsAuto(&argv, parsed.passthrough.items);
 
-    var child = std.process.Child.init(argv.items, arena.allocator());
+    var child = sio.Child.init(argv.items, arena.allocator());
     const term = child.spawnAndWait() catch |err| {
         try stderr.print("error[SA-TS]: failed to run 'sa build-exe': {}\n", .{err});
         return 1;
     };
     return switch (term) {
-        .Exited => |code| code,
+        .exited => |code| code,
         else => 1,
     };
 }
@@ -860,8 +861,8 @@ fn runTsBuildExeCommand(
 fn runTsCommand(
     ctx: *const plugin_api.Context,
     argv: []const []const u8,
-    stdout: std.io.AnyWriter,
-    stderr: std.io.AnyWriter,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
 ) anyerror!?u8 {
     // argv[0] = "sa", argv[1] = "ts", argv[2..] = subcommand args
     if (argv.len < 2) return null;
@@ -939,10 +940,10 @@ fn runTsCommandAbi(
     const args = plugin_helpers.cArgvToSlice(argv, argv_len, ctx.allocator) catch return @intFromEnum(plugin_api.AbiStatus.failed);
     defer ctx.allocator.free(args);
 
-    var stdout_storage: plugin_helpers.StreamWriterCtx = undefined;
-    var stderr_storage: plugin_helpers.StreamWriterCtx = undefined;
-    const stdout_writer = plugin_helpers.makeAnyWriter(stdout, &stdout_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
-    const stderr_writer = plugin_helpers.makeAnyWriter(stderr, &stderr_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    var stdout_storage: plugin_helpers.HostWriter = undefined;
+    var stderr_storage: plugin_helpers.HostWriter = undefined;
+    const stdout_writer = plugin_helpers.makeHostWriter(stdout, &stdout_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
+    const stderr_writer = plugin_helpers.makeHostWriter(stderr, &stderr_storage) orelse return @intFromEnum(plugin_api.AbiStatus.failed);
 
     const result = runTsCommand(ctx, args, stdout_writer, stderr_writer) catch |err| {
         if (!isTsCliError(err)) return @intFromEnum(plugin_api.AbiStatus.failed);
@@ -1165,7 +1166,7 @@ test "sa_plugin_ts compiles arrow function closures using static defunctionaliza
 
     // Arrow callbacks are buffered out-of-line (SA-ASM has no nested
     // functions), so join the buffers for substring assertions.
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.callbacks.items);
     try joined.appendSlice(low.output.items);
@@ -1233,7 +1234,7 @@ test "sa_plugin_ts compiles WASM imports and stubs" {
 
     // The arity-matched `@extern` lands in the header buffer, so join it for
     // assertions.
-    var wasm_joined = std.ArrayList(u8).init(arena_allocator);
+    var wasm_joined = std.array_list.Managed(u8).init(arena_allocator);
     defer wasm_joined.deinit();
     try wasm_joined.appendSlice(low.header.items);
     try wasm_joined.appendSlice(low.output.items);
@@ -1269,7 +1270,7 @@ test "sa_plugin_ts lowers console.log to sa_print_bytes" {
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -1339,7 +1340,7 @@ test "sa_plugin_ts lowers float interpolation through sa_fmt_f64_into" {
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -1571,7 +1572,7 @@ test "sa_plugin_ts lowers new Map to sa_btree_map_new" {
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -1603,7 +1604,7 @@ test "sa_plugin_ts Map string-literal keys lower to slices with &-prefixed btree
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -1953,9 +1954,9 @@ test "sa_plugin_ts resolves a cross-file parent via relative import" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try (sio.Dir{ .inner = tmp.dir }).realpathAlloc(allocator, ".");
     defer allocator.free(dir_path);
-    try tmp.dir.writeFile(.{
+    try (sio.Dir{ .inner = tmp.dir }).writeFile(.{
         .sub_path = "base.ts",
         .data =
         \\export class Base {
@@ -2566,10 +2567,10 @@ test "benchmark: parsing speed for large input" {
     const allocator = std.testing.allocator;
 
     // Generate a large TS source with many function declarations
-    var source_buf = std.ArrayList(u8).init(allocator);
+    var source_buf: std.Io.Writer.Allocating = .init(allocator);
     defer source_buf.deinit();
 
-    const writer = source_buf.writer();
+    const writer = &source_buf.writer;
     try writer.writeAll("interface Data {\n  value: i32;\n  count: i32;\n}\n\n");
     var i: u32 = 0;
     while (i < 1000) : (i += 1) {
@@ -2584,7 +2585,7 @@ test "benchmark: parsing speed for large input" {
         try writer.writeAll("}\n\n");
     }
 
-    const source = source_buf.items;
+    const source = source_buf.written();
     const line_count = blk: {
         var count: u32 = 0;
         for (source) |c| {
@@ -2600,11 +2601,11 @@ test "benchmark: parsing speed for large input" {
     var low = lowerer.Lowerer.init(arena_allocator);
     defer low.deinit();
 
-    const start = std.time.nanoTimestamp();
+    const start = sio.nanoTimestamp();
     var p = try parser.Parser.init(arena_allocator, source, &low);
     defer p.deinit();
     try p.parse();
-    const elapsed = std.time.nanoTimestamp() - start;
+    const elapsed = sio.nanoTimestamp() - start;
 
     const elapsed_us = @divTrunc(elapsed, 1000);
     const lines_per_sec = @divTrunc(@as(i128, line_count) * 1_000_000, elapsed_us + 1);
@@ -3004,7 +3005,7 @@ test "sa_plugin_ts lowers interpolated integers through fmt instead of emitting 
     try p.parse();
 
     try std.testing.expect(p.errors.items.len == 0);
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -3526,9 +3527,9 @@ fn lowerForRuntimeTest(allocator: std.mem.Allocator, tc: *const RuntimeCase) ![]
 }
 
 fn findSaForRuntimeTest(allocator: std.mem.Allocator) !?[]u8 {
-    if (std.process.getEnvVarOwned(allocator, "SA_BIN")) |v| return v else |_| {}
+    if (sio.getEnvVarOwned(allocator, "SA_BIN")) |v| return v else |_| {}
     const dev_path = "/content/sa_all/sci/zig-out/bin/sa";
-    std.fs.accessAbsolute(dev_path, .{}) catch return null;
+    sio.cwd().access(dev_path, .{}) catch return null;
     return try allocator.dupe(u8, dev_path);
 }
 
@@ -3539,31 +3540,31 @@ fn runRuntimeCase(allocator: std.mem.Allocator, sa_path: []const u8, tc: *const 
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(allocator, ".");
+    const dir_path = try (sio.Dir{ .inner = tmp.dir }).realpathAlloc(allocator, ".");
     defer allocator.free(dir_path);
     const sai_path = try std.fs.path.join(allocator, &.{ dir_path, "case.sai" });
     defer allocator.free(sai_path);
     const exe_path = try std.fs.path.join(allocator, &.{ dir_path, "case.exe" });
     defer allocator.free(exe_path);
 
-    const sai_file = try std.fs.createFileAbsolute(sai_path, .{});
+    const sai_file = try sio.createFileAbsolute(sai_path, .{});
     try sai_file.writeAll(sa_code);
     sai_file.close();
 
-    var build_child = std.process.Child.init(&.{ sa_path, "build", sai_path, "-o", exe_path }, allocator);
+    var build_child = sio.Child.init(&.{ sa_path, "build", sai_path, "-o", exe_path }, allocator);
     build_child.stdout_behavior = .Ignore;
     build_child.stderr_behavior = .Ignore;
     const build_term = try build_child.spawnAndWait();
-    if (build_term != .Exited or build_term.Exited != 0) {
+    if (build_term != .exited or build_term.exited != 0) {
         std.debug.print("sa build failed for '{s}': {any}\n", .{ tc.name, build_term });
         return error.TestExpectedEqual;
     }
 
-    var run_child = std.process.Child.init(&.{exe_path}, allocator);
+    var run_child = sio.Child.init(&.{exe_path}, allocator);
     run_child.stdout_behavior = .Ignore;
     run_child.stderr_behavior = .Ignore;
     const run_term = try run_child.spawnAndWait();
-    if (run_term != .Exited or run_term.Exited != tc.expected) {
+    if (run_term != .exited or run_term.exited != tc.expected) {
         std.debug.print("wrong result for '{s}': got {any}, want status {d}\n", .{ tc.name, run_term, tc.expected });
         return error.TestExpectedEqual;
     }
@@ -3610,7 +3611,7 @@ test "sa_plugin_ts lowers class ctor/new/method calls via trait downgrade" {
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
@@ -3704,7 +3705,7 @@ test "sa_plugin_ts lowers native Map methods to sa_btree_map calls" {
 
     try p.parse();
 
-    var joined = std.ArrayList(u8).init(arena_allocator);
+    var joined = std.array_list.Managed(u8).init(arena_allocator);
     defer joined.deinit();
     try joined.appendSlice(low.header.items);
     try joined.appendSlice(low.output.items);
