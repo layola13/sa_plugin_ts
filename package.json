@@ -1,0 +1,26 @@
+{
+  "name": "sa-plugin-sa-plugin-ts",
+  "version": "0.1.0",
+  "description": "SA plugin: sa_plugin_ts. The plugin manifest is sap.json; install with: sa plugin install npm:sa-plugin-sa-plugin-ts@0.1.0",
+  "keywords": [
+    "sa-plugin",
+    "sa",
+    "sla"
+  ],
+  "files": [
+    "sap.json",
+    "build.zig",
+    "build.zig.zon",
+    "src",
+    "sa",
+    "*.sai",
+    "*.sal",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {}
+}
